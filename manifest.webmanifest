@@ -1,0 +1,18 @@
+{
+  "name": "打工人小账本",
+  "short_name": "小账本",
+  "description": "一个简单、清楚、本地优先的个人收支账本",
+  "lang": "zh-CN",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "icons": [
+    {
+      "src": "./favicon.svg?v=8",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
