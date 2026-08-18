@@ -1,12 +1,13 @@
 /* 打工人小账本：本地优先的个人收支账本。 */
 
 const DB_NAME = 'worker-ledger';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const STORES = {
   transactions: 'transactions',
   settings: 'profile_settings',
   categories: 'categories',
   accounts: 'accounts',
+  agentMessages: 'agent_messages',
 };
 
 const DEFAULT_PROFILE = {
@@ -21,6 +22,19 @@ const DEFAULT_PROFILE = {
     otherDeductions: 0,
     postTaxAllowance: 0,
   },
+};
+
+const DEFAULT_AGENT_CONFIG = {
+  baseUrl: '',
+  model: '',
+  apiKey: '',
+  rememberKey: false,
+};
+
+const AGENT_STORAGE_KEYS = {
+  config: 'worker-ledger-agent-config',
+  rememberedKey: 'worker-ledger-agent-api-key',
+  sessionKey: 'worker-ledger-agent-session-key',
 };
 
 const DEFAULT_CATEGORIES = [
@@ -88,6 +102,7 @@ const CURRENCY_FORMATTER = new Intl.NumberFormat('zh-CN', {
 
 const NUMBER_FORMATTER = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 });
 const DEMO_MODE = new URLSearchParams(location.search).get('demo') === '1';
+const VALID_VIEWS = ['home', 'agent', 'ledger', 'reports', 'accounts', 'categories', 'settings'];
 
 const state = {
   db: null,
@@ -103,6 +118,11 @@ const state = {
   ledgerType: 'all',
   ledgerAccount: 'all',
   reportPeriod: 'month',
+  agentMessages: [],
+  agentSending: false,
+  agentConnection: 'idle',
+  agentConnectionMessage: '本地基础模式可用',
+  agentConfig: { ...DEFAULT_AGENT_CONFIG },
   demo: DEMO_MODE,
 };
 
@@ -137,6 +157,70 @@ function yuanFromCents(value) {
 
 function money(cents) {
   return CURRENCY_FORMATTER.format(yuanFromCents(cents)).replace('CN¥', '¥').replace('￥', '¥').replace(/\s/g, '');
+}
+
+function readStoredJson(key, fallback = {}) {
+  try {
+    return JSON.parse(localStorage.getItem(key) || '') || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function loadAgentConfig() {
+  const stored = readStoredJson(AGENT_STORAGE_KEYS.config, {});
+  const rememberKey = stored.rememberKey === true;
+  const apiKey = rememberKey
+    ? localStorage.getItem(AGENT_STORAGE_KEYS.rememberedKey) || ''
+    : sessionStorage.getItem(AGENT_STORAGE_KEYS.sessionKey) || '';
+  return {
+    ...DEFAULT_AGENT_CONFIG,
+    baseUrl: String(stored.baseUrl || ''),
+    model: String(stored.model || ''),
+    rememberKey,
+    apiKey,
+  };
+}
+
+function saveAgentConfig(config) {
+  const next = {
+    ...DEFAULT_AGENT_CONFIG,
+    ...config,
+    baseUrl: String(config.baseUrl || '').trim().replace(/\/+$/, ''),
+    model: String(config.model || '').trim(),
+    apiKey: String(config.apiKey || '').trim(),
+    rememberKey: config.rememberKey === true,
+  };
+  localStorage.setItem(AGENT_STORAGE_KEYS.config, JSON.stringify({
+    baseUrl: next.baseUrl,
+    model: next.model,
+    rememberKey: next.rememberKey,
+  }));
+  if (next.rememberKey) {
+    localStorage.setItem(AGENT_STORAGE_KEYS.rememberedKey, next.apiKey);
+    sessionStorage.removeItem(AGENT_STORAGE_KEYS.sessionKey);
+  } else {
+    localStorage.removeItem(AGENT_STORAGE_KEYS.rememberedKey);
+    if (next.apiKey) sessionStorage.setItem(AGENT_STORAGE_KEYS.sessionKey, next.apiKey);
+    else sessionStorage.removeItem(AGENT_STORAGE_KEYS.sessionKey);
+  }
+  state.agentConfig = next;
+  return next;
+}
+
+function hasRemoteAgentConfig() {
+  return Boolean(state.agentConfig.baseUrl && state.agentConfig.model);
+}
+
+async function postJson(path, payload) {
+  const response = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || '请求失败，请稍后重试。');
+  return data;
 }
 
 function signedMoney(transaction) {
@@ -351,6 +435,7 @@ function demoData() {
     categories: [...DEFAULT_CATEGORIES],
     accounts,
     transactions: sortTransactions(transactions),
+    agentMessages: [],
   };
 }
 
@@ -373,6 +458,10 @@ function openDatabase() {
       if (!db.objectStoreNames.contains(STORES.settings)) db.createObjectStore(STORES.settings, { keyPath: 'key' });
       if (!db.objectStoreNames.contains(STORES.categories)) db.createObjectStore(STORES.categories, { keyPath: 'id' });
       if (!db.objectStoreNames.contains(STORES.accounts)) db.createObjectStore(STORES.accounts, { keyPath: 'id' });
+      const messageStore = db.objectStoreNames.contains(STORES.agentMessages)
+        ? request.transaction.objectStore(STORES.agentMessages)
+        : db.createObjectStore(STORES.agentMessages, { keyPath: 'id' });
+      if (!messageStore.indexNames.contains('createdAt')) messageStore.createIndex('createdAt', 'createdAt');
     };
     request.onsuccess = () => resolve(request.result);
   });
@@ -444,11 +533,12 @@ async function loadData() {
     } else {
       if (!state.db) state.db = await openDatabase();
       await ensureInitialData();
-      const [profileRecord, transactions, categories, accounts] = await Promise.all([
+      const [profileRecord, transactions, categories, accounts, agentMessages] = await Promise.all([
         dbGet(STORES.settings, 'profile'),
         dbGetAll(STORES.transactions),
         dbGetAll(STORES.categories),
         dbGetAll(STORES.accounts),
+        dbGetAll(STORES.agentMessages),
       ]);
       state.profile = {
         ...DEFAULT_PROFILE,
@@ -459,6 +549,10 @@ async function loadData() {
       state.transactions = sortTransactions(transactions);
       state.categories = categories.length ? categories : [...DEFAULT_CATEGORIES];
       state.accounts = accounts.length ? accounts : [...DEFAULT_ACCOUNTS];
+      state.agentMessages = agentMessages
+        .filter((message) => message?.role === 'user' || message?.role === 'assistant')
+        .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+        .slice(-80);
     }
     state.error = null;
   } catch (error) {
@@ -509,6 +603,31 @@ async function persistCategory(category) {
   setSavedStatus();
   render();
   toast('分类已添加。');
+}
+
+async function persistAgentMessage(message) {
+  if (!state.demo) await dbPut(STORES.agentMessages, message);
+  const existingIndex = state.agentMessages.findIndex((item) => item.id === message.id);
+  if (existingIndex >= 0) state.agentMessages[existingIndex] = message;
+  else state.agentMessages.push(message);
+  state.agentMessages = state.agentMessages
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+    .slice(-80);
+}
+
+async function updateAgentMessage(messageId, patch) {
+  const existing = state.agentMessages.find((message) => message.id === messageId);
+  if (!existing) return null;
+  const next = { ...existing, ...patch, updatedAt: new Date().toISOString() };
+  await persistAgentMessage(next);
+  return next;
+}
+
+async function clearAgentMessages() {
+  if (!state.demo) await dbClear(STORES.agentMessages);
+  state.agentMessages = [];
+  render();
+  toast('聊天记录已清空。');
 }
 
 function setSavedStatus() {
@@ -803,6 +922,428 @@ function renderReports() {
     </div>`;
 }
 
+function agentMessage(role, content, extra = {}) {
+  const now = new Date().toISOString();
+  return {
+    id: id(),
+    role,
+    content: String(content || '').trim(),
+    createdAt: now,
+    updatedAt: now,
+    ...extra,
+  };
+}
+
+function agentAmountFromText(text) {
+  const currencyPrefix = text.match(/[¥￥]\s*(\d+(?:\.\d{1,2})?)/);
+  if (currencyPrefix) return number(currencyPrefix[1]);
+  const currencySuffix = text.match(/(\d+(?:\.\d{1,2})?)\s*(?:元|块钱|块|人民币)/);
+  if (currencySuffix) return number(currencySuffix[1]);
+  const candidates = [...text.matchAll(/\d+(?:\.\d{1,2})?/g)]
+    .filter((match) => {
+      const before = text.slice(Math.max(0, match.index - 1), match.index);
+      const after = text.slice(match.index + match[0].length, match.index + match[0].length + 1);
+      return !/[年月日号:：点时分秒/\-]/.test(`${before}${after}`);
+    })
+    .map((match) => number(match[0]))
+    .filter((value) => value > 0);
+  return candidates.at(-1) || 0;
+}
+
+function inferAgentType(text) {
+  if (/转账|转到|转入|转出/.test(text)) return 'transfer';
+  if (/收入|工资|薪资|到账|奖金|报销|退款|兼职|补贴|入账/.test(text)) return 'income';
+  return 'expense';
+}
+
+function inferAgentCategory(text, type) {
+  const rules = type === 'income'
+    ? [
+        ['bonus', /奖金|年终奖|绩效/],
+        ['reimburse', /报销|退款|返现/],
+        ['salary', /工资|薪资|兼职|补贴|津贴/],
+      ]
+    : [
+        ['food', /早餐|午饭|午餐|晚饭|晚餐|夜宵|外卖|咖啡|奶茶|餐饮|吃饭/],
+        ['commute', /地铁|公交|打车|出租|网约车|交通|通勤|加油|停车/],
+        ['housing', /房租|租金|物业|住房|居住/],
+        ['health', /医院|门诊|药|体检|健康/],
+        ['learn', /课程|书|学习|培训|资料/],
+        ['fun', /电影|游戏|娱乐|演出|旅行/],
+        ['daily', /日用|超市|买菜|购物|话费|水电|燃气/],
+      ];
+  const matched = rules.find(([, pattern]) => pattern.test(text))?.[0];
+  if (matched && state.categories.some((category) => category.id === matched && category.type === type)) return matched;
+  return state.categories.find((category) => category.type === type)?.id || (type === 'income' ? 'other-income' : 'other');
+}
+
+function inferAgentAccount(text, excludedId = '') {
+  const normalized = text.toLowerCase();
+  const aliases = [
+    ['微信', 'wechat'],
+    ['支付宝', 'alipay'],
+    ['工资卡', 'salary-card'],
+  ];
+  const matches = [];
+  for (const [label, accountId] of aliases) {
+    const index = normalized.indexOf(label.toLowerCase());
+    if (index >= 0 && accountId !== excludedId && activeAccounts().some((item) => item.id === accountId)) matches.push({ accountId, index });
+  }
+  for (const account of activeAccounts()) {
+    const index = normalized.indexOf(account.name.toLowerCase());
+    if (index >= 0 && account.id !== excludedId) matches.push({ accountId: account.id, index });
+  }
+  matches.sort((a, b) => a.index - b.index);
+  return matches[0]?.accountId || activeAccounts().find((item) => item.id !== excludedId)?.id || '';
+}
+
+function inferAgentOccurredAt(text) {
+  const date = new Date();
+  if (/前天/.test(text)) date.setDate(date.getDate() - 2);
+  else if (/昨天/.test(text)) date.setDate(date.getDate() - 1);
+  const dateMatch = text.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*日?/);
+  if (dateMatch) date.setMonth(Number(dateMatch[1]) - 1, Number(dateMatch[2]));
+  const timeMatch = text.match(/(?:上午|下午|晚上|早上)?\s*(\d{1,2})[:：点时](\d{1,2})?/);
+  if (timeMatch) {
+    let hour = Number(timeMatch[1]);
+    if (/下午|晚上/.test(timeMatch[0]) && hour < 12) hour += 12;
+    date.setHours(hour, Number(timeMatch[2] || 0), 0, 0);
+  }
+  return date.toISOString();
+}
+
+function inferAgentNote(text, type) {
+  const notes = [
+    ['早餐', /早餐/], ['午餐', /午饭|午餐/], ['晚餐', /晚饭|晚餐/], ['咖啡', /咖啡/], ['奶茶', /奶茶/],
+    ['地铁', /地铁/], ['公交', /公交/], ['打车', /打车|出租|网约车/], ['房租', /房租|租金/],
+    ['日常采购', /超市|买菜|日用/], ['工资到账', /工资|薪资/], ['奖金到账', /奖金|绩效/],
+    ['报销到账', /报销/], ['退款到账', /退款/],
+  ];
+  return notes.find(([, pattern]) => pattern.test(text))?.[0] || (type === 'income' ? '收入' : type === 'transfer' ? '账户转账' : '支出');
+}
+
+function normalizeAgentDraft(rawDraft = {}) {
+  const type = ['expense', 'income', 'transfer'].includes(rawDraft.type) ? rawDraft.type : 'expense';
+  const amountYuan = number(rawDraft.amountYuan ?? rawDraft.amount);
+  if (!(amountYuan > 0)) return null;
+  const category = state.categories.find((item) => item.id === rawDraft.categoryId && item.type === type);
+  const account = activeAccounts().find((item) => item.id === rawDraft.accountId);
+  const occurredAt = new Date(rawDraft.occurredAt || Date.now());
+  const accountId = account?.id || activeAccounts()[0]?.id || '';
+  const toAccountId = type === 'transfer'
+    ? activeAccounts().find((item) => item.id === rawDraft.toAccountId && item.id !== accountId)?.id || activeAccounts().find((item) => item.id !== accountId)?.id || ''
+    : '';
+  return {
+    type,
+    amountYuan,
+    categoryId: type === 'transfer' ? 'transfer' : category?.id || inferAgentCategory(String(rawDraft.note || ''), type),
+    accountId,
+    toAccountId,
+    occurredAt: Number.isNaN(occurredAt.getTime()) ? new Date().toISOString() : occurredAt.toISOString(),
+    note: String(rawDraft.note || '').trim() || (type === 'income' ? '收入' : type === 'transfer' ? '账户转账' : '支出'),
+    tags: Array.isArray(rawDraft.tags) ? rawDraft.tags.map((tag) => String(tag).trim()).filter(Boolean).slice(0, 8) : [],
+  };
+}
+
+function buildLocalAgentDraft(text) {
+  const type = inferAgentType(text);
+  const amountYuan = agentAmountFromText(text);
+  if (!(amountYuan > 0)) return null;
+  const accountId = inferAgentAccount(text);
+  return normalizeAgentDraft({
+    type,
+    amountYuan,
+    categoryId: type === 'transfer' ? 'transfer' : inferAgentCategory(text, type),
+    accountId,
+    toAccountId: type === 'transfer' ? inferAgentAccount(text.replace(accountName(accountId), ''), accountId) : '',
+    occurredAt: inferAgentOccurredAt(text),
+    note: inferAgentNote(text, type),
+    tags: ['Agent 记账'],
+  });
+}
+
+function statsForPreviousMonth() {
+  const start = new Date(state.selectedMonth.getFullYear(), state.selectedMonth.getMonth() - 1, 1);
+  const end = new Date(state.selectedMonth.getFullYear(), state.selectedMonth.getMonth(), 0, 23, 59, 59, 999);
+  const stats = statsForRange(start, end);
+  stats.balance = stats.income - stats.expense;
+  return stats;
+}
+
+function localAgentAnswer(text) {
+  const normalized = text.replace(/\s/g, '');
+  const stats = monthlyStats();
+  const previous = statsForPreviousMonth();
+  const category = state.categories.find((item) => normalized.includes(item.label));
+  if (category && /上月|上个月|相比|对比|变化|多|少/.test(normalized)) {
+    const currentAmount = stats.transactions.filter((item) => item.type === category.type && item.categoryId === category.id).reduce((sum, item) => sum + number(item.amount), 0);
+    const previousAmount = previous.transactions.filter((item) => item.type === category.type && item.categoryId === category.id).reduce((sum, item) => sum + number(item.amount), 0);
+    const difference = currentAmount - previousAmount;
+    const direction = difference === 0 ? '持平' : difference > 0 ? `多了 ${money(Math.abs(difference))}` : `少了 ${money(Math.abs(difference))}`;
+    return { kind: 'answer', reply: `${monthLabel()}${category.label}${category.type === 'income' ? '收入' : '支出'} ${money(currentAmount)}，比上月${direction}。` };
+  }
+  if (/最多|最高|主要花在|支出分类/.test(normalized)) {
+    const top = reportCategoryData(stats.transactions)[0];
+    return top
+      ? { kind: 'answer', reply: `本月支出最多的是${top.category.label}，共 ${money(top.amount)}，占本月支出的 ${NUMBER_FORMATTER.format(stats.expense ? top.amount / stats.expense * 100 : 0)}%。` }
+      : { kind: 'answer', reply: '本月还没有支出记录。' };
+  }
+  if (/结余|剩下|剩余/.test(normalized)) return { kind: 'answer', reply: `本月收入 ${money(stats.income)}，支出 ${money(stats.expense)}，目前结余 ${money(stats.balance)}。` };
+  if (/收支|账单|消费情况|花费情况/.test(normalized)) return { kind: 'answer', reply: `本月收入 ${money(stats.income)}，支出 ${money(stats.expense)}，目前结余 ${money(stats.balance)}，共记录 ${stats.transactions.length} 笔流水。` };
+  if (/收入/.test(normalized) && /多少|统计|本月|这个月/.test(normalized)) return { kind: 'answer', reply: `本月共记录 ${stats.transactions.filter((item) => item.type === 'income').length} 笔收入，合计 ${money(stats.income)}。` };
+  if (/花了多少|支出多少|消费多少|本月支出|这个月花/.test(normalized)) return { kind: 'answer', reply: `本月共记录 ${stats.transactions.filter((item) => item.type === 'expense').length} 笔支出，合计 ${money(stats.expense)}。` };
+  if (/多少笔|记录情况/.test(normalized)) return { kind: 'answer', reply: `本月已经记录 ${stats.transactions.length} 笔流水，其中收入 ${stats.transactions.filter((item) => item.type === 'income').length} 笔、支出 ${stats.transactions.filter((item) => item.type === 'expense').length} 笔。` };
+  return null;
+}
+
+function localAgentResponse(text) {
+  const answer = localAgentAnswer(text);
+  if (answer) return answer;
+  const transactionIntent = /记|花|买|付|消费|支出|收入|工资|薪资|到账|奖金|报销|退款|转账|早餐|午饭|午餐|晚餐|地铁|公交|打车|房租/.test(text);
+  if (transactionIntent) {
+    const draft = buildLocalAgentDraft(text);
+    if (!draft) return { kind: 'clarify', reply: '这笔流水的实际金额是多少？例如可以说“午餐 28 元，微信支付”。' };
+    return { kind: 'transaction_draft', reply: '我整理成了一笔记账草稿。请核对金额、分类和账户，确认后才会写入账本。', draft };
+  }
+  return null;
+}
+
+function ledgerContextForAgent() {
+  const stats = monthlyStats();
+  const previous = statsForPreviousMonth();
+  const categories = reportCategoryData(stats.transactions).map(({ category, amount }) => ({ id: category.id, label: category.label, amountYuan: yuanFromCents(amount) }));
+  return {
+    selectedMonth: monthKey(state.selectedMonth),
+    currency: 'CNY',
+    currentMonth: { incomeYuan: yuanFromCents(stats.income), expenseYuan: yuanFromCents(stats.expense), balanceYuan: yuanFromCents(stats.balance), count: stats.transactions.length },
+    previousMonth: { incomeYuan: yuanFromCents(previous.income), expenseYuan: yuanFromCents(previous.expense), balanceYuan: yuanFromCents(previous.balance), count: previous.transactions.length },
+    categories,
+    availableCategories: state.categories.map((item) => ({ id: item.id, label: item.label, type: item.type })),
+    availableAccounts: activeAccounts().map((item) => ({ id: item.id, name: item.name, type: item.type })),
+    recentTransactions: sortTransactions(state.transactions).slice(0, 30).map((item) => ({
+      occurredAt: item.occurredAt,
+      type: item.type,
+      amountYuan: yuanFromCents(item.amount),
+      categoryId: item.categoryId,
+      category: getCategory(item.categoryId).label,
+      accountId: item.accountId,
+      account: accountName(item.accountId),
+      note: item.note,
+      tags: item.tags || [],
+    })),
+  };
+}
+
+function parseAgentModelReply(rawReply) {
+  const cleaned = String(rawReply || '').replace(/^```(?:json)?\s*/i, '').replace(/```$/i, '').trim();
+  const start = cleaned.indexOf('{');
+  const end = cleaned.lastIndexOf('}');
+  if (start < 0 || end < start) throw new Error('模型返回格式不完整。');
+  const parsed = JSON.parse(cleaned.slice(start, end + 1));
+  if (!['transaction_draft', 'answer', 'clarify'].includes(parsed.kind)) throw new Error('模型返回了未知操作。');
+  if (parsed.kind === 'transaction_draft') {
+    const draft = normalizeAgentDraft(parsed.draft);
+    if (!draft) return { kind: 'clarify', reply: '我还需要这笔流水的实际金额。' };
+    return { kind: parsed.kind, reply: String(parsed.reply || '请确认这笔记账草稿。'), draft };
+  }
+  return { kind: parsed.kind, reply: String(parsed.reply || '我暂时没有读懂，可以换一种说法吗？') };
+}
+
+async function remoteAgentResponse() {
+  const messages = state.agentMessages.slice(-12).map((message) => ({ role: message.role, content: message.content }));
+  const response = await postJson('/api/agent/chat', {
+    config: state.agentConfig,
+    messages,
+    ledgerContext: ledgerContextForAgent(),
+  });
+  return parseAgentModelReply(response.reply);
+}
+
+async function sendAgentMessage(text) {
+  const content = String(text || '').trim();
+  if (!content || state.agentSending) return;
+  await persistAgentMessage(agentMessage('user', content));
+  state.agentSending = true;
+  render();
+  requestAnimationFrame(scrollAgentToLatest);
+  try {
+    let result = null;
+    if (hasRemoteAgentConfig()) {
+      try {
+        result = await remoteAgentResponse();
+        state.agentConnection = 'connected';
+        state.agentConnectionMessage = `已连接 ${state.agentConfig.model}`;
+      } catch (error) {
+        state.agentConnection = 'error';
+        state.agentConnectionMessage = '模型暂时不可用，已切换本地模式';
+        toast(error instanceof Error ? error.message : '模型暂时不可用。', 'error');
+      }
+    }
+    result ||= localAgentResponse(content);
+    result ||= {
+      kind: 'answer',
+      reply: hasRemoteAgentConfig()
+        ? '我暂时没能处理这个问题。你可以换一种说法，或先检查模型连接。'
+        : '目前我可以直接帮你记账和查询本月收支。配置模型后，还能理解更灵活的表达。',
+    };
+    await persistAgentMessage(agentMessage('assistant', result.reply, result.draft ? { draft: result.draft, draftStatus: 'pending' } : {}));
+  } finally {
+    state.agentSending = false;
+    render();
+    requestAnimationFrame(scrollAgentToLatest);
+  }
+}
+
+function agentConnectionMeta() {
+  if (state.agentConnection === 'testing') return { className: 'testing', iconName: 'ph-circle-notch', label: '正在测试连接' };
+  if (state.agentConnection === 'connected') return { className: 'connected', iconName: 'ph-check-circle', label: state.agentConnectionMessage };
+  if (state.agentConnection === 'error') return { className: 'error', iconName: 'ph-warning-circle', label: state.agentConnectionMessage };
+  if (hasRemoteAgentConfig()) return { className: 'configured', iconName: 'ph-plugs-connected', label: `已配置 ${state.agentConfig.model}` };
+  return { className: 'local', iconName: 'ph-device-mobile', label: '本地基础模式可用' };
+}
+
+function renderAgentDraft(message) {
+  const draft = message.draft;
+  if (!draft) return '';
+  if (message.draftStatus === 'committed') {
+    return `<div class="agent-draft-card committed"><div class="agent-draft-result">${icon('ph-check-circle')}<div><strong>已写入账本</strong><span>${escapeHtml(getCategory(draft.categoryId).label)} · ${money(centsFromYuan(draft.amountYuan))} · ${escapeHtml(accountName(draft.accountId))}</span></div></div><button class="text-button" type="button" data-view="ledger">查看流水 ${icon('ph-caret-right')}</button></div>`;
+  }
+  if (message.draftStatus === 'dismissed') return `<div class="agent-draft-card dismissed">${icon('ph-x-circle')}<span>这份草稿已放弃，没有写入账本。</span></div>`;
+  return `
+    <form class="agent-draft-card" data-agent-draft-form data-message-id="${escapeHtml(message.id)}">
+      <div class="agent-draft-heading"><div>${icon('ph-receipt')}<span><strong>记账草稿</strong><small>确认后才会写入</small></span></div><strong class="agent-draft-amount">${money(centsFromYuan(draft.amountYuan))}</strong></div>
+      <div class="agent-draft-grid">
+        <label class="field"><span>类型</span><select class="select-input agent-draft-type" name="type"><option value="expense" ${draft.type === 'expense' ? 'selected' : ''}>支出</option><option value="income" ${draft.type === 'income' ? 'selected' : ''}>收入</option><option value="transfer" ${draft.type === 'transfer' ? 'selected' : ''}>转账</option></select></label>
+        <label class="field"><span>金额</span><input class="text-input" name="amount" type="number" min="0.01" step="0.01" value="${number(draft.amountYuan)}" required /></label>
+        <label class="field"><span>分类</span><select class="select-input agent-draft-category" name="categoryId">${categoryOptions(draft.type, draft.categoryId)}</select></label>
+        <label class="field"><span>账户</span><select class="select-input" name="accountId" required>${accountOptions(draft.accountId)}</select></label>
+        <label class="field agent-draft-transfer ${draft.type === 'transfer' ? '' : 'hidden'}"><span>转入账户</span><select class="select-input" name="toAccountId">${accountOptions(draft.toAccountId)}</select></label>
+        <label class="field"><span>发生时间</span><input class="text-input" name="occurredAt" type="datetime-local" value="${escapeHtml(localDateTimeValue(draft.occurredAt))}" required /></label>
+        <label class="field field-span-2"><span>备注</span><input class="text-input" name="note" value="${escapeHtml(draft.note)}" maxlength="80" /></label>
+      </div>
+      <div class="agent-draft-actions"><button class="secondary-button" type="button" data-action="dismiss-agent-draft" data-message-id="${escapeHtml(message.id)}">放弃草稿</button><button class="primary-button" type="submit">${icon('ph-check')}确认入账</button></div>
+    </form>`;
+}
+
+function renderAgentMessage(message) {
+  const assistant = message.role === 'assistant';
+  return `
+    <article class="agent-message ${assistant ? 'assistant' : 'user'}">
+      ${assistant ? `<span class="agent-avatar">${icon('ph-chat-circle-dots')}</span>` : ''}
+      <div class="agent-message-content">
+        <div class="agent-bubble">${escapeHtml(message.content).replaceAll('\n', '<br>')}</div>
+        ${assistant ? renderAgentDraft(message) : ''}
+        <time datetime="${escapeHtml(message.createdAt)}">${escapeHtml(timeLabel(message.createdAt))}</time>
+      </div>
+    </article>`;
+}
+
+function renderAgent() {
+  const connection = agentConnectionMeta();
+  const messages = state.agentMessages.length
+    ? state.agentMessages.map(renderAgentMessage).join('')
+    : `<article class="agent-message assistant"><span class="agent-avatar">${icon('ph-chat-circle-dots')}</span><div class="agent-message-content"><div class="agent-bubble"><strong>你好，我是账本助手。</strong><br>你可以直接说“午餐 28 元，微信支付”，也可以问“这个月花了多少”。记账草稿需要你确认后才会写入。</div></div></article>`;
+  const prompts = ['今天午餐 28 元，微信支付', '本月花了多少？', '本月支出最多的是哪类？', '餐饮比上月多吗？'];
+  return `
+    ${pageHeader('智能助手', '一句话记账，也可以直接询问收入、支出和结余。', `<button class="secondary-button" type="button" data-action="open-agent-settings">${icon('ph-sliders-horizontal')}模型设置</button>`)}
+    <div class="agent-workspace">
+      <section class="agent-chat-panel" aria-label="账本助手聊天">
+        <header class="agent-chat-header"><div><span class="agent-avatar">${icon('ph-chat-circle-dots')}</span><span><strong>账本助手</strong><small class="agent-status ${connection.className}">${icon(connection.iconName)}${escapeHtml(connection.label)}</small></span></div><button class="icon-button" type="button" data-action="clear-agent-chat" aria-label="清空聊天记录" title="清空聊天记录">${icon('ph-trash')}</button></header>
+        <div class="agent-message-list" id="agent-message-list" aria-live="polite">
+          ${messages}
+          ${state.agentSending ? `<article class="agent-message assistant"><span class="agent-avatar">${icon('ph-chat-circle-dots')}</span><div class="agent-message-content"><div class="agent-bubble agent-typing"><span></span><span></span><span></span><b class="visually-hidden">正在整理账本信息</b></div></div></article>` : ''}
+        </div>
+        <div class="agent-mobile-prompts">${prompts.slice(0, 2).map((prompt) => `<button type="button" data-agent-prompt="${escapeHtml(prompt)}">${escapeHtml(prompt)}</button>`).join('')}</div>
+        <form class="agent-composer" id="agent-chat-form">
+          <label class="visually-hidden" for="agent-input">发送给账本助手</label>
+          <textarea id="agent-input" name="message" rows="1" maxlength="1000" placeholder="说一笔收支，或问问本月账单" ${state.agentSending ? 'disabled' : ''}></textarea>
+          <button class="agent-send-button" type="submit" ${state.agentSending ? 'disabled' : ''} aria-label="发送消息">${icon(state.agentSending ? 'ph-circle-notch' : 'ph-arrow-up')}</button>
+          <small>Enter 发送，Shift + Enter 换行</small>
+        </form>
+      </section>
+      <aside class="agent-side">
+        <section class="side-panel agent-connection-card"><div class="panel-heading"><h3>模型连接</h3><span class="agent-status ${connection.className}">${icon(connection.iconName)}${escapeHtml(connection.label)}</span></div><div class="panel-body"><p>常见记账与查账可在本地完成。连接兼容模型后，可以理解更灵活的表达。</p><button class="secondary-button button-full" type="button" data-action="open-agent-settings">${icon('ph-plugs-connected')}配置并测试连接</button></div></section>
+        <section class="side-panel"><div class="panel-heading"><h3>试着这样问</h3></div><div class="panel-body agent-prompt-list">${prompts.map((prompt) => `<button type="button" data-agent-prompt="${escapeHtml(prompt)}">${icon('ph-arrow-bend-down-right')}<span>${escapeHtml(prompt)}</span></button>`).join('')}</div></section>
+        <section class="side-panel"><div class="panel-heading"><h3>数据边界</h3></div><div class="panel-body agent-privacy-note">${icon('ph-shield-check')}<p>写入前需要确认。模型只会收到必要汇总与近期流水，API Key 不会进入账本备份。</p></div></section>
+      </aside>
+    </div>`;
+}
+
+function scrollAgentToLatest() {
+  const list = document.querySelector('#agent-message-list');
+  if (list) list.scrollTop = list.scrollHeight;
+}
+
+async function testAgentConnection(config) {
+  state.agentConnection = 'testing';
+  state.agentConnectionMessage = '正在测试连接';
+  render();
+  try {
+    await postJson('/api/agent/test', { config });
+    state.agentConnection = 'connected';
+    state.agentConnectionMessage = `已连接 ${config.model}`;
+    render();
+    toast('模型连接成功。');
+  } catch (error) {
+    state.agentConnection = 'error';
+    state.agentConnectionMessage = '连接测试失败';
+    render();
+    throw error;
+  }
+}
+
+async function confirmAgentDraft(form) {
+  if (form.dataset.submitting === 'true') return;
+  form.dataset.submitting = 'true';
+  const submitButton = form.querySelector('button[type="submit"]');
+  if (submitButton) submitButton.disabled = true;
+  try {
+    const data = new FormData(form);
+    const type = String(data.get('type'));
+    const amount = centsFromYuan(data.get('amount'));
+    const occurredAt = parseLocalDateTime(data.get('occurredAt'));
+    const accountId = String(data.get('accountId') || '');
+    const toAccountId = type === 'transfer' ? String(data.get('toAccountId') || '') : '';
+    if (!(amount > 0)) throw new Error('金额需要大于 0。');
+    if (!occurredAt) throw new Error('请选择有效的发生时间。');
+    if (!accountId) throw new Error('请选择账户。');
+    if (type === 'transfer' && (!toAccountId || accountId === toAccountId)) throw new Error('请选择不同的转入账户。');
+    const now = new Date().toISOString();
+    const draft = {
+      type,
+      amountYuan: yuanFromCents(amount),
+      categoryId: type === 'transfer' ? 'transfer' : String(data.get('categoryId')),
+      accountId,
+      toAccountId,
+      occurredAt,
+      note: String(data.get('note') || '').trim(),
+      tags: ['Agent 记账'],
+    };
+    const transaction = {
+      id: id(),
+      type,
+      amount,
+      categoryId: draft.categoryId,
+      accountId,
+      toAccountId,
+      note: draft.note,
+      tags: draft.tags,
+      occurredAt,
+      source: 'agent',
+      createdAt: now,
+      updatedAt: now,
+    };
+    await persistTransaction(transaction, 'Agent 草稿已确认入账。');
+    await updateAgentMessage(form.dataset.messageId, { draft, draftStatus: 'committed' });
+    render();
+    requestAnimationFrame(scrollAgentToLatest);
+  } catch (error) {
+    delete form.dataset.submitting;
+    if (submitButton) submitButton.disabled = false;
+    throw error;
+  }
+}
+
 function renderAccounts() {
   const cards = activeAccounts().map((account) => `
     <article class="account-card">
@@ -839,10 +1380,24 @@ function renderCategories() {
 
 function renderSettings() {
   const estimate = salaryEstimate();
+  const connection = agentConnectionMeta();
   return `
-    ${pageHeader('设置', '管理账本口径、可选工资估算和本地备份。', '')}
+    ${pageHeader('设置', '管理账本口径、模型连接、可选工资估算和本地备份。', '')}
     <div class="settings-grid">
       <div class="settings-main">
+        <section class="settings-section" id="agent-model-settings">
+          <div class="settings-title-row"><div><h2>Agent 模型连接</h2><p>兼容 OpenAI 风格的聊天接口，也可填写支持该接口的本地模型地址。</p></div><span class="agent-status ${connection.className}">${icon(connection.iconName)}${escapeHtml(connection.label)}</span></div>
+          <form id="agent-settings-form" autocomplete="off">
+            <div class="form-grid">
+              <label class="field field-span-2"><span>API 地址</span><input class="text-input" name="baseUrl" type="url" inputmode="url" value="${escapeHtml(state.agentConfig.baseUrl)}" placeholder="例如：https://api.example.com/v1" /><small class="field-hint">需要填写到 v1 层级，系统会调用 /chat/completions。</small></label>
+              <label class="field"><span>模型名称</span><input class="text-input" name="model" value="${escapeHtml(state.agentConfig.model)}" placeholder="填写服务商提供的模型 ID" spellcheck="false" /></label>
+              <label class="field"><span>API Key</span><span class="secret-input"><input class="text-input" name="apiKey" type="password" value="${escapeHtml(state.agentConfig.apiKey)}" placeholder="本地模型可留空" autocomplete="new-password" /><button class="icon-button" type="button" data-action="toggle-agent-key" aria-label="显示 API Key">${icon('ph-eye')}</button></span></label>
+              <label class="check-field field-span-2"><input type="checkbox" name="rememberKey" ${state.agentConfig.rememberKey ? 'checked' : ''} /><span><strong>在这台设备记住 API Key</strong><small>关闭时只保留到当前浏览器会话结束；API Key 不会进入账本备份。</small></span></label>
+            </div>
+            <div class="form-actions"><button class="secondary-button" type="button" data-action="clear-agent-config">清除配置</button><button class="primary-button" type="submit" ${state.agentConnection === 'testing' ? 'disabled' : ''}>${state.agentConnection === 'testing' ? `${icon('ph-circle-notch')}正在测试` : `${icon('ph-plugs-connected')}保存并测试连接`}</button></div>
+          </form>
+        </section>
+
         <section class="settings-section">
           <h2>账本设置</h2>
           <p>预算只用于提醒，不会限制记账；金额默认使用人民币。</p>
@@ -879,7 +1434,8 @@ function renderSettings() {
           <p>所有流水、账户和分类默认只保存在当前浏览器。换设备或清理浏览器前，请先导出备份。</p>
           <ul class="privacy-list">
             <li>${icon('ph-check-circle')}<span>不要求注册账号</span></li>
-            <li>${icon('ph-check-circle')}<span>不会自动上传流水</span></li>
+            <li>${icon('ph-check-circle')}<span>不会自动同步或上传完整账本</span></li>
+            <li>${icon('ph-check-circle')}<span>使用外部模型时，仅在提问后发送必要汇总与近期流水</span></li>
             <li>${icon('ph-check-circle')}<span>备份文件可在另一台设备导入</span></li>
           </ul>
           <div class="backup-actions"><button class="secondary-button button-full" type="button" data-action="export-data">${icon('ph-download-simple')}导出备份</button><button class="secondary-button button-full" type="button" data-action="import-data">${icon('ph-upload-simple')}导入备份</button></div>
@@ -920,6 +1476,7 @@ function render() {
   } else {
     const views = {
       home: renderHome,
+      agent: renderAgent,
       ledger: renderLedger,
       reports: renderReports,
       accounts: renderAccounts,
@@ -934,12 +1491,13 @@ function render() {
 }
 
 function navigate(view, options = {}) {
-  if (!['home', 'ledger', 'reports', 'accounts', 'categories', 'settings'].includes(view)) view = 'home';
+  if (!VALID_VIEWS.includes(view)) view = 'home';
   state.activeView = view;
   if (location.hash !== `#${view}`) history.pushState(null, '', `#${view}`);
   render();
   document.querySelector('#main-content')?.focus({ preventScroll: true });
   if (options.focusSearch) requestAnimationFrame(() => document.querySelector('#ledger-search')?.focus());
+  if (view === 'agent') requestAnimationFrame(scrollAgentToLatest);
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -1223,7 +1781,7 @@ async function importData(file) {
   validateBackup(data);
   if (!window.confirm(`将导入 ${data.transactions.length} 笔流水，并替换当前账本数据。继续吗？`)) return;
   if (!state.demo) {
-    await Promise.all([dbClear(STORES.transactions), dbClear(STORES.categories), dbClear(STORES.accounts)]);
+    await Promise.all([dbClear(STORES.transactions), dbClear(STORES.categories), dbClear(STORES.accounts), dbClear(STORES.agentMessages)]);
     for (const item of data.transactions) await dbPut(STORES.transactions, item);
     for (const item of data.categories) await dbPut(STORES.categories, item);
     for (const item of data.accounts) await dbPut(STORES.accounts, item);
@@ -1233,6 +1791,7 @@ async function importData(file) {
   state.transactions = sortTransactions(data.transactions);
   state.categories = data.categories;
   state.accounts = data.accounts;
+  state.agentMessages = [];
   render();
   toast('备份已导入。');
 }
@@ -1240,13 +1799,14 @@ async function importData(file) {
 async function resetData() {
   if (!window.confirm('确定清空当前设备中的全部账本数据吗？此操作不能撤销。')) return;
   if (!state.demo) {
-    await Promise.all([dbClear(STORES.transactions), dbClear(STORES.categories), dbClear(STORES.accounts)]);
+    await Promise.all([dbClear(STORES.transactions), dbClear(STORES.categories), dbClear(STORES.accounts), dbClear(STORES.agentMessages)]);
     await dbPut(STORES.settings, { key: 'profile', ...DEFAULT_PROFILE });
     for (const category of DEFAULT_CATEGORIES) await dbPut(STORES.categories, category);
     for (const account of DEFAULT_ACCOUNTS) await dbPut(STORES.accounts, account);
   }
   state.profile = { ...DEFAULT_PROFILE, salaryEstimate: { ...DEFAULT_PROFILE.salaryEstimate } };
   state.transactions = [];
+  state.agentMessages = [];
   state.categories = [...DEFAULT_CATEGORIES];
   state.accounts = [...DEFAULT_ACCOUNTS];
   navigate('home');
@@ -1260,6 +1820,15 @@ document.addEventListener('click', async (event) => {
     navigate(viewTarget.dataset.view);
     return;
   }
+  const promptTarget = event.target.closest('[data-agent-prompt]');
+  if (promptTarget) {
+    try {
+      await sendAgentMessage(promptTarget.dataset.agentPrompt);
+    } catch (error) {
+      toast(error instanceof Error ? error.message : '发送失败，请重试。', 'error');
+    }
+    return;
+  }
   const actionTarget = event.target.closest('[data-action]');
   if (!actionTarget) return;
   const { action } = actionTarget.dataset;
@@ -1271,6 +1840,38 @@ document.addEventListener('click', async (event) => {
     if (action === 'previous-month') { shiftMonth(-1); return; }
     if (action === 'next-month') { shiftMonth(1); return; }
     if (action === 'open-search') { navigate('ledger', { focusSearch: true }); return; }
+    if (action === 'open-agent-settings') {
+      navigate('settings');
+      requestAnimationFrame(() => document.querySelector('#agent-model-settings')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+      return;
+    }
+    if (action === 'clear-agent-chat') {
+      if (!state.agentMessages.length) { toast('当前没有聊天记录。'); return; }
+      if (window.confirm('清空当前设备中的 Agent 聊天记录吗？账本流水不会受影响。')) await clearAgentMessages();
+      return;
+    }
+    if (action === 'dismiss-agent-draft') {
+      await updateAgentMessage(actionTarget.dataset.messageId, { draftStatus: 'dismissed' });
+      render();
+      toast('草稿已放弃，没有写入账本。');
+      return;
+    }
+    if (action === 'toggle-agent-key') {
+      const input = actionTarget.closest('.secret-input')?.querySelector('input');
+      if (!input) return;
+      input.type = input.type === 'password' ? 'text' : 'password';
+      actionTarget.setAttribute('aria-label', input.type === 'password' ? '显示 API Key' : '隐藏 API Key');
+      actionTarget.innerHTML = icon(input.type === 'password' ? 'ph-eye' : 'ph-eye-slash');
+      return;
+    }
+    if (action === 'clear-agent-config') {
+      saveAgentConfig(DEFAULT_AGENT_CONFIG);
+      state.agentConnection = 'idle';
+      state.agentConnectionMessage = '本地基础模式可用';
+      render();
+      toast('模型配置已清除，本地基础模式仍可使用。');
+      return;
+    }
     if (action === 'toggle-sidebar') {
       const shell = document.querySelector('#app-shell');
       shell?.classList.toggle('sidebar-collapsed');
@@ -1310,6 +1911,13 @@ document.addEventListener('click', async (event) => {
 document.addEventListener('change', async (event) => {
   if (event.target.id === 'ledger-type-filter') { state.ledgerType = event.target.value; render(); }
   if (event.target.id === 'ledger-account-filter') { state.ledgerAccount = event.target.value; render(); }
+  if (event.target.classList.contains('agent-draft-type')) {
+    const form = event.target.closest('[data-agent-draft-form]');
+    const type = event.target.value;
+    const category = form?.querySelector('.agent-draft-category');
+    if (category) category.innerHTML = categoryOptions(type, '');
+    form?.querySelector('.agent-draft-transfer')?.classList.toggle('hidden', type !== 'transfer');
+  }
   if (event.target.id === 'backup-file') {
     const file = event.target.files?.[0];
     event.target.value = '';
@@ -1320,6 +1928,10 @@ document.addEventListener('change', async (event) => {
 
 document.addEventListener('input', (event) => {
   if (event.target.classList.contains('salary-input')) updateSalaryEstimatePreview();
+  if (event.target.id === 'agent-input') {
+    event.target.style.height = 'auto';
+    event.target.style.height = `${Math.min(132, event.target.scrollHeight)}px`;
+  }
   if (event.target.id === 'ledger-search') {
     state.searchTerm = event.target.value;
     const position = event.target.selectionStart;
@@ -1339,6 +1951,25 @@ document.addEventListener('submit', async (event) => {
   const form = event.target;
   const data = new FormData(form);
   try {
+    if (form.id === 'agent-chat-form') {
+      await sendAgentMessage(data.get('message'));
+      return;
+    }
+    if (form.matches('[data-agent-draft-form]')) {
+      await confirmAgentDraft(form);
+      return;
+    }
+    if (form.id === 'agent-settings-form') {
+      const config = saveAgentConfig({
+        baseUrl: data.get('baseUrl'),
+        model: data.get('model'),
+        apiKey: data.get('apiKey'),
+        rememberKey: data.get('rememberKey') === 'on',
+      });
+      if (!config.baseUrl || !config.model) throw new Error('请填写 API 地址和模型名称。');
+      await testAgentConnection(config);
+      return;
+    }
     if (form.id === 'transaction-form') {
       const original = state.transactions.find((item) => item.id === form.dataset.transactionId);
       const type = String(data.get('type'));
@@ -1411,6 +2042,12 @@ document.addEventListener('submit', async (event) => {
   }
 });
 
+document.addEventListener('keydown', (event) => {
+  if (event.target.id !== 'agent-input' || event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
+  event.preventDefault();
+  event.target.form?.requestSubmit();
+});
+
 document.querySelector('#app-dialog')?.addEventListener('cancel', (event) => {
   event.preventDefault();
   closeDialog();
@@ -1419,7 +2056,7 @@ document.querySelector('#app-dialog')?.addEventListener('cancel', (event) => {
 window.addEventListener('hashchange', () => {
   const view = location.hash.replace('#', '');
   if (!view || view === state.activeView) return;
-  state.activeView = ['home', 'ledger', 'reports', 'accounts', 'categories', 'settings'].includes(view) ? view : 'home';
+  state.activeView = VALID_VIEWS.includes(view) ? view : 'home';
   render();
 });
 
@@ -1438,7 +2075,8 @@ function registerServiceWorker() {
 
 function initialize() {
   const hashView = location.hash.replace('#', '');
-  if (['home', 'ledger', 'reports', 'accounts', 'categories', 'settings'].includes(hashView)) state.activeView = hashView;
+  if (VALID_VIEWS.includes(hashView)) state.activeView = hashView;
+  state.agentConfig = loadAgentConfig();
   if (new URLSearchParams(location.search).get('qa') === '1') document.documentElement.dataset.qa = 'true';
   if (state.demo) state.selectedMonth = new Date(2026, 7, 1);
   if (localStorage.getItem('worker-ledger-sidebar') === 'collapsed') document.querySelector('#app-shell')?.classList.add('sidebar-collapsed');

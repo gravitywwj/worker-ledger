@@ -8,7 +8,7 @@
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" href="./favicon.svg?v=8" type="image/svg+xml" />
     <link rel="stylesheet" href="./assets/phosphor/style.css?v=1" />
-    <link rel="stylesheet" href="./styles.css?v=12" />
+    <link rel="stylesheet" href="./styles.css?v=14" />
     <title>打工人小账本</title>
   </head>
   <body>
@@ -22,6 +22,9 @@
         <nav class="nav-list" aria-label="账本功能">
           <a class="nav-item active" href="#home" data-view="home">
             <i class="ph ph-house" aria-hidden="true"></i><span>首页</span>
+          </a>
+          <a class="nav-item" href="#agent" data-view="agent">
+            <i class="ph ph-chat-circle-dots" aria-hidden="true"></i><span>智能助手</span>
           </a>
           <a class="nav-item" href="#ledger" data-view="ledger">
             <i class="ph ph-list-bullets" aria-hidden="true"></i><span>流水</span>
@@ -62,7 +65,7 @@
         <button class="mobile-nav-item mobile-add" type="button" data-action="open-transaction"><i class="ph ph-plus" aria-hidden="true"></i><span>记一笔</span></button>
         <a class="mobile-nav-item" href="#ledger" data-view="ledger"><i class="ph ph-list-bullets" aria-hidden="true"></i><span>流水</span></a>
         <a class="mobile-nav-item" href="#reports" data-view="reports"><i class="ph ph-chart-bar" aria-hidden="true"></i><span>报表</span></a>
-        <a class="mobile-nav-item" href="#settings" data-view="settings"><i class="ph ph-gear" aria-hidden="true"></i><span>设置</span></a>
+        <a class="mobile-nav-item" href="#agent" data-view="agent"><i class="ph ph-chat-circle-dots" aria-hidden="true"></i><span>助手</span></a>
       </nav>
     </div>
 
@@ -70,6 +73,6 @@
     <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
     <input id="backup-file" class="visually-hidden" type="file" accept="application/json" />
 
-    <script src="./app.js?v=11" defer></script>
+    <script src="./app.js?v=15" defer></script>
   </body>
 </html>

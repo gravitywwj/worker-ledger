@@ -84,4 +84,37 @@
 - 根据品牌授权决定是否增加第三方支付平台品牌图标。
 - 后续给真实趋势点增加悬停明细，不改变当前简洁结构。
 
+## Agent V1 Addendum
+
+### Comparison Evidence
+
+- Existing Option 1 baseline: `D:\ML\Bill\.design-references\implementation-home-final.png`
+- Agent desktop, `1024 × 683`: `D:\ML\Bill\.design-references\agent-desktop-1024.png`
+- Full shared-system comparison: `D:\ML\Bill\.design-references\agent-qa-comparison-full.png`
+- Focused shared-chrome comparison: `D:\ML\Bill\.design-references\agent-qa-comparison-focus.png`
+- Filled draft state: `D:\ML\Bill\.design-references\agent-desktop-flow.png`
+- Mobile, `375 × 812`: `D:\ML\Bill\.design-references\agent-mobile.png`
+
+Agent 是新增页面，没有同状态的独立视觉稿；因此本轮不重新发明视觉方向，而是把已经通过的方案 1 首页作为共享设计系统基准，对比侧栏、页面标题、面板、边框、圆角、按钮、字体、图标和响应式节奏。完整对比与聚焦对比均未发现仍需修复的 P0、P1 或 P2 差异。
+
+### Agent Interaction Verification
+
+- 本地基础问答：“本月花了多少？”返回 `15` 笔支出、合计 `¥3,286`。
+- 自然语言记账：“今天午餐 28 元，微信支付”生成 `¥28 / 餐饮 / 微信` 的可编辑支出草稿。
+- 点击确认后显示“已写入账本”，流水页出现来源为 Agent 的 `¥28` 午餐支出。
+- “12:30 午饭”不会把时间误识别为金额；页面追问金额且不生成待确认草稿。
+- “支付宝转账 100 元到微信”生成 `转账 / ¥100 / 支付宝 → 微信` 草稿，放弃后不写入流水。
+- 模型设置页通过本地模拟 `/v1/chat/completions` 完成保存、连接测试和远程回答；未勾选记住时 API Key 不写入本地存储。
+- `1280 × 800` 桌面和 `375 × 812` 移动端均无水平溢出；移动端右侧辅助栏隐藏，输入框、模型设置入口和底部助手导航可用。
+- 浏览器运行时异常：0；控制台错误：0。
+
+### Agent Checklist
+
+- [x] 与现有视觉系统一致，没有引入第二套 AI 风格。
+- [x] 本地基础模式无需模型配置即可使用。
+- [x] 外部模型配置包含地址、模型名、可选 Key 和连接测试。
+- [x] 草稿可编辑，确认前不写入正式流水。
+- [x] 桌面双栏、移动单栏和数据边界文案通过。
+- [x] README、产品范围、设计规范、交接文档与 Figma 路线图已更新。
+
 final result: passed
