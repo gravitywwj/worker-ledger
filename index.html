@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#ffffff" />
+    <meta name="description" content="一个简单、清楚、本地优先的个人收支账本。" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./favicon.svg?v=8" type="image/svg+xml" />
+    <link rel="stylesheet" href="./assets/phosphor/style.css?v=1" />
+    <link rel="stylesheet" href="./styles.css?v=12" />
+    <title>打工人小账本</title>
+  </head>
+  <body>
+    <div class="app-shell" id="app-shell">
+      <aside class="sidebar" aria-label="主导航">
+        <a class="brand" href="#home" data-view="home" aria-label="返回首页">
+          <img class="brand-mark" src="./favicon.svg?v=8" alt="" />
+          <span class="brand-name">打工人小账本</span>
+        </a>
+
+        <nav class="nav-list" aria-label="账本功能">
+          <a class="nav-item active" href="#home" data-view="home">
+            <i class="ph ph-house" aria-hidden="true"></i><span>首页</span>
+          </a>
+          <a class="nav-item" href="#ledger" data-view="ledger">
+            <i class="ph ph-list-bullets" aria-hidden="true"></i><span>流水</span>
+          </a>
+          <a class="nav-item" href="#reports" data-view="reports">
+            <i class="ph ph-chart-bar" aria-hidden="true"></i><span>报表</span>
+          </a>
+          <a class="nav-item" href="#accounts" data-view="accounts">
+            <i class="ph ph-wallet" aria-hidden="true"></i><span>账户</span>
+          </a>
+          <a class="nav-item" href="#categories" data-view="categories">
+            <i class="ph ph-tag" aria-hidden="true"></i><span>分类</span>
+          </a>
+          <a class="nav-item" href="#settings" data-view="settings">
+            <i class="ph ph-gear" aria-hidden="true"></i><span>设置</span>
+          </a>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div class="storage-status" title="账本数据默认只保存在这台设备">
+            <i class="ph ph-database" aria-hidden="true"></i>
+            <span><strong>本地保存</strong><small id="save-status">数据未上传</small></span>
+          </div>
+          <button class="sidebar-collapse" type="button" data-action="toggle-sidebar" aria-label="收起侧栏">
+            <i class="ph ph-sidebar-simple" aria-hidden="true"></i>
+          </button>
+        </div>
+      </aside>
+
+      <main class="main-content" id="main-content" tabindex="-1">
+        <div class="loading-line" id="loading-line" aria-hidden="true"></div>
+        <section class="app-notice hidden" id="app-notice" role="status" aria-live="polite"></section>
+        <section id="app-view" aria-live="polite"></section>
+      </main>
+
+      <nav class="mobile-nav" aria-label="移动端导航">
+        <a class="mobile-nav-item active" href="#home" data-view="home"><i class="ph ph-house" aria-hidden="true"></i><span>首页</span></a>
+        <button class="mobile-nav-item mobile-add" type="button" data-action="open-transaction"><i class="ph ph-plus" aria-hidden="true"></i><span>记一笔</span></button>
+        <a class="mobile-nav-item" href="#ledger" data-view="ledger"><i class="ph ph-list-bullets" aria-hidden="true"></i><span>流水</span></a>
+        <a class="mobile-nav-item" href="#reports" data-view="reports"><i class="ph ph-chart-bar" aria-hidden="true"></i><span>报表</span></a>
+        <a class="mobile-nav-item" href="#settings" data-view="settings"><i class="ph ph-gear" aria-hidden="true"></i><span>设置</span></a>
+      </nav>
+    </div>
+
+    <dialog class="app-dialog" id="app-dialog" aria-labelledby="dialog-title"></dialog>
+    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+    <input id="backup-file" class="visually-hidden" type="file" accept="application/json" />
+
+    <script src="./app.js?v=11" defer></script>
+  </body>
+</html>

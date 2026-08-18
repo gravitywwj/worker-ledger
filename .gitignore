@@ -1,0 +1,19 @@
+node_modules/
+
+# Local design and browser QA artifacts
+.design-references/
+.firecrawl/
+.impeccable/
+.playwright-cli/
+
+# Local environment and logs
+.env
+.env.*
+!.env.example
+*.log
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
