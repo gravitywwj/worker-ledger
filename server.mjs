@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createLedgerAgent } from './agent/agent.mjs';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
 const port = Number(process.env.PORT || 4173);
@@ -68,7 +69,7 @@ async function callChatCompletions(rawConfig, messages, options = {}) {
   const config = validateModelConfig(rawConfig);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 45000);
-  const thinking = options.thinking ?? { type: 'enabled' };
+  const thinking = options.thinking ?? { type: 'disabled' };
   const requestBody = {
     model: config.model,
     messages,
@@ -78,6 +79,7 @@ async function callChatCompletions(rawConfig, messages, options = {}) {
     thinking,
     ...(thinking.type === 'disabled' ? { temperature: options.temperature ?? 0.2 } : {}),
     ...(thinking.type === 'enabled' && options.reasoningEffort ? { reasoning_effort: options.reasoningEffort } : {}),
+    ...(Array.isArray(options.tools) && options.tools.length ? { tools: options.tools, tool_choice: options.toolChoice ?? 'auto' } : {}),
   };
   try {
     const response = await fetch(`${config.baseUrl}/chat/completions`, {
@@ -96,13 +98,16 @@ async function callChatCompletions(rawConfig, messages, options = {}) {
     }
     const choice = payload?.choices?.[0];
     if (choice?.finish_reason === 'length') throw new Error('模型输出被截断，请缩短输入或稍后重试。');
-    const message = choice?.message;
-    const content = message?.content;
-    if (typeof content === 'string' && content.trim()) return content.trim();
+    const rawMessage = choice?.message || {};
+    const message = { ...rawMessage };
+    const content = message?.content ?? choice?.text ?? payload?.output_text;
+    if (typeof content === 'string') message.content = content.trim();
     if (Array.isArray(content)) {
-      const joined = content.map((item) => item?.text || '').join('').trim();
-      if (joined) return joined;
+      const joined = content.map((item) => item?.text || item?.content?.text || '').join('').trim();
+      message.content = joined;
     }
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length) return { message, finishReason: choice?.finish_reason || 'tool_calls' };
+    if (message.content) return { message, finishReason: choice?.finish_reason || 'stop' };
     if (message?.reasoning_content) throw new Error('模型只返回了思考过程，没有返回最终内容；请关闭思考模式或增加输出长度。');
     throw new Error('模型没有返回可读取的内容。');
   } catch (error) {
@@ -117,28 +122,7 @@ async function callChatCompletions(rawConfig, messages, options = {}) {
   }
 }
 
-function agentSystemPrompt(ledgerContext) {
-  return `你是“打工人小账本”的记账助手。你只处理个人记账、收支查询和账本分析，不提供投资、借贷或税务决策建议。
-
-请始终返回一个合法 json 对象，不要使用 Markdown 代码块。结构只能是以下三种之一：
-1. 单笔：{"kind":"transaction_draft","reply":"给用户的简短说明","draft":{"type":"expense|income|transfer","amountYuan":数字,"category":"分类名称","account":"账户名称","toAccount":"转入账户名称或空字符串","occurredAt":"ISO 时间","note":"备注","tags":["标签"]}}
-2. 多笔：{"kind":"transaction_draft","reply":"给用户的简短说明","drafts":[{"type":"expense|income|transfer","amountYuan":数字,"category":"分类名称","account":"账户名称","toAccount":"转入账户名称或空字符串","occurredAt":"ISO 时间","note":"备注","tags":["标签"]}]}
-3. {"kind":"answer","reply":"基于账本数据的回答"}
-4. {"kind":"clarify","reply":"只追问一个最关键的缺失信息"}
-
-规则：
-- 只有用户明确表达要记一笔收入、支出或转账时，才返回 transaction_draft。
-- 金额不明确时必须 clarify，禁止猜测。
-- 一条消息出现多笔明确金额时，必须每笔都放进 drafts，禁止只取最后一个金额或合并金额；后续日期和账户未重复说明时，沿用最近的日期和账户。
-- category 必须填写 availableCategories 中对应的分类名称，account 必须填写 availableAccounts 中对应的账户名称；不要输出 categoryId 或 accountId。
-- “工资卡”是账户名称，只有明确出现“工资到账、工资收入”等到账语义时才是收入；“工资卡支出”必须识别为支出。
-- 优先使用上下文中已有的分类名称和账户名称；无法判断分类时使用“其他”，无法判断账户时 clarify。
-- 不得声称已经写入账本，草稿仍需用户确认。
-- 回答查账问题时必须以给定汇总和流水为依据，不得编造数据。
-- reply 使用简洁自然的中文。
-
-当前账本上下文：${JSON.stringify(ledgerContext)}`;
-}
+const ledgerAgent = await createLedgerAgent({ root, complete: callChatCompletions });
 
 async function handleAgentApi(request, response, pathname) {
   try {
@@ -155,21 +139,21 @@ async function handleAgentApi(request, response, pathname) {
       await callChatCompletions(payload.config, [
         { role: 'system', content: '只返回合法 json 对象：{"ok":true}。不要返回 Markdown。' },
         { role: 'user', content: '测试模型连接。' },
-      ], { maxTokens: 512, thinking: { type: 'enabled' }, reasoningEffort: 'low' });
+      ], { maxTokens: 512, thinking: { type: 'disabled' } });
       sendJson(response, 200, { ok: true });
       return;
     }
     if (pathname === '/api/agent/chat') {
       const history = Array.isArray(payload.messages) ? payload.messages.slice(-12) : [];
-      const messages = [
-        { role: 'system', content: agentSystemPrompt(payload.ledgerContext || {}) },
-        ...history.map((message) => ({
+      const result = await ledgerAgent.run({
+        config: payload.config,
+        messages: history.map((message) => ({
           role: message.role === 'assistant' ? 'assistant' : 'user',
           content: String(message.content || '').slice(0, 4000),
         })),
-      ];
-      const reply = await callChatCompletions(payload.config, messages);
-      sendJson(response, 200, { ok: true, reply });
+        ledgerContext: payload.ledgerContext || {},
+      });
+      sendJson(response, 200, { ok: true, reply: result.reply, agentMeta: { candidateCount: result.candidateCount, toolRounds: result.toolRounds } });
       return;
     }
     sendJson(response, 404, { error: '接口不存在。' });

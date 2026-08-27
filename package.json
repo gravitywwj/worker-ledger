@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check app.js && node --check server.mjs"
+    "check": "node --check app.js && node --check server.mjs && node --check agent/tools.mjs && node --check agent/agent.mjs",
+    "test:agent": "node --test agent/agent.test.mjs"
   },
   "dependencies": {
     "@phosphor-icons/web": "^2.1.1"

@@ -44,9 +44,13 @@ const DEFAULT_CATEGORIES = [
   { id: 'commute', label: '交通', icon: 'ph-train', type: 'expense' },
   { id: 'housing', label: '居住', icon: 'ph-house-line', type: 'expense' },
   { id: 'daily', label: '日用', icon: 'ph-shopping-bag', type: 'expense' },
+  { id: 'shopping', label: '购物', icon: 'ph-shopping-cart', type: 'expense' },
   { id: 'fun', label: '娱乐', icon: 'ph-game-controller', type: 'expense' },
+  { id: 'subscription', label: '订阅服务', icon: 'ph-calendar-check', type: 'expense' },
   { id: 'health', label: '健康', icon: 'ph-first-aid-kit', type: 'expense' },
   { id: 'learn', label: '学习', icon: 'ph-book-open', type: 'expense' },
+  { id: 'social', label: '人情', icon: 'ph-gift', type: 'expense' },
+  { id: 'travel', label: '旅行', icon: 'ph-airplane', type: 'expense' },
   { id: 'other', label: '其他', icon: 'ph-dots-three', type: 'expense' },
   { id: 'salary', label: '工资', icon: 'ph-briefcase', type: 'income' },
   { id: 'bonus', label: '奖金', icon: 'ph-sparkle', type: 'income' },
@@ -65,9 +69,13 @@ const CATEGORY_ICON_FALLBACKS = {
   commute: 'ph-train',
   housing: 'ph-house-line',
   daily: 'ph-shopping-bag',
+  shopping: 'ph-shopping-cart',
   fun: 'ph-game-controller',
+  subscription: 'ph-calendar-check',
   health: 'ph-first-aid-kit',
   learn: 'ph-book-open',
+  social: 'ph-gift',
+  travel: 'ph-airplane',
   other: 'ph-dots-three',
   salary: 'ph-briefcase',
   bonus: 'ph-sparkle',
@@ -106,6 +114,7 @@ const NUMBER_FORMATTER = new Intl.NumberFormat('zh-CN', { maximumFractionDigits:
 const DEMO_MODE = new URLSearchParams(location.search).get('demo') === '1';
 const VALID_VIEWS = ['home', 'agent', 'ledger', 'reports', 'accounts', 'categories', 'settings'];
 const AGENT_MAX_INPUT_LENGTH = 1000;
+const REMOTE_AGENT_TIMEOUT_MS = 12000;
 
 const state = {
   db: null,
@@ -310,7 +319,7 @@ function getCategory(categoryId) {
   if (categoryId === 'transfer') return { id: 'transfer', label: '转账', icon: 'ph-arrows-left-right', type: 'transfer' };
   return state.categories.find((category) => category.id === categoryId)
     || DEFAULT_CATEGORIES.find((category) => category.id === categoryId)
-    || DEFAULT_CATEGORIES[7];
+    || DEFAULT_CATEGORIES.find((category) => category.id === 'other');
 }
 
 function categoryIcon(category) {
@@ -534,8 +543,14 @@ function dbClear(storeName) {
 }
 
 async function ensureInitialData() {
-  if ((await dbGetAll(STORES.categories)).length === 0) {
+  const existingCategories = await dbGetAll(STORES.categories);
+  if (existingCategories.length === 0) {
     for (const category of DEFAULT_CATEGORIES) await dbPut(STORES.categories, category);
+  } else {
+    const existingIds = new Set(existingCategories.map((category) => category.id));
+    for (const category of DEFAULT_CATEGORIES) {
+      if (!existingIds.has(category.id)) await dbPut(STORES.categories, category);
+    }
   }
   if ((await dbGetAll(STORES.accounts)).length === 0) {
     for (const account of DEFAULT_ACCOUNTS) await dbPut(STORES.accounts, account);
@@ -1016,6 +1031,7 @@ function agentAmountFromText(text) {
 }
 
 function inferAgentType(text) {
+  if (/退款|退回|退还|返还|返款|返现/.test(text)) return 'income';
   if (/转账|转到|转入|转出/.test(text)) return 'transfer';
   if (/支出|消费|花费|付款|付了|买了|购买|充值|扣款|外卖|餐饮/.test(text)) return 'expense';
   if (/收入|工资到账|薪资到账|工资收入|薪资收入|奖金到账|报销到账|退款到账|兼职收入|补贴到账|收到/.test(text)) return 'income';
@@ -1026,7 +1042,7 @@ function inferAgentCategory(text, type) {
   const rules = type === 'income'
     ? [
         ['bonus', /奖金|年终奖|绩效/],
-        ['reimburse', /报销|退款|返现/],
+        ['reimburse', /报销|退款|退回|退还|返还|返款|返现/],
         ['salary', /工资|薪资|兼职|补贴|津贴/],
       ]
     : [
@@ -1035,8 +1051,12 @@ function inferAgentCategory(text, type) {
         ['housing', /房租|租金|物业|住房|居住/],
         ['health', /医院|门诊|药|体检|健康/],
         ['learn', /课程|书|学习|培训|资料/],
-        ['fun', /电影|游戏|娱乐|演出|旅行|GPT|OpenAI|会员|订阅|软件服务/],
-        ['daily', /日用|超市|买菜|购物|话费|水电|水费|电费|燃气|枕头|家政|洗衣液|垃圾桶|厨房|客厅|厕所|锅|刀具|锅铲|驱蚊器/],
+        ['travel', /火车|高铁|机票|酒店|旅行|旅游/],
+        ['subscription', /GPT|OpenAI|会员|订阅|软件服务|续费/],
+        ['fun', /电影|游戏|娱乐|演出/],
+        ['social', /红包|礼物|随礼|人情|请客/],
+        ['daily', /日用|盒马|超市|买菜|生鲜|话费|水电|水费|电费|燃气|枕头|家政|洗衣液|垃圾桶|厨房|客厅|厕所|锅|刀具|锅铲|驱蚊器/],
+        ['shopping', /抖音|淘宝|天猫|京东|拼多多|购物|服装|衣服|鞋|数码|电子产品|商品/],
       ];
   const matched = rules.find(([, pattern]) => pattern.test(text))?.[0];
   if (matched && state.categories.some((category) => category.id === matched && category.type === type)) return matched;
@@ -1071,7 +1091,7 @@ function inferAgentOccurredAt(text) {
   const date = new Date();
   if (/前天/.test(text)) date.setDate(date.getDate() - 2);
   else if (/昨天/.test(text)) date.setDate(date.getDate() - 1);
-  const dateMatch = text.match(/(?:(\d{4})\s*[年/-]\s*)?(\d{1,2})\s*(?:月|[./-])\s*(\d{1,2})\s*(?:日|号)?/);
+  const dateMatch = text.match(/(?:(\d{4})\s*[年/-]\s*)?((?:1[0-2]|0?[1-9]))\s*(?:月|[./-])\s*((?:[12]\d|3[01]|0?[1-9]))\s*(?:日|号)?(?!\d)/);
   if (dateMatch) date.setMonth(Number(dateMatch[2]) - 1, Number(dateMatch[3]));
   else {
     const dayMatch = text.match(/(?:^|[^\d])(\d{1,2})\s*(?:日|号)/);
@@ -1091,7 +1111,7 @@ function inferAgentNote(text, type) {
     ['早餐', /早餐/], ['午餐', /午饭|午餐/], ['晚餐', /晚饭|晚餐/], ['咖啡', /咖啡/], ['奶茶', /奶茶/],
     ['地铁', /地铁/], ['公交', /公交/], ['打车', /打车|出租|网约车/], ['房租', /房租|租金/],
     ['日常采购', /超市|买菜|日用/], ['工资到账', /工资|薪资/], ['奖金到账', /奖金|绩效/],
-    ['报销到账', /报销/], ['退款到账', /退款/],
+    ['报销到账', /报销/], ['退款到账', /退款|退回|退还|返还|返款|返现/],
   ];
   return notes.find(([, pattern]) => pattern.test(text))?.[0] || (type === 'income' ? '收入' : type === 'transfer' ? '账户转账' : '支出');
 }
@@ -1108,7 +1128,7 @@ function resolveAgentCategoryId(value, type, note = '') {
   if (byLabel) return byLabel.id;
   const aliases = type === 'income'
     ? { 工资收入: 'salary', 薪资: 'salary', 报销: 'reimburse', 退款: 'reimburse', 其他: 'other-income' }
-    : { 吃饭: 'food', 餐饮消费: 'food', 交通卡: 'commute', 公交卡: 'commute', 家庭用品: 'daily', 日常用品: 'daily', 订阅: 'fun' };
+    : { 吃饭: 'food', 餐饮消费: 'food', 交通卡: 'commute', 公交卡: 'commute', 家庭用品: 'daily', 日常用品: 'daily', 购物: 'shopping', 订阅: 'subscription', 人情: 'social', 旅行: 'travel' };
   const aliasId = aliases[raw];
   if (aliasId && state.categories.some((category) => category.id === aliasId && category.type === type)) return aliasId;
   return inferAgentCategory(note, type);
@@ -1156,11 +1176,11 @@ function normalizeAgentDraft(rawDraft = {}) {
 function splitAgentTransactionGroups(text) {
   return String(text || '')
     .replace(/\r?\n/g, '；')
-    .split(/[；;]/)
+    .split(/[；;。！？!?]/)
     .map((fragment) => fragment.trim())
     .filter(Boolean)
     .map((fragment) => {
-      const dateMatch = fragment.match(/^\s*(?:(?:\d{4})\s*[年/-]\s*)?\d{1,2}\s*(?:月\s*\d{1,2}\s*(?:日|号)?|[./-]\s*\d{1,2}\s*(?:日|号)?|(?:日|号))\s*[，,、:：-]?\s*/);
+      const dateMatch = fragment.match(/^\s*(?:(?:(?:\d{4})\s*[年/-]\s*)?(?:1[0-2]|0?[1-9])\s*(?:月\s*(?:[12]\d|3[01]|0?[1-9])\s*(?:日|号)?|[./-]\s*(?:[12]\d|3[01]|0?[1-9])\s*(?:日|号)?)|(?:0?[1-9]|[12]\d|3[01])\s*(?:日|号))(?!\d)\s*[，,、:：-]?\s*/);
       return {
         raw: fragment,
         dateText: dateMatch?.[0] || '',
@@ -1170,17 +1190,46 @@ function splitAgentTransactionGroups(text) {
     .filter((group) => group.body);
 }
 
+function hasAgentSemanticText(value) {
+  const semantic = String(value || '')
+    .replace(/[\d¥￥元块钱人民币\s，,、:：/\\.+-]/g, '')
+    .replace(/^(?:和|以及|还有)+|(?:和|以及|还有)+$/g, '');
+  return /[A-Za-z\u3400-\u9fff]/.test(semantic);
+}
+
+function agentAmountClause(text, amount, amounts, index) {
+  const source = String(text || '');
+  const previousEnd = index > 0 ? amounts[index - 1].end : 0;
+  const before = source.slice(0, amount.index);
+  const boundaryMatches = [...before.matchAll(/[，,、。！？!?；;:：]/g)];
+  const boundaryStart = boundaryMatches.length ? boundaryMatches.at(-1).index + 1 : 0;
+  const start = Math.max(previousEnd, boundaryStart);
+  const nextIndex = amounts[index + 1]?.index ?? source.length;
+  const afterAmount = source.slice(amount.end, nextIndex);
+  const separatorIndex = afterAmount.search(/[，,、。！？!?；;:：]/);
+  const end = separatorIndex >= 0 ? amount.end + separatorIndex : nextIndex;
+  return source.slice(start, end).trim();
+}
+
 function agentAmountMatches(text) {
   const matches = [];
-  const numericPattern = /(?:[¥￥]\s*)?(\d+(?:\.\d{1,2})?)/g;
+  const colloquialPattern = /(?:[¥￥]\s*)?(\d+)\s*块\s*(\d{1,2})(?!\d)/g;
+  for (const match of text.matchAll(colloquialPattern)) {
+    const fraction = match[2].length === 1 ? `${match[2]}0` : match[2];
+    const amountYuan = number(`${match[1]}.${fraction}`);
+    if (amountYuan > 0) matches.push({ index: match.index, end: match.index + match[0].length, amountYuan });
+  }
+  const numericPattern = /(?:[¥￥]\s*)?(\d+(?:,\d{3})*(?:\.\d{1,2})?)(?:\s*(万|千))?(?![\d.])/g;
   for (const match of text.matchAll(numericPattern)) {
+    if (matches.some((item) => match.index < item.end && match.index + match[0].length > item.index)) continue;
     const before = text.slice(Math.max(0, match.index - 1), match.index);
     const after = text.slice(match.index + match[0].length, match.index + match[0].length + 1);
     const beforeTwo = text.slice(Math.max(0, match.index - 2), match.index);
     const afterTwo = text.slice(match.index + match[0].length, match.index + match[0].length + 2);
     if (/[年月日号点时分秒/\-]/.test(`${before}${after}`)) continue;
     if ((/[：:]/.test(after) && /\d/.test(afterTwo.slice(1))) || (/[：:]/.test(before) && /\d/.test(beforeTwo.slice(0, 1)))) continue;
-    const amountYuan = number(match[1]);
+    const multiplier = match[2] === '万' ? 10000 : match[2] === '千' ? 1000 : 1;
+    const amountYuan = number(match[1].replaceAll(',', '')) * multiplier;
     if (amountYuan > 0) matches.push({ index: match.index, end: match.index + match[0].length, amountYuan });
   }
   const chinesePattern = /([\u96f6\u3007\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u5343\u4e07\u4ebf]+(?:[\u70b9.]?[\u96f6\u3007\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d]+)?)\s*(?=[元块人民币])/g;
@@ -1201,7 +1250,8 @@ function inferAgentItemNote(prefix) {
     .replace(/^(?:支出|收入|消费|花费|付款|支付|内容|明细|记录)\s*[:：]?\s*/, '')
     .replace(/^(?:是|为)\s*/, '')
     .replace(/^(?:购买|买了|买)\s*/, '')
-    .replace(/\s*(?:各|分别)\s*$/, '')
+    .replace(/(?:元|块钱|块|人民币)/g, ' ')
+    .replace(/\s*(?:各|分别|和)\s*$/, '')
     .trim();
 }
 
@@ -1224,7 +1274,6 @@ function buildLocalAgentDrafts(text) {
   for (const group of groups) {
     if (group.dateText) occurredAt = inferAgentOccurredAt(group.dateText, occurredAt);
     accountId = inferAgentAccount(`${group.raw} ${group.body}`, '', accountId);
-    let cursor = 0;
     const waterEach = waterAndElectricityEachAmount(group.body);
     const detectedAmounts = agentAmountMatches(group.body);
     const amounts = waterEach
@@ -1234,13 +1283,16 @@ function buildLocalAgentDrafts(text) {
           { ...waterEach, noteOverride: '电费充值' },
         ].sort((a, b) => a.index - b.index)
       : detectedAmounts;
+    const groupType = inferAgentType(group.body);
+    const groupHint = inferAgentItemNote(group.body.slice(0, amounts[0]?.index || 0)) || '';
     for (let index = 0; index < amounts.length; index += 1) {
       const amount = amounts[index];
-      const prefix = group.body.slice(cursor, amount.index);
-      const nextAmount = amounts[index + 1];
-      const suffix = group.body.slice(amount.end, nextAmount?.index ?? group.body.length);
-      const note = amount.noteOverride || inferAgentItemNote(`${prefix} ${suffix}`) || inferAgentNote(group.body, inferAgentType(group.body));
-      const type = inferAgentType(`${group.body} ${note}`);
+      const clause = agentAmountClause(group.body, amount, amounts, index);
+      const withoutAmount = clause.replace(/(?:[¥￥]\s*)?\d+(?:,\d{3})*(?:\.\d{1,2})?\s*(?:万|千)?\s*(?:元|块钱|块|人民币)?/, ' ');
+      const clauseHint = inferAgentItemNote(withoutAmount);
+      const hint = clauseHint || groupHint || inferAgentNote(group.body, groupType);
+      const type = inferAgentType(hasAgentSemanticText(withoutAmount) ? withoutAmount : hint || group.body) || groupType;
+      const note = amount.noteOverride || hint;
       const draft = normalizeAgentDraft({
         type,
         amountYuan: amount.amountYuan,
@@ -1252,7 +1304,6 @@ function buildLocalAgentDrafts(text) {
         tags: ['Agent 记账'],
       });
       if (draft) drafts.push(draft);
-      cursor = amount.end;
     }
   }
   return drafts;
@@ -1299,7 +1350,7 @@ function localAgentAnswer(text) {
 function localAgentResponse(text) {
   const answer = localAgentAnswer(text);
   if (answer) return answer;
-  const transactionIntent = /记|花|买|付|消费|支出|收入|工资|薪资|到账|奖金|报销|退款|转账|充值|会员|GPT|OpenAI|外卖|早餐|午饭|午餐|晚餐|地铁|公交|打车|房租/.test(text);
+  const transactionIntent = /记|花|买|付|消费|购物|日用|支出|收入|工资|薪资|到账|奖金|报销|退款|转账|充值|会员|订阅|GPT|OpenAI|外卖|早餐|午饭|午餐|晚餐|地铁|公交|打车|房租|盒马|超市|买菜|家政|洗衣液|垃圾桶|枕头|锅|刀具|锅铲|水电|燃气|天然气|话费/.test(text);
   if (transactionIntent) {
     const drafts = buildLocalAgentDrafts(text);
     if (!drafts.length) return { kind: 'clarify', reply: '我还没有识别到明确金额。请补充金额，例如“午餐 28 元，微信支付”。' };
@@ -1454,13 +1505,48 @@ async function remoteAgentResponse() {
   return parseAgentModelReply(response.reply);
 }
 
-function agentDraftsMatchLocalResult(remoteDrafts, localDrafts) {
+function withTimeout(promise, milliseconds, message) {
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = window.setTimeout(() => reject(new Error(message)), milliseconds);
+  });
+  return Promise.race([promise, timeout]).finally(() => window.clearTimeout(timeoutId));
+}
+
+function agentDraftsHaveSameAmounts(remoteDrafts, localDrafts) {
   if (remoteDrafts.length !== localDrafts.length) return false;
-  return remoteDrafts.every((draft, index) => (
-    draft.type === localDrafts[index].type
-    && centsFromYuan(draft.amountYuan) === centsFromYuan(localDrafts[index].amountYuan)
-    && draft.categoryId === localDrafts[index].categoryId
-  ));
+  const amountCounts = (drafts) => drafts.reduce((counts, draft) => {
+    const key = String(centsFromYuan(draft.amountYuan));
+    counts.set(key, (counts.get(key) || 0) + 1);
+    return counts;
+  }, new Map());
+  const expected = amountCounts(localDrafts);
+  const actual = amountCounts(remoteDrafts);
+  if (expected.size !== actual.size) return false;
+  return [...expected].every(([amount, count]) => actual.get(amount) === count);
+}
+
+function mergeAgentDraftFields(remoteDrafts, localDrafts) {
+  const usedLocalIndexes = new Set();
+  return remoteDrafts.map((remoteDraft) => {
+    const localIndex = localDrafts.findIndex((localDraft, index) => {
+      if (usedLocalIndexes.has(index)) return false;
+      return centsFromYuan(localDraft.amountYuan) === centsFromYuan(remoteDraft.amountYuan);
+    });
+    if (localIndex < 0) return remoteDraft;
+    usedLocalIndexes.add(localIndex);
+    const localDraft = localDrafts[localIndex];
+    const hasSpecificLocalCategory = localDraft.categoryId
+      && !['other', 'other-income'].includes(localDraft.categoryId);
+    return {
+      ...remoteDraft,
+      // The deterministic parser is the source of truth for date and refund/transfer precedence.
+      type: localDraft.type,
+      occurredAt: localDraft.occurredAt,
+      ...(hasSpecificLocalCategory ? { categoryId: localDraft.categoryId } : {}),
+      ...(!remoteDraft.note ? { note: localDraft.note } : {}),
+    };
+  });
 }
 
 async function sendAgentMessage(text) {
@@ -1474,30 +1560,41 @@ async function sendAgentMessage(text) {
   state.agentSending = true;
   render();
   requestAnimationFrame(scrollAgentToLatest);
+  const localResult = localAgentResponse(content);
   try {
     let result = null;
     if (hasRemoteAgentConfig()) {
       try {
-        result = await remoteAgentResponse();
+        result = await withTimeout(
+          remoteAgentResponse(),
+          REMOTE_AGENT_TIMEOUT_MS,
+          `模型响应超过 ${REMOTE_AGENT_TIMEOUT_MS / 1000} 秒，已回退本地解析。`,
+        );
         state.agentConnection = 'connected';
         state.agentConnectionMessage = `已连接 ${state.agentConfig.model}`;
       } catch (error) {
         state.agentConnection = 'error';
-        state.agentConnectionMessage = '模型暂时不可用，已切换本地模式';
+        state.agentConnectionMessage = '模型请求失败 · 已回退本地解析';
         toast(error instanceof Error ? error.message : '模型暂时不可用。', 'error');
       }
     }
-    const localResult = localAgentResponse(content);
     if (localResult?.kind === 'transaction_draft') {
       const remoteDrafts = result?.kind === 'transaction_draft'
         ? (Array.isArray(result.drafts) ? result.drafts : result.draft ? [result.draft] : [])
         : [];
       const localDrafts = Array.isArray(localResult.drafts) ? localResult.drafts : localResult.draft ? [localResult.draft] : [];
-      if (!agentDraftsMatchLocalResult(remoteDrafts, localDrafts)) {
+      if (!agentDraftsHaveSameAmounts(remoteDrafts, localDrafts)) {
         result = localResult;
         if (hasRemoteAgentConfig() && state.agentConnection === 'connected') {
           state.agentConnectionMessage = `已连接 ${state.agentConfig.model} · 已校验多笔流水`;
         }
+      } else if (remoteDrafts.length) {
+        const mergedDrafts = mergeAgentDraftFields(remoteDrafts, localDrafts);
+        result = {
+          ...result,
+          drafts: mergedDrafts,
+          ...(remoteDrafts.length === 1 ? { draft: mergedDrafts[0] } : {}),
+        };
       }
     }
     result ||= localResult;
