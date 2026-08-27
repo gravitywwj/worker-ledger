@@ -483,6 +483,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .agent-draft-heading strong { font-size: 13px; }
 .agent-draft-heading small { color: var(--ink-muted); font-size: 10px; }
 .agent-draft-heading .agent-draft-amount { color: var(--ink); font-size: 19px; font-variant-numeric: tabular-nums; }
+.agent-draft-summary { margin: -4px 0 14px; color: var(--ink-soft); font-size: 11px; line-height: 1.55; }
+.agent-draft-entry { padding: 13px 0; border-top: 1px solid var(--line); }
+.agent-draft-entry:first-of-type { padding-top: 0; border-top: 0; }
+.agent-draft-entry-heading { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 10px; color: var(--ink-soft); font-size: 11px; }
+.agent-draft-entry-heading strong { color: var(--ink); font-size: 12px; font-variant-numeric: tabular-nums; }
 .agent-draft-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .agent-draft-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
 .agent-draft-card.committed { display: flex; align-items: center; justify-content: space-between; gap: 16px; border-color: #b8d9c6; background: var(--income-soft); }
@@ -492,11 +497,33 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .agent-draft-result span { color: var(--ink-soft); font-size: 11px; }
 .agent-draft-card.dismissed { display: flex; align-items: center; gap: 8px; color: var(--ink-soft); font-size: 12px; }
 .agent-draft-card.dismissed .ph { color: var(--ink-muted); font-size: 18px; }
-.agent-composer { position: relative; flex: 0 0 auto; padding: 14px 64px 24px 16px; border-top: 1px solid var(--line); background: var(--surface); }
+.agent-methods-card .panel-heading { align-items: center; }
+.agent-methods-badge { padding: 4px 7px; border-radius: 999px; background: var(--income-soft); color: var(--income); font-size: 10px; font-weight: 700; white-space: nowrap; }
+.agent-method-list { display: grid; gap: 0; padding-top: 4px; }
+.record-method-item { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 54px; padding: 9px 0; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--ink); text-align: left; }
+.record-method-item:last-child { border-bottom: 0; }
+.record-method-item > .ph:first-child { flex: 0 0 auto; color: var(--primary); font-size: 19px; }
+.record-method-item > span { display: grid; flex: 1 1 auto; gap: 3px; min-width: 0; }
+.record-method-item strong { font-size: 12px; }
+.record-method-item small { color: var(--ink-soft); font-size: 11px; line-height: 1.45; }
+.record-method-item > .ph:last-child { flex: 0 0 auto; color: var(--ink-muted); font-size: 16px; }
+button.record-method-item { cursor: pointer; }
+button.record-method-item:hover strong, button.record-method-item:hover > .ph { color: var(--primary); }
+.agent-composer { position: relative; flex: 0 0 auto; padding: 14px 112px 24px 16px; border-top: 1px solid var(--line); background: var(--surface); }
 .agent-composer textarea { width: 100%; min-height: 48px; max-height: 132px; resize: none; padding: 13px 14px; border: 1px solid var(--line-strong); border-radius: var(--radius-md); outline: 0; background: var(--surface); color: var(--ink); line-height: 1.5; transition: border-color 160ms ease, box-shadow 160ms ease; }
 .agent-composer textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--focus); }
 .agent-composer textarea:disabled { background: var(--surface-subtle); cursor: not-allowed; }
-.agent-composer > small { position: absolute; bottom: 5px; left: 18px; color: var(--ink-muted); font-size: 10px; }
+.agent-composer > small { position: absolute; right: 18px; bottom: 5px; left: 18px; display: flex; justify-content: space-between; gap: 12px; color: var(--ink-muted); font-size: 10px; }
+.agent-composer > small span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-input-count { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.agent-input-count.limit { color: var(--expense); font-weight: 700; }
+.agent-voice-button, .agent-send-button { display: grid; place-items: center; width: 40px; height: 40px; padding: 0; border-radius: var(--radius-sm); font-size: 19px; transition: background-color 160ms ease, color 160ms ease, transform 120ms var(--ease-out); }
+.agent-voice-button { position: absolute; right: 64px; bottom: 30px; border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink-soft); }
+.agent-voice-button:hover { border-color: var(--primary); color: var(--primary); }
+.agent-voice-button.listening { border-color: var(--expense); background: var(--expense-soft); color: var(--expense); }
+.agent-voice-button.listening .ph { animation: agent-voice-pulse 1.2s ease-in-out infinite; }
+.agent-voice-button:disabled { opacity: .55; cursor: wait; }
+@keyframes agent-voice-pulse { 50% { transform: scale(1.14); } }
 .agent-send-button { position: absolute; right: 16px; bottom: 30px; display: grid; place-items: center; width: 40px; height: 40px; padding: 0; border: 0; border-radius: var(--radius-sm); background: var(--primary); color: #fff; font-size: 19px; transition: background-color 160ms ease, transform 120ms var(--ease-out); }
 .agent-send-button:hover { background: var(--primary-hover); }
 .agent-send-button:active { transform: translateY(1px); }
@@ -693,7 +720,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .agent-mobile-prompts { display: flex; gap: 8px; overflow-x: auto; padding: 10px 16px 0; border-top: 1px solid var(--line); scrollbar-width: none; }
   .agent-mobile-prompts::-webkit-scrollbar { display: none; }
   .agent-mobile-prompts button { flex: 0 0 auto; min-height: 34px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--ink-soft); font-size: 11px; }
-  .agent-composer { padding-top: 10px; padding-right: 68px; }
+  .agent-composer { padding-top: 10px; padding-right: 116px; }
+  .agent-voice-button { right: 68px; bottom: 28px; width: 44px; height: 44px; }
   .agent-send-button { width: 44px; height: 44px; bottom: 28px; }
   .settings-title-row { align-items: flex-start; flex-direction: column; }
   .mobile-nav {
