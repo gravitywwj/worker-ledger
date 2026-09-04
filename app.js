@@ -1,13 +1,14 @@
 /* 打工人小账本：本地优先的个人收支账本。 */
 
 const DB_NAME = 'worker-ledger';
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 const STORES = {
   transactions: 'transactions',
   settings: 'profile_settings',
   categories: 'categories',
   accounts: 'accounts',
   agentMessages: 'agent_messages',
+  agentMemory: 'agent_memory',
 };
 
 const DEFAULT_PROFILE = {
@@ -114,7 +115,8 @@ const NUMBER_FORMATTER = new Intl.NumberFormat('zh-CN', { maximumFractionDigits:
 const DEMO_MODE = new URLSearchParams(location.search).get('demo') === '1';
 const VALID_VIEWS = ['home', 'agent', 'ledger', 'reports', 'accounts', 'categories', 'settings'];
 const AGENT_MAX_INPUT_LENGTH = 1000;
-const REMOTE_AGENT_TIMEOUT_MS = 12000;
+const REMOTE_AGENT_SINGLE_TIMEOUT_MS = 45000;
+const REMOTE_AGENT_MULTI_TIMEOUT_MS = 90000;
 
 const state = {
   db: null,
@@ -131,7 +133,10 @@ const state = {
   ledgerAccount: 'all',
   reportPeriod: 'month',
   agentMessages: [],
+  agentMemory: [],
   agentSending: false,
+  agentRemoteJobs: 0,
+  agentDraftEditLocks: new Set(),
   agentVoiceStatus: 'idle',
   agentVoiceMessage: '',
   agentConnection: 'idle',
@@ -226,13 +231,14 @@ function hasRemoteAgentConfig() {
   return Boolean(state.agentConfig.baseUrl && state.agentConfig.model);
 }
 
-async function postJson(path, payload) {
+async function postJson(path, payload, options = {}) {
   let response;
   try {
     response = await fetch(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      ...(options.signal ? { signal: options.signal } : {}),
     });
   } catch (error) {
     if (error instanceof TypeError) throw new Error('无法连接本地账本服务，请先运行 start.bat 并保持窗口开启。');
@@ -482,6 +488,10 @@ function openDatabase() {
         ? request.transaction.objectStore(STORES.agentMessages)
         : db.createObjectStore(STORES.agentMessages, { keyPath: 'id' });
       if (!messageStore.indexNames.contains('createdAt')) messageStore.createIndex('createdAt', 'createdAt');
+      const memoryStore = db.objectStoreNames.contains(STORES.agentMemory)
+        ? request.transaction.objectStore(STORES.agentMemory)
+        : db.createObjectStore(STORES.agentMemory, { keyPath: 'id' });
+      if (!memoryStore.indexNames.contains('updatedAt')) memoryStore.createIndex('updatedAt', 'updatedAt');
     };
     request.onsuccess = () => resolve(request.result);
   });
@@ -570,12 +580,13 @@ async function loadData() {
     } else {
       if (!state.db) state.db = await openDatabase();
       await ensureInitialData();
-      const [profileRecord, transactions, categories, accounts, agentMessages] = await Promise.all([
+      const [profileRecord, transactions, categories, accounts, agentMessages, agentMemory] = await Promise.all([
         dbGet(STORES.settings, 'profile'),
         dbGetAll(STORES.transactions),
         dbGetAll(STORES.categories),
         dbGetAll(STORES.accounts),
         dbGetAll(STORES.agentMessages),
+        dbGetAll(STORES.agentMemory),
       ]);
       state.profile = {
         ...DEFAULT_PROFILE,
@@ -590,6 +601,10 @@ async function loadData() {
         .filter((message) => message?.role === 'user' || message?.role === 'assistant')
         .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
         .slice(-80);
+      state.agentMemory = agentMemory
+        .filter((memory) => memory?.id && memory?.kind && memory?.value)
+        .sort((a, b) => new Date(a.updatedAt || a.createdAt) - new Date(b.updatedAt || b.createdAt))
+        .slice(-50);
     }
     state.error = null;
   } catch (error) {
@@ -665,6 +680,23 @@ async function persistAgentMessage(message) {
     .slice(-80);
 }
 
+async function persistAgentMemory(memory) {
+  const now = new Date().toISOString();
+  const next = { ...memory, id: memory.id || id(), createdAt: memory.createdAt || now, updatedAt: now };
+  if (!state.demo) await dbPut(STORES.agentMemory, next);
+  const existingIndex = state.agentMemory.findIndex((item) => item.id === next.id);
+  if (existingIndex >= 0) state.agentMemory[existingIndex] = next;
+  else state.agentMemory.push(next);
+  state.agentMemory = state.agentMemory.sort((a, b) => new Date(a.updatedAt) - new Date(b.updatedAt)).slice(-50);
+  return next;
+}
+
+async function removeAgentMemory(memoryId) {
+  if (!memoryId) return;
+  if (!state.demo) await dbDelete(STORES.agentMemory, memoryId);
+  state.agentMemory = state.agentMemory.filter((item) => item.id !== memoryId);
+}
+
 async function updateAgentMessage(messageId, patch) {
   const existing = state.agentMessages.find((message) => message.id === messageId);
   if (!existing) return null;
@@ -676,6 +708,7 @@ async function updateAgentMessage(messageId, patch) {
 async function clearAgentMessages() {
   if (!state.demo) await dbClear(STORES.agentMessages);
   state.agentMessages = [];
+  state.agentDraftEditLocks.clear();
   render();
   toast('聊天记录已清空。');
 }
@@ -1038,7 +1071,39 @@ function inferAgentType(text) {
   return 'expense';
 }
 
+function rememberedAgentCategory(text, type) {
+  const value = String(text || '').toLowerCase();
+  return state.agentMemory.slice().reverse().find((memory) => memory.kind === 'category' && memory.categoryType === type && memory.match && value.includes(String(memory.match).toLowerCase()));
+}
+
+function rememberedAgentAccount(text) {
+  const value = String(text || '').toLowerCase();
+  return state.agentMemory.slice().reverse().find((memory) => memory.kind === 'account' && memory.match && value.includes(String(memory.match).toLowerCase()));
+}
+
+function extractAgentMemorySuggestion(text) {
+  const match = String(text || '').trim().match(/(?:请)?(?:记住|记一下|以后(?:默认)?|下次(?:默认)?)\s*(.+?)\s*(?:归类|分类|算作|记作|归到)\s*(?:为|到)?\s*(.+)$/);
+  if (!match) return null;
+  const keyword = match[1].replace(/[，,。；;：:]+$/, '').trim();
+  const target = match[2].replace(/[，,。；;]+$/, '').trim();
+  if (!keyword || !target) return null;
+  const category = state.categories.find((item) => item.type === 'expense' && (normalizeAgentLabel(item.label) === normalizeAgentLabel(target) || item.id === target));
+  if (!category) return null;
+  return { kind: 'category', key: `category:${keyword}`, value: category.id, label: `${keyword} → ${category.label}`, match: keyword, categoryId: category.id, categoryType: category.type };
+}
+
+function extractAgentAccountMemorySuggestion(text) {
+  const match = String(text || '').trim().match(/(?:请)?(?:记住|记一下|以后(?:默认)?|下次(?:默认)?)\s*(.+?)\s*(?:默认账户|默认用|使用账户)\s*(.+)$/);
+  if (!match) return null;
+  const keyword = match[1].replace(/[，,。；;：:]+$/, '').trim();
+  const accountName = match[2].replace(/[，,。；;]+$/, '').trim();
+  const account = activeAccounts().find((item) => normalizeAgentLabel(item.name) === normalizeAgentLabel(accountName));
+  if (!keyword || !account) return null;
+  return { kind: 'account', key: `account:${keyword}`, value: account.id, label: `${keyword} → ${account.name}`, match: keyword, accountId: account.id };
+}
 function inferAgentCategory(text, type) {
+  const remembered = rememberedAgentCategory(text, type);
+  if (remembered?.categoryId && state.categories.some((category) => category.id === remembered.categoryId && category.type === type)) return remembered.categoryId;
   const rules = type === 'income'
     ? [
         ['bonus', /奖金|年终奖|绩效/],
@@ -1065,6 +1130,8 @@ function inferAgentCategory(text, type) {
 
 function inferAgentAccount(text, excludedId = '', fallbackId = '') {
   const normalized = text.toLowerCase();
+  const remembered = rememberedAgentAccount(text);
+  if (remembered?.accountId && activeAccounts().some((account) => account.id === remembered.accountId && account.id !== excludedId)) return remembered.accountId;
   const aliases = [
     ['农行工资卡', 'salary-card'],
     ['微信', 'wechat'],
@@ -1321,8 +1388,231 @@ function statsForPreviousMonth() {
   return stats;
 }
 
+function localSpendingHabitAnalysis() {
+  const transactions = state.transactions.filter((item) => item.type === 'expense' && number(item.amount) > 0);
+  const total = transactions.reduce((sum, item) => sum + number(item.amount), 0);
+  const grouped = new Map();
+  transactions.forEach((item) => {
+    const category = getCategory(item.categoryId);
+    const current = grouped.get(category.id) || { category, amount: 0, count: 0 };
+    current.amount += number(item.amount);
+    current.count += 1;
+    grouped.set(category.id, current);
+  });
+  const categories = [...grouped.values()].sort((a, b) => b.amount - a.amount);
+  const notes = new Map();
+  transactions.forEach((item) => {
+    const note = String(item.note || '').trim();
+    if (!note) return;
+    const current = notes.get(note) || { note, amount: 0, count: 0 };
+    current.amount += number(item.amount);
+    current.count += 1;
+    notes.set(note, current);
+  });
+  const repeated = [...notes.values()].filter((item) => item.count >= 2).sort((a, b) => b.amount - a.amount).slice(0, 5);
+  const largest = [...transactions].sort((a, b) => b.amount - a.amount).slice(0, 3);
+  return { count: transactions.length, total, categories, repeated, largest };
+}
+function isAgentCorrectionRequest(text) {
+  return /修改|改错|记错|更正|纠正|改成|改为|改到|换成|换到|调整为|改回|日期错|金额错|类型错|收支错|类目错|分类错|账户错|备注错/.test(String(text || ''));
+}
+
+function correctionChangeIndex(text) {
+  const match = String(text || '').match(/改成|改为|改到|换成|换到|调整为|应该是|改回|记为|写成|归类为|归到/);
+  return match?.index ?? -1;
+}
+
+function correctionAmount(text, changeIndex) {
+  if (changeIndex < 0) return null;
+  const matches = agentAmountMatches(String(text || '').slice(changeIndex));
+  return matches[0]?.amountYuan || null;
+}
+
+function correctionDate(text, changeIndex) {
+  const source = String(text || '').slice(Math.max(0, changeIndex));
+  const match = source.match(/(?:(?:(?:\d{4})\s*[年/-]\s*)?(?:1[0-2]|0?[1-9])\s*(?:月\s*(?:[12]\d|3[01]|0?[1-9])\s*(?:日|号)?|[./-]\s*(?:[12]\d|3[01]|0?[1-9])\s*(?:日|号)?)|(?:0?[1-9]|[12]\d|3[01])\s*(?:日|号))/);
+  return match ? inferAgentOccurredAt(match[0]) : '';
+}
+
+function correctionMentionedCategory(text, changeIndex, type) {
+  const source = String(text || '').slice(Math.max(0, changeIndex));
+  const categories = state.categories.filter((category) => category.type === type);
+  return categories.find((category) => source.includes(category.label))?.id || '';
+}
+
+function correctionMentionedAccount(text, changeIndex) {
+  const source = String(text || '').slice(Math.max(0, changeIndex));
+  return activeAccounts().find((account) => source.includes(account.name))?.id || '';
+}
+
+function correctionMentionedType(text, changeIndex) {
+  const source = String(text || '').slice(Math.max(0, changeIndex));
+  const matches = [...source.matchAll(/(?:改成|改为|调整为|应该是|是|为)\s*(支出|收入|转账)/g)];
+  const value = matches.at(-1)?.[1] || '';
+  return value === '支出' ? 'expense' : value === '收入' ? 'income' : value === '转账' ? 'transfer' : '';
+}
+
+function agentTransactionSnapshot(transaction) {
+  return {
+    type: transaction.type,
+    amountYuan: yuanFromCents(transaction.amount),
+    categoryId: transaction.categoryId,
+    accountId: transaction.accountId,
+    toAccountId: transaction.toAccountId || '',
+    occurredAt: transaction.occurredAt,
+    note: transaction.note || '',
+  };
+}
+
+function applyAgentEditChanges(before, changes) {
+  const after = { ...before };
+  Object.entries(changes || {}).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') after[key] = value;
+  });
+  if (after.type !== 'transfer') after.toAccountId = '';
+  if (after.type === 'transfer' && after.toAccountId === after.accountId) after.toAccountId = '';
+  return after;
+}
+
+function findAgentCorrectionTargets(text, changeIndex) {
+  const source = String(text || '');
+  const reference = changeIndex >= 0 ? source.slice(0, changeIndex) : source;
+  const referenceAmounts = agentAmountMatches(reference).map((item) => centsFromYuan(item.amountYuan));
+  const referenceDate = correctionDate(reference, -1);
+  const latestCue = /刚才|刚刚|上一笔|最后一笔|最近一笔|这笔|那笔/.test(source);
+  const transactions = sortTransactions(state.transactions).filter((item) => !item.deletedAt);
+  const scored = transactions.map((transaction, index) => {
+    const category = getCategory(transaction.categoryId);
+    const account = state.accounts.find((item) => item.id === transaction.accountId);
+    const note = String(transaction.note || '').trim();
+    const haystack = `${note} ${category.label} ${account?.name || ''}`.toLowerCase();
+    let score = 0;
+    if (referenceAmounts.includes(Number(transaction.amount))) score += 10;
+    if (referenceDate && dateKey(transaction.occurredAt) === dateKey(referenceDate)) score += 4;
+    if (note && note.length >= 2 && source.toLowerCase().includes(note.toLowerCase())) score += 8;
+    if (source.includes(category.label)) score += 3;
+    if (account?.name && source.includes(account.name)) score += 3;
+    if (/刚才|刚刚|上一笔|最后一笔|最近一笔/.test(source) && index === 0) score += 8;
+    if (latestCue && index === 0) score += 2;
+    return { transaction, score, haystack };
+  }).filter((item) => item.score > 0).sort((a, b) => b.score - a.score);
+  if (!scored.length) return { transaction: null, ambiguous: [], candidates: [] };
+  const topScore = scored[0].score;
+  const top = scored.filter((item) => item.score === topScore);
+  return { transaction: top.length === 1 ? top[0].transaction : null, ambiguous: top.length > 1 ? top.map((item) => item.transaction) : [], candidates: scored.slice(0, 3).map((item) => item.transaction) };
+}
+
+function normalizeAgentEditSuggestion(update) {
+  const raw = update && typeof update === 'object' ? update : {};
+  const targetId = String(raw.transactionId || raw.targetId || raw.id || '');
+  const target = state.transactions.find((item) => item.id === targetId && !item.deletedAt);
+  if (!target) return null;
+  const rawChanges = raw.changes && typeof raw.changes === 'object' ? raw.changes : {};
+  const changes = {};
+  const amount = rawChanges.amountYuan ?? rawChanges.amount;
+  if (amount !== undefined && amount !== null && amount !== '') {
+    const value = number(amount);
+    if (!(value > 0)) return null;
+    changes.amountYuan = Math.round(value * 100) / 100;
+  }
+  const nextType = ['expense', 'income', 'transfer'].includes(rawChanges.type) ? rawChanges.type : target.type;
+  if (rawChanges.type && nextType !== target.type) changes.type = nextType;
+  const categoryValue = rawChanges.category ?? rawChanges.categoryName ?? rawChanges.categoryLabel ?? rawChanges.categoryId;
+  if (categoryValue !== undefined && categoryValue !== null && categoryValue !== '') {
+    const categoryId = resolveAgentCategoryId(categoryValue, nextType, target.note);
+    if (!categoryId || (nextType !== 'transfer' && !state.categories.some((item) => item.id === categoryId && item.type === nextType))) return null;
+    if (categoryId !== target.categoryId) changes.categoryId = nextType === 'transfer' ? 'transfer' : categoryId;
+  } else if (rawChanges.type && nextType === 'transfer') {
+    changes.categoryId = 'transfer';
+  } else if (rawChanges.type && nextType !== 'transfer' && !state.categories.some((item) => item.id === target.categoryId && item.type === nextType)) {
+    const fallbackCategoryId = nextType === 'income' ? 'other-income' : 'other';
+    changes.categoryId = state.categories.some((item) => item.id === fallbackCategoryId && item.type === nextType) ? fallbackCategoryId : (state.categories.find((item) => item.type === nextType)?.id || '');
+  }
+  const accountValue = rawChanges.account ?? rawChanges.accountName ?? rawChanges.accountLabel ?? rawChanges.accountId;
+  if (accountValue !== undefined && accountValue !== null && accountValue !== '') {
+    const accountId = resolveAgentAccountId(accountValue, target.accountId);
+    if (!accountId) return null;
+    if (accountId !== target.accountId) changes.accountId = accountId;
+  }
+  const toAccountValue = rawChanges.toAccount ?? rawChanges.toAccountName ?? rawChanges.toAccountLabel ?? rawChanges.toAccountId;
+  if (nextType === 'transfer' && toAccountValue !== undefined && toAccountValue !== null && toAccountValue !== '') {
+    const toAccountId = resolveAgentAccountId(toAccountValue, target.toAccountId);
+    if (!toAccountId || toAccountId === (changes.accountId || target.accountId)) return null;
+    if (toAccountId !== target.toAccountId) changes.toAccountId = toAccountId;
+  } else if (nextType !== 'transfer' && target.toAccountId) changes.toAccountId = '';
+  if (rawChanges.occurredAt) {
+    const occurredAt = new Date(rawChanges.occurredAt).toISOString();
+    if (dateKey(occurredAt) !== dateKey(target.occurredAt) || occurredAt !== target.occurredAt) changes.occurredAt = occurredAt;
+  }
+  if (rawChanges.note !== undefined && rawChanges.note !== null) {
+    const note = String(rawChanges.note).trim();
+    if (!note) return null;
+    if (note !== (target.note || '')) changes.note = note;
+  }
+  if (!Object.keys(changes).length) return null;
+  const before = agentTransactionSnapshot(target);
+  const after = applyAgentEditChanges(before, changes);
+  return { targetType: 'transaction', targetId: target.id, targetUpdatedAt: target.updatedAt || target.createdAt || '', changes, before, after };
+}
+
+function preserveAgentTransactionTime(originalOccurredAt, nextOccurredAt) {
+  const original = new Date(originalOccurredAt);
+  const next = new Date(nextOccurredAt);
+  if (Number.isNaN(original.getTime()) || Number.isNaN(next.getTime())) return nextOccurredAt;
+  next.setHours(original.getHours(), original.getMinutes(), original.getSeconds(), original.getMilliseconds());
+  return next.toISOString();
+}
+
+function buildLocalAgentCorrection(text) {
+  const changeIndex = correctionChangeIndex(text);
+  const changes = {};
+  const amount = correctionAmount(text, changeIndex);
+  const occurredAt = correctionDate(text, changeIndex);
+  const referenceType = state.transactions.find((item) => !item.deletedAt && item.type)?.type || 'expense';
+  const type = correctionMentionedType(text, changeIndex);
+  const categoryId = correctionMentionedCategory(text, changeIndex, type || referenceType);
+  const accountId = correctionMentionedAccount(text, changeIndex);
+  if (amount) changes.amountYuan = amount;
+  if (occurredAt) changes.occurredAt = occurredAt;
+  if (type) changes.type = type;
+  if (categoryId) changes.category = categoryId;
+  if (accountId) changes.account = accountId;
+  const noteMatch = String(text || '').match(/(?:备注|说明).{0,8}(?:改成|改为|写成|应该是)\s*(.+)$/);
+  if (noteMatch?.[1]) changes.note = noteMatch[1].replace(/[。；;]+$/, '').trim();
+  if (!Object.keys(changes).length) return { kind: 'clarify', reply: '可以修改已入账流水。请告诉我目标和新值，例如“把刚才的外卖改到 8 月 10 日”或“把 GPT 会员那笔金额改成 144.51 元”。' };
+  const targetResult = findAgentCorrectionTargets(text, changeIndex);
+  if (targetResult.ambiguous.length) {
+    const choices = targetResult.ambiguous.slice(0, 3).map((item) => `${groupDateLabel(item.occurredAt)} ${item.note || getCategory(item.categoryId).label} ${money(item.amount)}`).join('；');
+    return { kind: 'clarify', reply: `我找到多笔可能的流水，请补充商户、金额或日期来区分：${choices}。` };
+  }
+  if (!targetResult.transaction) {
+    return { kind: 'clarify', reply: '我暂时没找到唯一的已入账流水。请补充商户、金额或日期，例如“把 8 月 17 日的美团外卖 28.8 元改到 8 月 10 日”。' };
+  }
+  if (occurredAt) changes.occurredAt = preserveAgentTransactionTime(targetResult.transaction.occurredAt, occurredAt);
+  const suggestion = normalizeAgentEditSuggestion({ transactionId: targetResult.transaction.id, changes });
+  if (!suggestion) return { kind: 'clarify', reply: '这次修改没有形成有效变更。请确认新金额、日期、分类或账户属于账本中的可用选项。' };
+  const changedLabels = Object.keys(suggestion.changes).map((key) => ({ amountYuan: '金额', occurredAt: '发生时间', type: '类型', categoryId: '分类', accountId: '账户', toAccountId: '转入账户', note: '备注' }[key] || key));
+  return {
+    kind: 'transaction_update',
+    reply: `我找到“${suggestion.before.note || getCategory(suggestion.before.categoryId).label}”这笔流水，准备修改${changedLabels.join('、')}。请核对修改前后内容，确认后才会写回账本。`,
+    editSuggestion: suggestion,
+    update: { transactionId: suggestion.targetId, changes: suggestion.changes },
+  };
+}
+
 function localAgentAnswer(text) {
   const normalized = text.replace(/\s/g, '');
+  if (isAgentCorrectionRequest(text)) return buildLocalAgentCorrection(text);
+  const memorySuggestion = extractAgentMemorySuggestion(text) || extractAgentAccountMemorySuggestion(text);
+  if (memorySuggestion) return { kind: 'memory_suggestion', reply: `我可以记住这条规则：${memorySuggestion.label}。点击确认后，之后的草稿会参考它。`, memory: memorySuggestion };
+  if (/消费习惯|消费趋势|固定支出|固定消费|异常消费|订阅/.test(normalized)) {
+    const analysis = localSpendingHabitAnalysis();
+    if (!analysis.count) return { kind: 'answer', reply: '目前还没有足够的支出记录，先记几笔后我再帮你分析。' };
+    const top = analysis.categories.slice(0, 3).map((item) => `${item.category.label} ${money(item.amount)}（${item.count}笔）`).join('、');
+    const repeated = analysis.repeated.slice(0, 3).map((item) => `${item.note} ${money(item.amount)}（${item.count}次）`).join('、');
+    const largest = analysis.largest.map((item) => `${item.note || getCategory(item.categoryId).label} ${money(item.amount)}`).join('、');
+    return { kind: 'answer', reply: `基于当前 ${analysis.count} 笔支出，累计 ${money(analysis.total)}。主要分类：${top || '暂无'}。${repeated ? `重复支出：${repeated}。` : '暂未发现重复备注足够多的支出。'}${largest ? `较大单笔：${largest}。` : ''}这是基于现有流水的观察，不代表长期结论。` };
+  }
   const stats = monthlyStats();
   const previous = statsForPreviousMonth();
   const category = state.categories.find((item) => normalized.includes(item.label));
@@ -1463,6 +1753,7 @@ function ledgerContextForAgent() {
     availableCategories: state.categories.map((item) => ({ label: item.label, type: item.type })),
     availableAccounts: activeAccounts().map((item) => ({ name: item.name, type: item.type })),
     recentTransactions: sortTransactions(state.transactions).slice(0, 30).map((item) => ({
+      id: item.id,
       occurredAt: item.occurredAt,
       type: item.type,
       amountYuan: yuanFromCents(item.amount),
@@ -1480,7 +1771,7 @@ function parseAgentModelReply(rawReply) {
   const end = cleaned.lastIndexOf('}');
   if (start < 0 || end < start) throw new Error('模型返回格式不完整。');
   const parsed = JSON.parse(cleaned.slice(start, end + 1));
-  if (!['transaction_draft', 'answer', 'clarify'].includes(parsed.kind)) throw new Error('模型返回了未知操作。');
+  if (!['transaction_draft', 'transaction_update', 'answer', 'clarify', 'memory_suggestion'].includes(parsed.kind)) throw new Error('模型返回了未知操作。');
   if (parsed.kind === 'transaction_draft') {
     const rawDrafts = Array.isArray(parsed.drafts) ? parsed.drafts : [parsed.draft];
     const drafts = rawDrafts.map((draft) => normalizeAgentDraft(draft)).filter(Boolean);
@@ -1492,23 +1783,41 @@ function parseAgentModelReply(rawReply) {
       ...(drafts.length === 1 ? { draft: drafts[0] } : {}),
     };
   }
+  if (parsed.kind === 'transaction_update') {
+    const editSuggestion = normalizeAgentEditSuggestion(parsed.update);
+    if (!editSuggestion) return { kind: 'clarify', reply: '我没有找到可核对的目标流水，或模型没有给出有效修改字段。请补充商户、金额或日期。' };
+    return {
+      kind: parsed.kind,
+      reply: String(parsed.reply || '请核对修改前后内容，确认后才会写回账本。'),
+      editSuggestion,
+      update: { transactionId: editSuggestion.targetId, changes: editSuggestion.changes },
+    };
+  }
+  if (parsed.kind === 'memory_suggestion' && parsed.memory && typeof parsed.memory === 'object') {
+    return { kind: parsed.kind, reply: String(parsed.reply || '请确认是否保存这条偏好。'), memory: parsed.memory };
+  }
   return { kind: parsed.kind, reply: String(parsed.reply || '我暂时没有读懂，可以换一种说法吗？') };
 }
 
-async function remoteAgentResponse() {
-  const messages = state.agentMessages.slice(-12).map((message) => ({ role: message.role, content: message.content }));
+async function remoteAgentResponse(options = {}) {
+  const { messages: requestMessages, ...requestOptions } = options;
+  const messages = requestMessages || state.agentMessages.slice(-12).map((message) => ({ role: message.role, content: message.content }));
   const response = await postJson('/api/agent/chat', {
     config: state.agentConfig,
     messages,
     ledgerContext: ledgerContextForAgent(),
-  });
+  }, requestOptions);
   return parseAgentModelReply(response.reply);
 }
 
 function withTimeout(promise, milliseconds, message) {
   let timeoutId;
   const timeout = new Promise((_, reject) => {
-    timeoutId = window.setTimeout(() => reject(new Error(message)), milliseconds);
+    timeoutId = window.setTimeout(() => {
+      const error = new Error(message);
+      error.name = 'TimeoutError';
+      reject(error);
+    }, milliseconds);
   });
   return Promise.race([promise, timeout]).finally(() => window.clearTimeout(timeoutId));
 }
@@ -1549,6 +1858,82 @@ function mergeAgentDraftFields(remoteDrafts, localDrafts) {
   });
 }
 
+function agentDraftsFromResult(result) {
+  return Array.isArray(result?.drafts) ? result.drafts : result?.draft ? [result.draft] : [];
+}
+
+function agentMessageDataFromResult(result) {
+  const data = agentDraftDataFromResult(result);
+  if (result?.kind === 'transaction_update' && result.editSuggestion) return { ...data, editSuggestion: result.editSuggestion, editStatus: 'pending' };
+  if (result?.kind === 'memory_suggestion' && result.memory) return { ...data, memorySuggestion: result.memory, memoryStatus: 'pending' };
+  return data;
+}
+function agentDraftDataFromResult(result) {
+  const drafts = agentDraftsFromResult(result);
+  return drafts.length === 1
+    ? { draft: drafts[0], drafts, draftStatus: 'pending' }
+    : drafts.length > 1
+      ? { drafts, draftStatus: 'pending' }
+      : {};
+}
+
+function reconcileRemoteAgentResult(remoteResult, localResult, localDrafts) {
+  if (localResult?.kind === 'transaction_update') return localResult;
+  if (localResult?.kind !== 'transaction_draft') return remoteResult || localResult;
+  const remoteDrafts = agentDraftsFromResult(remoteResult);
+  if (!agentDraftsHaveSameAmounts(remoteDrafts, localDrafts)) return localResult;
+  if (!remoteDrafts.length) return localResult;
+  const mergedDrafts = mergeAgentDraftFields(remoteDrafts, localDrafts);
+  return {
+    ...remoteResult,
+    drafts: mergedDrafts,
+    ...(mergedDrafts.length === 1 ? { draft: mergedDrafts[0] } : {}),
+  };
+}
+
+async function enhanceAgentMessageInBackground({ messageId, requestMessages, localResult, localDrafts, timeoutMs }) {
+  const controller = new AbortController();
+  let succeeded = false;
+  try {
+    const remoteResult = await withTimeout(
+      remoteAgentResponse({ signal: controller.signal, messages: requestMessages }),
+      timeoutMs,
+      `模型后台分析超过 ${timeoutMs / 1000} 秒，当前已使用本地草稿。`,
+    );
+    succeeded = true;
+    const result = reconcileRemoteAgentResult(remoteResult, localResult, localDrafts);
+    const existing = state.agentMessages.find((message) => message.id === messageId);
+    const hasPendingAction = ['transaction_draft', 'transaction_update', 'memory_suggestion'].includes(localResult?.kind);
+    const wasEdited = state.agentDraftEditLocks.has(messageId);
+    const pendingStatus = localResult?.kind === 'transaction_draft' ? existing?.draftStatus === 'pending'
+      : localResult?.kind === 'transaction_update' ? existing?.editStatus === 'pending'
+        : localResult?.kind === 'memory_suggestion' ? existing?.memoryStatus === 'pending' : false;
+    if (existing && (!hasPendingAction || (pendingStatus && !wasEdited))) {
+      await updateAgentMessage(messageId, {
+        content: result?.reply || existing.content,
+        ...agentMessageDataFromResult(result),
+      });
+      if (state.activeView === 'agent') {
+        renderAgentPreservingComposer();
+        requestAnimationFrame(scrollAgentToLatest);
+      }
+    }
+  } catch (error) {
+    if (error?.name === 'TimeoutError') controller.abort();
+    // The local result is already visible; background model failure must not remove it.
+    if (error?.name !== 'TimeoutError') toast(error instanceof Error ? error.message : '模型后台分析失败，已使用本地草稿。', 'error');
+  } finally {
+    state.agentRemoteJobs = Math.max(0, state.agentRemoteJobs - 1);
+    if (state.agentRemoteJobs === 0) {
+      state.agentConnection = succeeded ? 'connected' : 'error';
+      state.agentConnectionMessage = succeeded
+        ? `已连接 ${state.agentConfig.model} · 后台校验完成`
+        : '模型暂不可用 · 当前草稿可直接审核';
+      if (state.activeView === 'agent') renderAgentPreservingComposer();
+    }
+  }
+}
+
 async function sendAgentMessage(text) {
   const content = String(text || '').trim();
   if (!content || state.agentSending) return;
@@ -1556,70 +1941,52 @@ async function sendAgentMessage(text) {
     toast(`单次输入最多 ${AGENT_MAX_INPUT_LENGTH} 个字符，请分段发送。`, 'error');
     return;
   }
-  await persistAgentMessage(agentMessage('user', content));
   state.agentSending = true;
+  try {
+    await persistAgentMessage(agentMessage('user', content));
+  } catch (error) {
+    state.agentSending = false;
+    throw error;
+  }
+  const localResult = localAgentResponse(content);
+  const localDrafts = agentDraftsFromResult(localResult);
+  const remoteTimeoutMs = localDrafts.length > 1 ? REMOTE_AGENT_MULTI_TIMEOUT_MS : REMOTE_AGENT_SINGLE_TIMEOUT_MS;
+  const remoteEnabled = hasRemoteAgentConfig();
+  const requestMessages = state.agentMessages.slice(-12).map((message) => ({ role: message.role, content: message.content }));
+  const immediateResult = localResult || {
+    kind: 'answer',
+    reply: remoteEnabled ? '我已收到这条内容，先为你保留在当前对话中，模型将在后台继续分析。' : '目前我可以直接帮你记账和查询本月收支。配置模型后，还能理解更灵活的表达。',
+  };
+  if (remoteEnabled) {
+    state.agentConnection = 'testing';
+    state.agentConnectionMessage = localDrafts.length > 1
+      ? `本地草稿已就绪 · 模型后台校验 ${localDrafts.length} 笔流水`
+      : '本地结果已就绪 · 模型后台增强中';
+  }
   render();
   requestAnimationFrame(scrollAgentToLatest);
-  const localResult = localAgentResponse(content);
+  const immediateMessage = agentMessage(immediateResult.role || 'assistant', immediateResult.reply, agentMessageDataFromResult(immediateResult));
   try {
-    let result = null;
-    if (hasRemoteAgentConfig()) {
-      try {
-        result = await withTimeout(
-          remoteAgentResponse(),
-          REMOTE_AGENT_TIMEOUT_MS,
-          `模型响应超过 ${REMOTE_AGENT_TIMEOUT_MS / 1000} 秒，已回退本地解析。`,
-        );
-        state.agentConnection = 'connected';
-        state.agentConnectionMessage = `已连接 ${state.agentConfig.model}`;
-      } catch (error) {
-        state.agentConnection = 'error';
-        state.agentConnectionMessage = '模型请求失败 · 已回退本地解析';
-        toast(error instanceof Error ? error.message : '模型暂时不可用。', 'error');
-      }
-    }
-    if (localResult?.kind === 'transaction_draft') {
-      const remoteDrafts = result?.kind === 'transaction_draft'
-        ? (Array.isArray(result.drafts) ? result.drafts : result.draft ? [result.draft] : [])
-        : [];
-      const localDrafts = Array.isArray(localResult.drafts) ? localResult.drafts : localResult.draft ? [localResult.draft] : [];
-      if (!agentDraftsHaveSameAmounts(remoteDrafts, localDrafts)) {
-        result = localResult;
-        if (hasRemoteAgentConfig() && state.agentConnection === 'connected') {
-          state.agentConnectionMessage = `已连接 ${state.agentConfig.model} · 已校验多笔流水`;
-        }
-      } else if (remoteDrafts.length) {
-        const mergedDrafts = mergeAgentDraftFields(remoteDrafts, localDrafts);
-        result = {
-          ...result,
-          drafts: mergedDrafts,
-          ...(remoteDrafts.length === 1 ? { draft: mergedDrafts[0] } : {}),
-        };
-      }
-    }
-    result ||= localResult;
-    result ||= {
-      kind: 'answer',
-      reply: hasRemoteAgentConfig()
-        ? '我暂时没能处理这个问题。你可以换一种说法，或先检查模型连接。'
-        : '目前我可以直接帮你记账和查询本月收支。配置模型后，还能理解更灵活的表达。',
-    };
-    const drafts = Array.isArray(result.drafts) ? result.drafts : result.draft ? [result.draft] : [];
-    const draftData = drafts.length === 1
-      ? { draft: drafts[0], drafts, draftStatus: 'pending' }
-      : drafts.length > 1
-        ? { drafts, draftStatus: 'pending' }
-        : {};
-    await persistAgentMessage(agentMessage('assistant', result.reply, draftData));
+    await persistAgentMessage(immediateMessage);
   } finally {
     state.agentSending = false;
-    render();
-    requestAnimationFrame(scrollAgentToLatest);
+  }
+  render();
+  requestAnimationFrame(scrollAgentToLatest);
+  if (remoteEnabled) {
+    state.agentRemoteJobs += 1;
+    void enhanceAgentMessageInBackground({
+      messageId: immediateMessage.id,
+      requestMessages,
+      localResult,
+      localDrafts,
+      timeoutMs: remoteTimeoutMs,
+    });
   }
 }
 
 function agentConnectionMeta() {
-  if (state.agentConnection === 'testing') return { className: 'testing', iconName: 'ph-circle-notch', label: '正在测试连接' };
+  if (state.agentConnection === 'testing') return { className: 'testing', iconName: 'ph-circle-notch', label: state.agentConnectionMessage || '正在测试连接' };
   if (state.agentConnection === 'connected') return { className: 'connected', iconName: 'ph-check-circle', label: state.agentConnectionMessage };
   if (state.agentConnection === 'error') return { className: 'error', iconName: 'ph-warning-circle', label: state.agentConnectionMessage };
   if (hasRemoteAgentConfig()) return { className: 'configured', iconName: 'ph-plugs-connected', label: `已配置 ${state.agentConfig.model}` };
@@ -1670,14 +2037,93 @@ function renderAgentDraft(message) {
     </form>`;
 }
 
+function renderAgentMemorySuggestion(message) {
+  const memory = message.memorySuggestion;
+  if (!memory) return '';
+  if (message.memoryStatus === 'saved') return `<div class="agent-memory-card saved">${icon('ph-check-circle')}<span>已记住：${escapeHtml(memory.label || memory.key || '这条偏好')}</span></div>`;
+  if (message.memoryStatus === 'dismissed') return `<div class="agent-memory-card dismissed">${icon('ph-x-circle')}<span>未保存这条偏好。</span></div>`;
+  return `<div class="agent-memory-card"><div class="agent-memory-card-title">${icon('ph-brain')}<span><strong>记忆建议</strong><small>${escapeHtml(memory.label || memory.key || '一条记账偏好')}</small></span></div><div class="agent-draft-actions"><button class="secondary-button" type="button" data-action="dismiss-agent-memory" data-message-id="${escapeHtml(message.id)}">暂不保存</button><button class="primary-button" type="button" data-action="confirm-agent-memory" data-message-id="${escapeHtml(message.id)}">${icon('ph-check')}确认记住</button></div></div>`;
+}
+
+async function confirmAgentMemory(messageId) {
+  const message = state.agentMessages.find((item) => item.id === messageId);
+  const suggestion = message?.memorySuggestion;
+  if (!message || !suggestion) return;
+  const category = state.categories.find((item) => item.id === suggestion.categoryId || item.id === suggestion.value || normalizeAgentLabel(item.label) === normalizeAgentLabel(suggestion.value));
+  const account = activeAccounts().find((item) => item.id === suggestion.accountId || item.id === suggestion.value || normalizeAgentLabel(item.name) === normalizeAgentLabel(suggestion.value));
+  const memory = category
+    ? { ...suggestion, kind: 'category', value: category.id, categoryId: category.id, categoryType: category.type }
+    : account
+      ? { ...suggestion, kind: 'account', value: account.id, accountId: account.id }
+      : null;
+  if (!memory) throw new Error('这条记忆无法对应当前分类或账户，未保存。');
+  await persistAgentMemory(memory);
+  await updateAgentMessage(messageId, { memoryStatus: 'saved' });
+  render();
+  requestAnimationFrame(scrollAgentToLatest);
+  toast('偏好已保存，之后的草稿会参考它。');
+}
+function agentEditValue(snapshot, key) {
+  if (key === 'amountYuan') return money(centsFromYuan(snapshot.amountYuan));
+  if (key === 'occurredAt') return `${groupDateLabel(snapshot.occurredAt)} ${timeLabel(snapshot.occurredAt)}`;
+  if (key === 'type') return agentDraftTypeLabel(snapshot.type);
+  if (key === 'categoryId') return getCategory(snapshot.categoryId).label;
+  if (key === 'accountId' || key === 'toAccountId') return snapshot[key] ? accountName(snapshot[key]) : '未设置';
+  if (key === 'note') return snapshot.note || '无备注';
+  return String(snapshot[key] ?? '');
+}
+
+function renderAgentEditSuggestion(message) {
+  const suggestion = message.editSuggestion;
+  if (!suggestion) return '';
+  const title = suggestion.before?.note || getCategory(suggestion.before?.categoryId).label;
+  if (message.editStatus === 'confirmed') return `<div class="agent-edit-card confirmed">${icon('ph-check-circle')}<span>已修改流水：${escapeHtml(title)}</span></div>`;
+  if (message.editStatus === 'dismissed') return `<div class="agent-edit-card dismissed">${icon('ph-x-circle')}<span>已取消这次修改，原流水没有变化。</span></div>`;
+  const labels = { amountYuan: '金额', occurredAt: '发生时间', type: '类型', categoryId: '分类', accountId: '账户', toAccountId: '转入账户', note: '备注' };
+  const rows = Object.keys(suggestion.changes || {}).map((key) => `<div class="agent-edit-row"><span>${labels[key] || key}</span><strong>${escapeHtml(agentEditValue(suggestion.before, key))}</strong><i class="ph ph-arrow-right" aria-hidden="true"></i><strong class="agent-edit-after">${escapeHtml(agentEditValue(suggestion.after, key))}</strong></div>`).join('');
+  return `<div class="agent-edit-card"><div class="agent-edit-heading">${icon('ph-pencil-simple')}<span><strong>修改流水</strong><small>请核对差异，确认后才会写回账本</small></span></div><div class="agent-edit-target"><span>目标流水</span><strong>${escapeHtml(title)} · ${escapeHtml(money(centsFromYuan(suggestion.before.amountYuan)))}</strong><small>${escapeHtml(groupDateLabel(suggestion.before.occurredAt))}</small></div><div class="agent-edit-diff">${rows}</div><div class="agent-draft-actions"><button class="secondary-button" type="button" data-action="dismiss-agent-edit" data-message-id="${escapeHtml(message.id)}">取消修改</button><button class="primary-button" type="button" data-action="confirm-agent-edit" data-message-id="${escapeHtml(message.id)}">${icon('ph-check')}确认修改</button></div></div>`;
+}
+
+async function confirmAgentEdit(messageId) {
+  const message = state.agentMessages.find((item) => item.id === messageId);
+  const suggestion = message?.editSuggestion;
+  if (!message || !suggestion || message.editStatus !== 'pending') return;
+  const transaction = state.transactions.find((item) => item.id === suggestion.targetId && !item.deletedAt);
+  if (!transaction) throw new Error('目标流水已不存在，未执行修改。');
+  if (suggestion.targetUpdatedAt && suggestion.targetUpdatedAt !== (transaction.updatedAt || transaction.createdAt || '')) throw new Error('目标流水在此期间已发生变化，请重新描述要修改的内容。');
+  const changes = suggestion.changes || {};
+  const now = new Date().toISOString();
+  const updated = {
+    ...transaction,
+    ...(changes.amountYuan !== undefined ? { amount: centsFromYuan(changes.amountYuan) } : {}),
+    ...(changes.type ? { type: changes.type } : {}),
+    ...(changes.categoryId ? { categoryId: changes.categoryId } : {}),
+    ...(changes.accountId ? { accountId: changes.accountId } : {}),
+    ...(changes.toAccountId !== undefined ? { toAccountId: changes.toAccountId } : {}),
+    ...(changes.occurredAt ? { occurredAt: changes.occurredAt } : {}),
+    ...(changes.note !== undefined ? { note: changes.note } : {}),
+    updatedAt: now,
+  };
+  if (updated.type !== 'transfer') updated.toAccountId = '';
+  if (updated.type === 'transfer' && (!updated.toAccountId || updated.toAccountId === updated.accountId)) throw new Error('转账流水需要不同的转出和转入账户，未执行修改。');
+  if (updated.type !== 'transfer' && !state.categories.some((item) => item.id === updated.categoryId && item.type === updated.type)) throw new Error('修改后的分类与流水类型不匹配，未执行修改。');
+  const after = agentTransactionSnapshot(updated);
+  await persistTransaction(updated, '流水修改已保存。');
+  await updateAgentMessage(messageId, { editStatus: 'confirmed', editSuggestion: { ...suggestion, before: agentTransactionSnapshot(transaction), after, targetUpdatedAt: updated.updatedAt } });
+  render();
+  requestAnimationFrame(scrollAgentToLatest);
+}
+
 function renderAgentMessage(message) {
   const assistant = message.role === 'assistant';
   return `
     <article class="agent-message ${assistant ? 'assistant' : 'user'}">
       ${assistant ? `<span class="agent-avatar">${icon('ph-chat-circle-dots')}</span>` : ''}
       <div class="agent-message-content">
-        <div class="agent-bubble">${escapeHtml(message.content).replaceAll('\n', '<br>')}</div>
+        <div class="agent-bubble">${escapeHtml(message.content).replaceAll('\\n', '<br>')}</div>
         ${assistant ? renderAgentDraft(message) : ''}
+        ${assistant ? renderAgentEditSuggestion(message) : ''}
+        ${assistant ? renderAgentMemorySuggestion(message) : ''}
         <time datetime="${escapeHtml(message.createdAt)}">${escapeHtml(timeLabel(message.createdAt))}</time>
       </div>
     </article>`;
@@ -1692,7 +2138,7 @@ function renderAgent() {
   const messages = state.agentMessages.length
     ? state.agentMessages.map(renderAgentMessage).join('')
     : `<article class="agent-message assistant"><span class="agent-avatar">${icon('ph-chat-circle-dots')}</span><div class="agent-message-content"><div class="agent-bubble"><strong>你好，我是账本助手。</strong><br>你可以直接说“午餐 28 元，微信支付”，也可以问“这个月花了多少”。记账草稿需要你确认后才会写入。</div></div></article>`;
-  const prompts = ['今天午餐 28 元，微信支付', '本月花了多少？', '本月支出最多的是哪类？', '餐饮比上月多吗？'];
+  const prompts = ['今天午餐 28 元，微信支付', '本月花了多少？', '本月支出最多的是哪类？', '餐饮比上月多吗？', '分析我的消费习惯', '哪些可能是固定支出？'];
   return `
     ${pageHeader('智能助手', '一句话记账，也可以直接询问收入、支出和结余。', `<button class="secondary-button" type="button" data-action="open-agent-settings">${icon('ph-sliders-horizontal')}模型设置</button>`)}
     <div class="agent-workspace">
@@ -1717,7 +2163,7 @@ function renderAgent() {
           <div class="record-method-item">${icon('ph-text-aa')}<span><strong>文本输入</strong><small>一句话自动识别收支、金额、分类、账户和备注</small></span></div>
           <div class="record-method-item">${icon('ph-microphone')}<span><strong>语音输入</strong><small>说完自动转写并整理成待审核草稿</small></span></div>
         </div></section>
-        <section class="side-panel agent-connection-card"><div class="panel-heading"><h3>模型连接</h3><span class="agent-status ${connection.className}">${icon(connection.iconName)}${escapeHtml(connection.label)}</span></div><div class="panel-body"><p>常见记账与查账可在本地完成。连接兼容模型后，可以理解更灵活的表达。</p><button class="secondary-button button-full" type="button" data-action="open-agent-settings">${icon('ph-plugs-connected')}配置并测试连接</button></div></section>
+        <section class="side-panel agent-connection-card"><div class="panel-heading"><h3>模型连接</h3><span class="agent-status ${connection.className}">${icon(connection.iconName)}${escapeHtml(connection.label)}</span></div><div class="panel-body"><p>常见记账与查账可在本地完成。连接兼容模型后，可以理解更灵活的表达。</p><button class="secondary-button button-full" type="button" data-action="open-agent-settings">${icon('ph-plugs-connected')}配置并测试连接</button></div></section>         <section class="side-panel"><div class="panel-heading"><h3>已确认偏好</h3><span class="panel-note">${state.agentMemory.length} 条</span></div><div class="panel-body agent-memory-list">${state.agentMemory.length ? state.agentMemory.slice().reverse().slice(0, 4).map((memory) => `<div class="agent-memory-list-item"><span>${icon('ph-brain')}<strong>${escapeHtml(memory.label || memory.key)}</strong></span><button class="row-action danger" type="button" data-action="delete-agent-memory" data-memory-id="${escapeHtml(memory.id)}" aria-label="删除${escapeHtml(memory.label || memory.key)}">${icon('ph-trash')}</button></div>`).join('') : '<p class="panel-note">你说“记住……”时，我会先给你确认，未确认不会保存。</p>'}<button class="secondary-button button-full" type="button" data-action="open-agent-memory">管理偏好记忆</button></div></section>
         <section class="side-panel"><div class="panel-heading"><h3>试着这样问</h3></div><div class="panel-body agent-prompt-list">${prompts.map((prompt) => `<button type="button" data-agent-prompt="${escapeHtml(prompt)}">${icon('ph-arrow-bend-down-right')}<span>${escapeHtml(prompt)}</span></button>`).join('')}</div></section>
         <section class="side-panel"><div class="panel-heading"><h3>数据边界</h3></div><div class="panel-body agent-privacy-note">${icon('ph-shield-check')}<p>写入前需要确认。模型只会收到必要汇总与近期流水，API Key 不会进入账本备份。</p></div></section>
       </aside>
@@ -1727,6 +2173,30 @@ function renderAgent() {
 function scrollAgentToLatest() {
   const list = document.querySelector('#agent-message-list');
   if (list) list.scrollTop = list.scrollHeight;
+}
+
+function renderAgentPreservingComposer() {
+  const input = document.querySelector('#agent-input');
+  const composerState = input
+    ? {
+        value: input.value,
+        selectionStart: input.selectionStart,
+        selectionEnd: input.selectionEnd,
+        focused: document.activeElement === input,
+      }
+    : null;
+  render();
+  const nextInput = document.querySelector('#agent-input');
+  if (!composerState || !nextInput) return;
+  nextInput.value = composerState.value;
+  nextInput.style.height = 'auto';
+  nextInput.style.height = `${Math.min(132, nextInput.scrollHeight)}px`;
+  const counter = document.querySelector('#agent-input-count');
+  if (counter) counter.textContent = `${nextInput.value.length}/${AGENT_MAX_INPUT_LENGTH}`;
+  if (composerState.focused) {
+    nextInput.focus();
+    nextInput.setSelectionRange(composerState.selectionStart, composerState.selectionEnd);
+  }
 }
 
 async function testAgentConnection(config) {
@@ -1863,7 +2333,11 @@ function renderSettings() {
           </form>
         </section>
 
-        <section class="settings-section">
+                <section class="settings-section" id="agent-memory-settings">
+          <div class="settings-title-row"><div><h2>偏好记忆</h2><p>只保存你明确确认过的规则，记忆只影响之后的草稿，不会修改历史流水。</p></div><span class="panel-note">${state.agentMemory.length} 条</span></div>
+          <div class="agent-settings-memory-list">${state.agentMemory.length ? state.agentMemory.slice().reverse().map((memory) => `<div class="agent-settings-memory-item"><div><strong>${escapeHtml(memory.label || memory.key)}</strong><small>${memory.kind === 'category' ? '分类偏好' : '账户偏好'}</small></div><button class="secondary-button" type="button" data-action="delete-agent-memory" data-memory-id="${escapeHtml(memory.id)}">删除</button></div>`).join('') : '<p class="panel-note">暂无已确认偏好。你可以在助手中输入“记住 GPT会员归类为订阅服务”。</p>'}</div>
+        </section>
+<section class="settings-section">
           <h2>账本设置</h2>
           <p>预算只用于提醒，不会限制记账；金额默认使用人民币。</p>
           <form id="ledger-settings-form">
@@ -2225,6 +2699,7 @@ async function exportData() {
     categories: state.categories,
     accounts: state.accounts,
     transactions: state.transactions,
+    agentMemory: state.agentMemory,
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -2246,10 +2721,11 @@ async function importData(file) {
   validateBackup(data);
   if (!window.confirm(`将导入 ${data.transactions.length} 笔流水，并替换当前账本数据。继续吗？`)) return;
   if (!state.demo) {
-    await Promise.all([dbClear(STORES.transactions), dbClear(STORES.categories), dbClear(STORES.accounts), dbClear(STORES.agentMessages)]);
+    await Promise.all([dbClear(STORES.transactions), dbClear(STORES.categories), dbClear(STORES.accounts), dbClear(STORES.agentMessages), dbClear(STORES.agentMemory)]);
     for (const item of data.transactions) await dbPut(STORES.transactions, item);
     for (const item of data.categories) await dbPut(STORES.categories, item);
     for (const item of data.accounts) await dbPut(STORES.accounts, item);
+    for (const item of (Array.isArray(data.agentMemory) ? data.agentMemory : [])) await dbPut(STORES.agentMemory, item);
     await dbPut(STORES.settings, { key: 'profile', ...DEFAULT_PROFILE, ...(data.profile || {}) });
   }
   state.profile = { ...DEFAULT_PROFILE, ...(data.profile || {}), salaryEstimate: { ...DEFAULT_PROFILE.salaryEstimate, ...(data.profile?.salaryEstimate || {}) } };
@@ -2257,6 +2733,7 @@ async function importData(file) {
   state.categories = data.categories;
   state.accounts = data.accounts;
   state.agentMessages = [];
+  state.agentMemory = Array.isArray(data.agentMemory) ? data.agentMemory : [];
   render();
   toast('备份已导入。');
 }
@@ -2264,7 +2741,7 @@ async function importData(file) {
 async function resetData() {
   if (!window.confirm('确定清空当前设备中的全部账本数据吗？此操作不能撤销。')) return;
   if (!state.demo) {
-    await Promise.all([dbClear(STORES.transactions), dbClear(STORES.categories), dbClear(STORES.accounts), dbClear(STORES.agentMessages)]);
+    await Promise.all([dbClear(STORES.transactions), dbClear(STORES.categories), dbClear(STORES.accounts), dbClear(STORES.agentMessages), dbClear(STORES.agentMemory)]);
     await dbPut(STORES.settings, { key: 'profile', ...DEFAULT_PROFILE });
     for (const category of DEFAULT_CATEGORIES) await dbPut(STORES.categories, category);
     for (const account of DEFAULT_ACCOUNTS) await dbPut(STORES.accounts, account);
@@ -2274,6 +2751,7 @@ async function resetData() {
   state.agentMessages = [];
   state.categories = [...DEFAULT_CATEGORIES];
   state.accounts = [...DEFAULT_ACCOUNTS];
+  state.agentMemory = [];
   navigate('home');
   toast('本地账本已清空。');
 }
@@ -2320,6 +2798,33 @@ document.addEventListener('click', async (event) => {
       await updateAgentMessage(actionTarget.dataset.messageId, { draftStatus: 'dismissed' });
       render();
       toast('草稿已放弃，没有写入账本。');
+      return;
+    }
+    if (action === 'confirm-agent-edit') { await confirmAgentEdit(actionTarget.dataset.messageId); return; }
+    if (action === 'dismiss-agent-edit') {
+      await updateAgentMessage(actionTarget.dataset.messageId, { editStatus: 'dismissed' });
+      render();
+      toast('修改已取消，原流水没有变化。');
+      return;
+    }
+    if (action === 'confirm-agent-memory') { await confirmAgentMemory(actionTarget.dataset.messageId); return; }
+    if (action === 'dismiss-agent-memory') {
+      await updateAgentMessage(actionTarget.dataset.messageId, { memoryStatus: 'dismissed' });
+      render();
+      toast('这条偏好没有保存。');
+      return;
+    }
+    if (action === 'delete-agent-memory') {
+      if (window.confirm('删除这条记账偏好吗？不会修改已有流水。')) {
+        await removeAgentMemory(actionTarget.dataset.memoryId);
+        render();
+        toast('记账偏好已删除。');
+      }
+      return;
+    }
+    if (action === 'open-agent-memory') {
+      navigate('settings');
+      requestAnimationFrame(() => document.querySelector('#agent-memory-settings')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
       return;
     }
     if (action === 'toggle-agent-key') {
@@ -2377,6 +2882,8 @@ document.addEventListener('click', async (event) => {
 document.addEventListener('change', async (event) => {
   if (event.target.id === 'ledger-type-filter') { state.ledgerType = event.target.value; render(); }
   if (event.target.id === 'ledger-account-filter') { state.ledgerAccount = event.target.value; render(); }
+  const changedDraftForm = event.target.closest('[data-agent-draft-form]');
+  if (changedDraftForm) state.agentDraftEditLocks.add(changedDraftForm.dataset.messageId);
   if (event.target.classList.contains('agent-draft-type')) {
     const entry = event.target.closest('[data-agent-draft-entry]');
     const type = event.target.value;
@@ -2393,6 +2900,8 @@ document.addEventListener('change', async (event) => {
 });
 
 document.addEventListener('input', (event) => {
+  const editedDraftForm = event.target.closest('[data-agent-draft-form]');
+  if (editedDraftForm) state.agentDraftEditLocks.add(editedDraftForm.dataset.messageId);
   if (event.target.classList.contains('salary-input')) updateSalaryEstimatePreview();
   if (event.target.id === 'agent-input') {
     event.target.style.height = 'auto';

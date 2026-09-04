@@ -496,7 +496,38 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .agent-draft-result strong { font-size: 12px; }
 .agent-draft-result span { color: var(--ink-soft); font-size: 11px; }
 .agent-draft-card.dismissed { display: flex; align-items: center; gap: 8px; color: var(--ink-soft); font-size: 12px; }
-.agent-draft-card.dismissed .ph { color: var(--ink-muted); font-size: 18px; }
+.agent-draft-card.dismissed .ph { color: var(--ink-muted); font-size: 18px; }.agent-memory-card { width: min(620px, 100%); margin-top: 10px; padding: 14px; border: 1px solid #cbded2; border-radius: var(--radius-md); background: var(--primary-soft); }
+.agent-memory-card-title, .agent-memory-list-item, .agent-settings-memory-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.agent-memory-card-title > .ph { color: var(--primary); font-size: 20px; }
+.agent-memory-card-title > span { display: grid; gap: 3px; }
+.agent-memory-card-title small, .agent-memory-list-item small, .agent-settings-memory-item small { color: var(--ink-muted); font-size: 11px; }
+.agent-memory-card.saved, .agent-memory-card.dismissed { display: flex; align-items: center; gap: 8px; color: var(--ink-soft); font-size: 12px; }
+.agent-memory-card.saved .ph { color: var(--income); }
+.agent-memory-card.dismissed .ph { color: var(--ink-muted); }
+.agent-memory-list { display: grid; gap: 10px; }
+.agent-memory-list-item { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.agent-memory-list-item > span { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.agent-memory-list-item strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.agent-settings-memory-list { display: grid; gap: 8px; }
+.agent-settings-memory-item { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.agent-settings-memory-item > div { display: grid; gap: 3px; }
+.agent-settings-memory-item strong { font-size: 12px; }
+.agent-edit-card { width: min(620px, 100%); margin-top: 10px; padding: 14px; border: 1px solid #d6ddd9; border-radius: var(--radius-md); background: var(--surface); }
+.agent-edit-heading { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; color: var(--primary); }
+.agent-edit-heading > .ph { font-size: 19px; }
+.agent-edit-heading span { display: grid; gap: 3px; }
+.agent-edit-heading strong { color: var(--ink); font-size: 13px; }
+.agent-edit-heading small, .agent-edit-target small { color: var(--ink-muted); font-size: 11px; }
+.agent-edit-target { display: grid; gap: 3px; padding: 10px; border-radius: var(--radius-sm); background: var(--surface-subtle); color: var(--ink-soft); font-size: 11px; }
+.agent-edit-target strong { color: var(--ink); font-size: 12px; }
+.agent-edit-diff { display: grid; gap: 0; margin-top: 10px; border-top: 1px solid var(--line); }
+.agent-edit-row { display: grid; grid-template-columns: 60px minmax(0, 1fr) 18px minmax(0, 1fr); align-items: center; gap: 8px; min-height: 38px; border-bottom: 1px solid var(--line); color: var(--ink-soft); font-size: 11px; }
+.agent-edit-row > strong { overflow: hidden; color: var(--ink-soft); font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.agent-edit-row > .ph { color: var(--ink-muted); font-size: 14px; text-align: center; }
+.agent-edit-row .agent-edit-after { color: var(--primary); }
+.agent-edit-card.confirmed, .agent-edit-card.dismissed { display: flex; align-items: center; gap: 8px; color: var(--ink-soft); font-size: 12px; }
+.agent-edit-card.confirmed .ph { color: var(--income); }
+.agent-edit-card.dismissed .ph { color: var(--ink-muted); }
 .agent-methods-card .panel-heading { align-items: center; }
 .agent-methods-badge { padding: 4px 7px; border-radius: 999px; background: var(--income-soft); color: var(--income); font-size: 10px; font-weight: 700; white-space: nowrap; }
 .agent-method-list { display: grid; gap: 0; padding-top: 4px; }
@@ -763,6 +794,8 @@ button.record-method-item:hover strong, button.record-method-item:hover > .ph { 
   .agent-message { gap: 8px; }
   .agent-avatar { width: 34px; height: 34px; }
   .agent-draft-card { padding: 13px; }
+  .agent-edit-card { padding: 13px; }
+  .agent-edit-row { grid-template-columns: 48px minmax(0, 1fr) 16px minmax(0, 1fr); gap: 5px; }
   .agent-draft-actions { align-items: stretch; flex-direction: column-reverse; }
   .agent-draft-actions button { width: 100%; }
 }

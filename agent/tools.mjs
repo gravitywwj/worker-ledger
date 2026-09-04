@@ -114,6 +114,48 @@ export const AGENT_TOOL_DEFINITIONS = [
       },
       strict: true,
     },
+  },  {
+    type: 'function',
+    function: {
+      name: 'search_transactions',
+      description: '按关键词、类型或时间读取流水摘要，只读，不写入账本。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          keyword: { type: 'string', description: '商户、备注或分类关键词，可为空' },
+          type: { type: 'string', enum: ['expense', 'income', 'transfer', ''], description: '流水类型，可为空' },
+          limit: { type: 'integer', minimum: 1, maximum: 50, description: '最多返回条数' },
+        },
+        required: ['keyword', 'type', 'limit'],
+      },
+      strict: true,
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'analyze_spending_habits',
+      description: '分析账本中的消费分类、商户、频率、固定支出和异常金额，只读。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          months: { type: 'integer', minimum: 1, maximum: 24, description: '分析最近几个月，默认 3' },
+        },
+        required: ['months'],
+      },
+      strict: true,
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_user_preferences',
+      description: '读取用户已经明确确认过的记账偏好，只读。',
+      parameters: { type: 'object', additionalProperties: false, properties: {}, required: [] },
+      strict: true,
+    },
   },
 ];
 
@@ -358,6 +400,53 @@ function expectedCandidates(candidates) {
   return candidates.flatMap((candidate) => Array.from({ length: Math.max(1, Number(candidate.count || 1)) }, () => candidate));
 }
 
+function ledgerItems(context) {
+  const value = context.ledgerContext?.analysisTransactions || context.ledgerContext?.recentTransactions || [];
+  return Array.isArray(value) ? value : [];
+}
+
+function normalizedItem(item) {
+  return {
+    id: String(item.id || ''),
+    occurredAt: item.occurredAt,
+    type: item.type,
+    amountYuan: number(item.amountYuan ?? item.amount),
+    category: String(item.category || ''),
+    account: String(item.account || ''),
+    note: String(item.note || ''),
+    tags: Array.isArray(item.tags) ? item.tags : [],
+  };
+}
+
+function analyzeHabits(context, months = 3) {
+  const items = ledgerItems(context).map(normalizedItem).filter((item) => item.type !== 'transfer' && item.amountYuan > 0);
+  const cutoff = new Date();
+  cutoff.setMonth(cutoff.getMonth() - Math.max(1, Number(months) || 3));
+  const scoped = items.filter((item) => !item.occurredAt || new Date(item.occurredAt) >= cutoff);
+  const expenses = scoped.filter((item) => item.type === 'expense');
+  const income = scoped.filter((item) => item.type === 'income');
+  const groupBy = (values, key) => values.reduce((map, item) => {
+    const name = item[key] || '未分类';
+    const current = map.get(name) || { name, amountYuan: 0, count: 0 };
+    current.amountYuan += item.amountYuan;
+    current.count += 1;
+    map.set(name, current);
+    return map;
+  }, new Map());
+  const categories = [...groupBy(expenses, 'category').values()].sort((a, b) => b.amountYuan - a.amountYuan);
+  const merchants = [...groupBy(expenses, 'note').values()].filter((item) => item.name).sort((a, b) => b.amountYuan - a.amountYuan);
+  const fixed = merchants.filter((item) => item.count >= 2).slice(0, 8);
+  const averageExpense = expenses.length ? expenses.reduce((sum, item) => sum + item.amountYuan, 0) / expenses.length : 0;
+  const largest = [...expenses].sort((a, b) => b.amountYuan - a.amountYuan).slice(0, 5);
+  return {
+    months: Math.max(1, Number(months) || 3), sampleCount: scoped.length,
+    expenseYuan: expenses.reduce((sum, item) => sum + item.amountYuan, 0),
+    incomeYuan: income.reduce((sum, item) => sum + item.amountYuan, 0),
+    averageExpenseYuan: Math.round(averageExpense * 100) / 100,
+    topCategories: categories.slice(0, 8), repeatedMerchants: fixed, largestExpenses: largest,
+    note: scoped.length < 8 ? '样本较少，只能做初步观察。' : '',
+  };
+}
 export function validateTransactionDrafts(args = {}, context = {}) {
   const drafts = Array.isArray(args.drafts) ? args.drafts : [];
   const candidates = expectedCandidates(Array.isArray(context.candidates) ? context.candidates : []);
@@ -401,5 +490,18 @@ export function executeAgentTool(name, args, context = {}) {
   }
   if (name === 'validate_transaction_drafts') return validateTransactionDrafts(args, context);
   if (name === 'query_ledger') return { query: String(args?.query || ''), ledgerContext: context.ledgerContext || {} };
+  if (name === 'search_transactions') {
+    const keyword = String(args?.keyword || '').trim().toLowerCase();
+    const type = String(args?.type || '');
+    const limit = Math.min(50, Math.max(1, Number(args?.limit) || 20));
+    const items = ledgerItems(context).map(normalizedItem).filter((item) => {
+      const matchesType = !type || item.type === type;
+      const haystack = [item.category, item.account, item.note, ...item.tags].join(' ').toLowerCase();
+      return matchesType && (!keyword || haystack.includes(keyword));
+    });
+    return { count: items.length, transactions: items.slice(0, limit) };
+  }
+  if (name === 'analyze_spending_habits') return analyzeHabits(context, args?.months);
+  if (name === 'get_user_preferences') return { preferences: context.ledgerContext?.userPreferences || [] };
   throw new Error(`未知 Agent tool：${name}`);
 }

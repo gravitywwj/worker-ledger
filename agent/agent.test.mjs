@@ -3,7 +3,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import test from 'node:test';
 import { createLedgerAgent } from './agent.mjs';
-import { extractTransactionCandidates, validateTransactionDrafts } from './tools.mjs';
+import { executeAgentTool, extractTransactionCandidates, validateTransactionDrafts } from './tools.mjs';
+import { normalizeAgentResponse } from './schemas.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const categories = [
@@ -75,4 +76,64 @@ test('runs a bounded validate-tool ReAct loop before final JSON', async () => {
   assert.equal(calls, 2);
   assert.equal(result.candidateCount, 2);
   assert.equal(result.toolRounds, 1);
+});
+
+test('enforces the final JSON contract and amount coverage', () => {
+  const complete = {
+    kind: 'transaction_draft',
+    reply: '请审核。',
+    drafts: [{ type: 'expense', amountYuan: 28.8, category: '餐饮', account: '微信', toAccount: '', occurredAt: '2026-08-27T12:00:00.000Z', note: '午餐', tags: [] }],
+  };
+  const result = normalizeAgentResponse(JSON.stringify(complete), { candidates: [{ amountYuan: 28.8 }] });
+  assert.equal(result.drafts[0].amountYuan, 28.8);
+  assert.throws(() => normalizeAgentResponse(JSON.stringify({ ...complete, drafts: [] }), { candidates: [{ amountYuan: 28.8 }] }), /没有返回记账草稿/);
+  assert.throws(() => normalizeAgentResponse(JSON.stringify({ ...complete, drafts: [{ ...complete.drafts[0], amountYuan: 8.13 }] }), { candidates: [{ amountYuan: 28.8 }] }), /没有完整覆盖/);
+});
+
+test('habit tool excludes transfers and returns only aggregate facts', () => {
+  const result = executeAgentTool('analyze_spending_habits', { months: 3 }, { ledgerContext: { recentTransactions: [
+    { occurredAt: new Date().toISOString(), type: 'expense', amountYuan: 28.8, category: '餐饮', account: '微信', note: '外卖', tags: [] },
+    { occurredAt: new Date().toISOString(), type: 'expense', amountYuan: 50, category: '日用', account: '支付宝', note: '盒马', tags: [] },
+    { occurredAt: new Date().toISOString(), type: 'transfer', amountYuan: 1000, category: '转账', account: '微信', note: '转入银行卡', tags: [] },
+  ] } });
+  assert.equal(result.sampleCount, 2);
+  assert.equal(result.expenseYuan, 78.8);
+  assert.equal(result.topCategories[0].name, '日用');
+  assert.ok(!Object.hasOwn(result, 'transactions'));
+});
+test('strictly validates a transaction update and keeps the target id', () => {
+  const update = {
+    kind: 'transaction_update',
+    reply: '请核对修改前后内容。',
+    update: { transactionId: 'tx-1', changes: { occurredAt: '2026-08-10T12:00:00.000Z' } },
+  };
+  const result = normalizeAgentResponse(JSON.stringify(update), { ledgerContext: { recentTransactions: [{ id: 'tx-1' }] } });
+  assert.equal(result.update.transactionId, 'tx-1');
+  assert.equal(result.update.changes.occurredAt, '2026-08-10T12:00:00.000Z');
+  assert.throws(() => normalizeAgentResponse(JSON.stringify({ ...update, update: { ...update.update, transactionId: 'missing' } }), { ledgerContext: { recentTransactions: [{ id: 'tx-1' }] } }), /近期流水范围/);
+});
+
+test('uses a read-only search tool before returning a transaction update', async () => {
+  const recentTransactions = [{ id: 'tx-1', occurredAt: '2026-08-17T12:00:00.000Z', type: 'expense', amountYuan: 28.8, category: '餐饮', account: '微信', note: '美团外卖', tags: [] }];
+  let calls = 0;
+  const complete = async (_config, messages, options = {}) => {
+    calls += 1;
+    if (calls === 1) {
+      assert.ok(Array.isArray(options.tools));
+      return { message: { role: 'assistant', content: '', tool_calls: [{ id: 'search-1', type: 'function', function: { name: 'search_transactions', arguments: JSON.stringify({ keyword: '美团外卖', type: 'expense', limit: 5 }) } }] } };
+    }
+    assert.equal(messages.at(-1).role, 'tool');
+    assert.match(messages.at(-1).content, /tx-1/);
+    return { message: { role: 'assistant', content: JSON.stringify({ kind: 'transaction_update', reply: '请核对修改前后内容。', update: { transactionId: 'tx-1', changes: { occurredAt: '2026-08-10T12:00:00.000Z' } } }) } };
+  };
+  const agent = await createLedgerAgent({ root, complete });
+  const result = await agent.run({
+    config: { baseUrl: 'http://fake.local', model: 'fake' },
+    messages: [{ role: 'user', content: '把美团外卖那笔记错的日期改成 8 月 10 日。' }],
+    ledgerContext: { ...context, recentTransactions },
+  });
+  const parsed = JSON.parse(result.reply);
+  assert.equal(calls, 2);
+  assert.equal(parsed.kind, 'transaction_update');
+  assert.equal(parsed.update.transactionId, 'tx-1');
 });
