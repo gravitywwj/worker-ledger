@@ -839,3 +839,24 @@ html[data-qa="true"] .transaction-row {
 html[data-qa="true"] .transaction-group { min-width: 700px; padding: 15px 20px 8px; }
 html[data-qa="true"] .transaction-row { font-size: 12px; }
 html[data-qa="true"] .mobile-nav { display: none; }
+
+/* Optional product detail rows use the existing form vocabulary. */
+.product-editor { margin-top: 18px; min-width: 0; }
+.product-editor summary { cursor: pointer; font-weight: 650; padding: 12px 0; }
+.product-help { color: var(--ink-soft); font-size: 12px; margin: 4px 0 12px; }
+.product-editor-toolbar { display: flex; gap: 12px; align-items: end; margin-bottom: 12px; }
+.product-editor-toolbar .field { flex: 1; min-width: 0; }
+.product-row { margin: 0 0 16px; padding: 14px 0; border: 0; border-top: 1px solid var(--line); min-width: 0; }
+.product-row legend { font-weight: 650; padding-right: 8px; }
+.product-row-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.product-row-fields input, .product-row-fields select { width: 100%; min-width: 0; }
+.product-row-footer { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; margin-top: 12px; }
+.product-row-footer output { color: var(--ink-soft); font-size: 12px; }
+.price-sources { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.price-sources button { white-space: normal; text-align: left; }
+.agent-bubble { white-space: pre-wrap; }
+@media (max-width: 480px) {
+  .product-editor-toolbar { align-items: stretch; flex-direction: column; }
+  .product-row-fields { grid-template-columns: minmax(0, 1fr); }
+  .product-editor button { min-height: 44px; }
+}

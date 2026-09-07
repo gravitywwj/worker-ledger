@@ -4,8 +4,11 @@
   "private": true,
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check app.js && node --check server.mjs && node --check agent/tools.mjs && node --check agent/agent.mjs",
-    "test:agent": "node --test agent/agent.test.mjs"
+    "check": "node --check app.js && node --check server.mjs && node --check agent/tools.mjs && node --check agent/agent.mjs && node --check product-prices.mjs && node --check product-ui.mjs && node --check product-backup.mjs && node --check agent/schemas.mjs",
+    "test:agent": "node --test agent/agent.test.mjs",
+    "test:products": "node --test tests/products.test.mjs",
+    "test": "node --test agent/agent.test.mjs tests/products.test.mjs",
+    "test:browser": "node tests/run-browser.mjs"
   },
   "dependencies": {
     "@phosphor-icons/web": "^2.1.1"

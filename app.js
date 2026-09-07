@@ -1,9 +1,15 @@
 /* 打工人小账本：本地优先的个人收支账本。 */
 
+import { DEFAULT_PRODUCT_CATEGORIES, normalizeProductItems, prepareProductTransactions, isProductQuery, parseProductQuote, compareProductPrices, formatPriceComparison, maskProductMeasurements, parseProductEntry } from './product-prices.mjs';
+import { normalizeBackup } from './product-backup.mjs';
+import { productRow, renderProductEditor, readProductEditor, updateProductPreviews, renderPriceSources } from './product-ui.mjs';
+
 const DB_NAME = 'worker-ledger';
-const DB_VERSION = 5;
+const DB_VERSION = 6;
 const STORES = {
   transactions: 'transactions',
+  products: 'products',
+  productCategories: 'product_categories',
   settings: 'profile_settings',
   categories: 'categories',
   accounts: 'accounts',
@@ -126,6 +132,8 @@ const state = {
   selectedMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
   profile: { ...DEFAULT_PROFILE, salaryEstimate: { ...DEFAULT_PROFILE.salaryEstimate } },
   transactions: [],
+  products: [],
+  productCategories: [...DEFAULT_PRODUCT_CATEGORIES],
   categories: [...DEFAULT_CATEGORIES],
   accounts: [...DEFAULT_ACCOUNTS],
   searchTerm: '',
@@ -475,6 +483,13 @@ function openDatabase() {
     request.onerror = () => reject(request.error || new Error('本地资料库无法打开。'));
     request.onupgradeneeded = () => {
       const db = request.result;
+      for (const name of [STORES.products, STORES.productCategories]) {
+        if (!db.objectStoreNames.contains(name)) {
+          const store = db.createObjectStore(name, { keyPath: 'id' });
+          store.createIndex('name', 'name');
+          if (name === STORES.products) store.createIndex('productCategoryId', 'productCategoryId');
+        }
+      }
       const transactionStore = db.objectStoreNames.contains(STORES.transactions)
         ? request.transaction.objectStore(STORES.transactions)
         : db.createObjectStore(STORES.transactions, { keyPath: 'id' });
@@ -493,7 +508,11 @@ function openDatabase() {
         : db.createObjectStore(STORES.agentMemory, { keyPath: 'id' });
       if (!memoryStore.indexNames.contains('updatedAt')) memoryStore.createIndex('updatedAt', 'updatedAt');
     };
-    request.onsuccess = () => resolve(request.result);
+    request.onblocked = () => reject(new Error('请关闭其他已打开的账本标签页，再重试升级。'));
+    request.onsuccess = () => {
+      request.result.onversionchange = () => request.result.close();
+      resolve(request.result);
+    };
   });
 }
 
@@ -553,6 +572,7 @@ function dbClear(storeName) {
 }
 
 async function ensureInitialData() {
+  if (!(await dbGetAll(STORES.productCategories)).length) await dbPutMany(STORES.productCategories, DEFAULT_PRODUCT_CATEGORIES);
   const existingCategories = await dbGetAll(STORES.categories);
   if (existingCategories.length === 0) {
     for (const category of DEFAULT_CATEGORIES) await dbPut(STORES.categories, category);
@@ -580,13 +600,15 @@ async function loadData() {
     } else {
       if (!state.db) state.db = await openDatabase();
       await ensureInitialData();
-      const [profileRecord, transactions, categories, accounts, agentMessages, agentMemory] = await Promise.all([
+      const [profileRecord, transactions, categories, accounts, agentMessages, agentMemory, products, productCategories] = await Promise.all([
         dbGet(STORES.settings, 'profile'),
         dbGetAll(STORES.transactions),
         dbGetAll(STORES.categories),
         dbGetAll(STORES.accounts),
         dbGetAll(STORES.agentMessages),
         dbGetAll(STORES.agentMemory),
+        dbGetAll(STORES.products),
+        dbGetAll(STORES.productCategories),
       ]);
       state.profile = {
         ...DEFAULT_PROFILE,
@@ -595,6 +617,8 @@ async function loadData() {
       };
       delete state.profile.key;
       state.transactions = sortTransactions(transactions);
+      state.products = products;
+      state.productCategories = productCategories;
       state.categories = categories.length ? categories : [...DEFAULT_CATEGORIES];
       state.accounts = accounts.length ? accounts : [...DEFAULT_ACCOUNTS];
       state.agentMessages = agentMessages
@@ -629,27 +653,33 @@ async function persistProfile(patch, successMessage = '设置已保存。') {
 }
 
 async function persistTransaction(transaction, successMessage = '这笔流水已保存。') {
-  if (!state.demo) await dbPut(STORES.transactions, transaction);
-  const existingIndex = state.transactions.findIndex((item) => item.id === transaction.id);
-  if (existingIndex >= 0) state.transactions[existingIndex] = transaction;
-  else state.transactions.push(transaction);
-  state.transactions = sortTransactions(state.transactions);
-  setSavedStatus();
-  render();
-  toast(successMessage);
+  return persistTransactions([transaction], successMessage);
 }
-
 async function persistTransactions(transactions, successMessage = '这些流水已保存。') {
   if (!transactions.length) return;
-  if (!state.demo) await dbPutMany(STORES.transactions, transactions);
-  const ids = new Set(transactions.map((item) => item.id));
-  state.transactions = sortTransactions([
-    ...state.transactions.filter((item) => !ids.has(item.id)),
-    ...transactions,
-  ]);
-  setSavedStatus();
-  render();
-  toast(successMessage);
+  const prepared = prepareProductTransactions(transactions, state.products, state.productCategories);
+  if (!state.demo) await dbWriteBundle({ [STORES.transactions]: prepared.transactions, [STORES.products]: prepared.products, [STORES.productCategories]: prepared.productCategories });
+  const ids = new Set(prepared.transactions.map((item) => item.id));
+  state.transactions = sortTransactions([...state.transactions.filter((item) => !ids.has(item.id)), ...prepared.transactions]);
+  state.products = prepared.products;
+  state.productCategories = prepared.productCategories;
+  setSavedStatus(); render(); toast(successMessage);
+}
+// Related stores succeed or roll back together.
+function dbWriteBundle(bundle, replaceAll = false) {
+  return new Promise((resolve, reject) => {
+    const tx = state.db.transaction(Object.keys(bundle), 'readwrite');
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error || new Error('保存失败。'));
+    tx.onabort = () => reject(tx.error || new Error('保存已回滚。'));
+    try {
+      for (const [name, values] of Object.entries(bundle)) {
+        const store = tx.objectStore(name);
+        if (replaceAll) store.clear();
+        values.forEach((value) => store.put(value));
+      }
+    } catch (error) { tx.abort(); reject(error); }
+  });
 }
 
 async function persistAccount(account, successMessage = '账户已保存。') {
@@ -1236,6 +1266,7 @@ function normalizeAgentDraft(rawDraft = {}) {
     toAccountId,
     occurredAt: Number.isNaN(occurredAt.getTime()) ? new Date().toISOString() : occurredAt.toISOString(),
     note: note || (type === 'income' ? '收入' : type === 'transfer' ? '账户转账' : '支出'),
+    items: normalizeProductItems(rawDraft.items || [], { amount: centsFromYuan(amountYuan), type }),
     tags: Array.isArray(rawDraft.tags) ? rawDraft.tags.map((tag) => String(tag).trim()).filter(Boolean).slice(0, 8) : [],
   };
 }
@@ -1334,6 +1365,7 @@ function waterAndElectricityEachAmount(text) {
 }
 
 function buildLocalAgentDrafts(text) {
+  text = maskProductMeasurements(text);
   const drafts = [];
   const groups = splitAgentTransactionGroups(text);
   let occurredAt = new Date().toISOString();
@@ -1638,11 +1670,18 @@ function localAgentAnswer(text) {
 }
 
 function localAgentResponse(text) {
+  if (isProductQuery(text)) {
+    const comparison = compareProductPrices(state, { query: text, quote: parseProductQuote(text) });
+    return { kind: comparison.status === 'ok' ? 'answer' : 'clarify', reply: formatPriceComparison(comparison), comparison };
+  }
   const answer = localAgentAnswer(text);
   if (answer) return answer;
   const transactionIntent = /记|花|买|付|消费|购物|日用|支出|收入|工资|薪资|到账|奖金|报销|退款|转账|充值|会员|订阅|GPT|OpenAI|外卖|早餐|午饭|午餐|晚餐|地铁|公交|打车|房租|盒马|超市|买菜|家政|洗衣液|垃圾桶|枕头|锅|刀具|锅铲|水电|燃气|天然气|话费/.test(text);
   if (transactionIntent) {
+    const productEntry = parseProductEntry(text);
+    if (productEntry?.error) return { kind: 'clarify', reply: productEntry.error };
     const drafts = buildLocalAgentDrafts(text);
+    if (productEntry?.item && drafts.length === 1) drafts[0].items = normalizeProductItems([productEntry.item], { amount: centsFromYuan(drafts[0].amountYuan), type: drafts[0].type });
     if (!drafts.length) return { kind: 'clarify', reply: '我还没有识别到明确金额。请补充金额，例如“午餐 28 元，微信支付”。' };
     return {
       kind: 'transaction_draft',
@@ -1739,11 +1778,12 @@ function toggleAgentVoiceInput() {
   }
 }
 
-function ledgerContextForAgent() {
+function ledgerContextForAgent(query = '') {
   const stats = monthlyStats();
   const previous = statsForPreviousMonth();
   const categories = reportCategoryData(stats.transactions).map(({ category, amount }) => ({ id: category.id, label: category.label, amountYuan: yuanFromCents(amount) }));
   return {
+    productContext: isProductQuery(query) ? compareProductPrices(state, { query, quote: parseProductQuote(query) }) : undefined,
     selectedMonth: monthKey(state.selectedMonth),
     today: dateKey(new Date()),
     currency: 'CNY',
@@ -1805,7 +1845,7 @@ async function remoteAgentResponse(options = {}) {
   const response = await postJson('/api/agent/chat', {
     config: state.agentConfig,
     messages,
-    ledgerContext: ledgerContextForAgent(),
+    ledgerContext: ledgerContextForAgent(messages.at(-1)?.content || ''),
   }, requestOptions);
   return parseAgentModelReply(response.reply);
 }
@@ -1854,6 +1894,7 @@ function mergeAgentDraftFields(remoteDrafts, localDrafts) {
       occurredAt: localDraft.occurredAt,
       ...(hasSpecificLocalCategory ? { categoryId: localDraft.categoryId } : {}),
       ...(!remoteDraft.note ? { note: localDraft.note } : {}),
+      items: localDraft.items?.length ? localDraft.items : remoteDraft.items || [],
     };
   });
 }
@@ -1863,7 +1904,7 @@ function agentDraftsFromResult(result) {
 }
 
 function agentMessageDataFromResult(result) {
-  const data = agentDraftDataFromResult(result);
+  const data = { ...agentDraftDataFromResult(result), ...(result?.comparison ? { comparison: result.comparison } : {}) };
   if (result?.kind === 'transaction_update' && result.editSuggestion) return { ...data, editSuggestion: result.editSuggestion, editStatus: 'pending' };
   if (result?.kind === 'memory_suggestion' && result.memory) return { ...data, memorySuggestion: result.memory, memoryStatus: 'pending' };
   return data;
@@ -1878,6 +1919,7 @@ function agentDraftDataFromResult(result) {
 }
 
 function reconcileRemoteAgentResult(remoteResult, localResult, localDrafts) {
+  if (localResult?.comparison) return localResult;
   if (localResult?.kind === 'transaction_update') return localResult;
   if (localResult?.kind !== 'transaction_draft') return remoteResult || localResult;
   const remoteDrafts = agentDraftsFromResult(remoteResult);
@@ -1948,7 +1990,9 @@ async function sendAgentMessage(text) {
     state.agentSending = false;
     throw error;
   }
-  const localResult = localAgentResponse(content);
+  let localResult;
+  try { localResult = localAgentResponse(content); }
+  catch (error) { localResult = { kind: 'clarify', reply: error instanceof Error ? error.message : '请核对商品规格和金额。' }; }
   const localDrafts = agentDraftsFromResult(localResult);
   const remoteTimeoutMs = localDrafts.length > 1 ? REMOTE_AGENT_MULTI_TIMEOUT_MS : REMOTE_AGENT_SINGLE_TIMEOUT_MS;
   const remoteEnabled = hasRemoteAgentConfig();
@@ -2015,6 +2059,7 @@ function renderAgentDraftEntry(draft, index) {
         <label class="field"><span>发生时间</span><input class="text-input" name="occurredAt" type="datetime-local" value="${escapeHtml(localDateTimeValue(draft.occurredAt))}" required /></label>
         <label class="field field-span-2"><span>备注</span><input class="text-input" name="note" value="${escapeHtml(draft.note)}" maxlength="80" /></label>
       </div>
+      ${renderProductEditor(draft.items || [], state.products, state.productCategories)}
     </section>`;
 }
 
@@ -2121,6 +2166,7 @@ function renderAgentMessage(message) {
       ${assistant ? `<span class="agent-avatar">${icon('ph-chat-circle-dots')}</span>` : ''}
       <div class="agent-message-content">
         <div class="agent-bubble">${escapeHtml(message.content).replaceAll('\\n', '<br>')}</div>
+        ${renderPriceSources(message.comparison)}
         ${assistant ? renderAgentDraft(message) : ''}
         ${assistant ? renderAgentEditSuggestion(message) : ''}
         ${assistant ? renderAgentMemorySuggestion(message) : ''}
@@ -2138,9 +2184,10 @@ function renderAgent() {
   const messages = state.agentMessages.length
     ? state.agentMessages.map(renderAgentMessage).join('')
     : `<article class="agent-message assistant"><span class="agent-avatar">${icon('ph-chat-circle-dots')}</span><div class="agent-message-content"><div class="agent-bubble"><strong>你好，我是账本助手。</strong><br>你可以直接说“午餐 28 元，微信支付”，也可以问“这个月花了多少”。记账草稿需要你确认后才会写入。</div></div></article>`;
-  const prompts = ['今天午餐 28 元，微信支付', '本月花了多少？', '本月支出最多的是哪类？', '餐饮比上月多吗？', '分析我的消费习惯', '哪些可能是固定支出？'];
+  const prompts = [
+    '酒水历史单价是多少？','今天午餐 28 元，微信支付', '本月花了多少？', '本月支出最多的是哪类？', '餐饮比上月多吗？', '分析我的消费习惯', '哪些可能是固定支出？'];
   return `
-    ${pageHeader('智能助手', '一句话记账，也可以直接询问收入、支出和结余。', `<button class="secondary-button" type="button" data-action="open-agent-settings">${icon('ph-sliders-horizontal')}模型设置</button>`)}
+    ${pageHeader('智能助手', '一句话记账，查询收支，也能比较商品单价。', `<button class="secondary-button" type="button" data-action="open-agent-settings">${icon('ph-sliders-horizontal')}模型设置</button>`)}
     <div class="agent-workspace">
       <section class="agent-chat-panel" aria-label="账本助手聊天">
         <header class="agent-chat-header"><div><span class="agent-avatar">${icon('ph-chat-circle-dots')}</span><span><strong>账本助手</strong><small class="agent-status ${connection.className}">${icon(connection.iconName)}${escapeHtml(connection.label)}</small></span></div><button class="icon-button" type="button" data-action="clear-agent-chat" aria-label="清空聊天记录" title="清空聊天记录">${icon('ph-trash')}</button></header>
@@ -2165,7 +2212,7 @@ function renderAgent() {
         </div></section>
         <section class="side-panel agent-connection-card"><div class="panel-heading"><h3>模型连接</h3><span class="agent-status ${connection.className}">${icon(connection.iconName)}${escapeHtml(connection.label)}</span></div><div class="panel-body"><p>常见记账与查账可在本地完成。连接兼容模型后，可以理解更灵活的表达。</p><button class="secondary-button button-full" type="button" data-action="open-agent-settings">${icon('ph-plugs-connected')}配置并测试连接</button></div></section>         <section class="side-panel"><div class="panel-heading"><h3>已确认偏好</h3><span class="panel-note">${state.agentMemory.length} 条</span></div><div class="panel-body agent-memory-list">${state.agentMemory.length ? state.agentMemory.slice().reverse().slice(0, 4).map((memory) => `<div class="agent-memory-list-item"><span>${icon('ph-brain')}<strong>${escapeHtml(memory.label || memory.key)}</strong></span><button class="row-action danger" type="button" data-action="delete-agent-memory" data-memory-id="${escapeHtml(memory.id)}" aria-label="删除${escapeHtml(memory.label || memory.key)}">${icon('ph-trash')}</button></div>`).join('') : '<p class="panel-note">你说“记住……”时，我会先给你确认，未确认不会保存。</p>'}<button class="secondary-button button-full" type="button" data-action="open-agent-memory">管理偏好记忆</button></div></section>
         <section class="side-panel"><div class="panel-heading"><h3>试着这样问</h3></div><div class="panel-body agent-prompt-list">${prompts.map((prompt) => `<button type="button" data-agent-prompt="${escapeHtml(prompt)}">${icon('ph-arrow-bend-down-right')}<span>${escapeHtml(prompt)}</span></button>`).join('')}</div></section>
-        <section class="side-panel"><div class="panel-heading"><h3>数据边界</h3></div><div class="panel-body agent-privacy-note">${icon('ph-shield-check')}<p>写入前需要确认。模型只会收到必要汇总与近期流水，API Key 不会进入账本备份。</p></div></section>
+        <section class="side-panel"><div class="panel-heading"><h3>数据边界</h3></div><div class="panel-body agent-privacy-note">${icon('ph-shield-check')}<p>写入前需要确认。模型会收到必要汇总、近期流水与本次匹配的商品价格，API Key 不会进入账本备份。</p></div></section>
       </aside>
     </div>`;
 }
@@ -2245,6 +2292,7 @@ async function confirmAgentDraft(form) {
         toAccountId,
         occurredAt,
         note: String(read(entry, 'note')).trim(),
+        items: normalizeProductItems(readProductEditor(entry), { amount, type }),
         tags: ['Agent 记账'],
       };
     });
@@ -2265,6 +2313,7 @@ async function confirmAgentDraft(form) {
       occurredAt: transaction.occurredAt,
       note: transaction.note,
       tags: transaction.tags,
+      items: transaction.items || [],
     }));
     await persistTransactions(transactions, `Agent ${transactions.length} 笔草稿已确认入账。`);
     await updateAgentMessage(form.dataset.messageId, transactions.length === 1
@@ -2425,6 +2474,7 @@ function render() {
     view.innerHTML = (views[state.activeView] || views.home)();
   }
   document.querySelectorAll('[data-view]').forEach((item) => item.classList.toggle('active', item.dataset.view === state.activeView));
+  updateProductPreviews(view);
   hideNotice();
   requestAnimationFrame(drawCharts);
 }
@@ -2449,6 +2499,7 @@ function openDialog(content) {
   const dialog = document.querySelector('#app-dialog');
   if (!dialog) return;
   dialog.innerHTML = content;
+  updateProductPreviews(dialog);
   if (!dialog.open) dialog.showModal();
 }
 
@@ -2487,6 +2538,7 @@ function openTransactionDialog(transaction = null, prefill = {}) {
         <label class="field"><span>标签（可选）</span><input class="text-input" name="tags" value="${escapeHtml(tags)}" placeholder="如：工作日、固定支出" /></label>
         <label class="field field-span-2"><span>备注</span><textarea class="text-area" name="note" placeholder="这笔钱花在了哪里，或来自哪里">${escapeHtml(note)}</textarea></label>
       </div>
+      ${renderProductEditor(transaction?.items || prefill.items || [], state.products, state.productCategories)}
       <div class="dialog-actions"><button class="secondary-button" type="button" data-action="close-dialog">取消</button><button class="primary-button" type="submit">${transaction ? '保存修改' : '保存这一笔'}</button></div>
     </form>`);
 }
@@ -2693,7 +2745,9 @@ async function removeTransaction(transactionId) {
 async function exportData() {
   const payload = {
     app: '打工人小账本',
-    version: 2,
+    version: 3,
+    products: state.products,
+    productCategories: state.productCategories,
     exportedAt: new Date().toISOString(),
     profile: state.profile,
     categories: state.categories,
@@ -2711,23 +2765,17 @@ async function exportData() {
   toast('备份已导出。');
 }
 
-function validateBackup(data) {
-  if (!data || typeof data !== 'object') throw new Error('文件内容不是有效备份。');
-  if (!Array.isArray(data.transactions) || !Array.isArray(data.categories) || !Array.isArray(data.accounts)) throw new Error('备份缺少流水、分类或账户数据。');
-}
-
 async function importData(file) {
-  const data = JSON.parse(await file.text());
-  validateBackup(data);
+  const data = normalizeBackup(JSON.parse(await file.text()));
   if (!window.confirm(`将导入 ${data.transactions.length} 笔流水，并替换当前账本数据。继续吗？`)) return;
-  if (!state.demo) {
-    await Promise.all([dbClear(STORES.transactions), dbClear(STORES.categories), dbClear(STORES.accounts), dbClear(STORES.agentMessages), dbClear(STORES.agentMemory)]);
-    for (const item of data.transactions) await dbPut(STORES.transactions, item);
-    for (const item of data.categories) await dbPut(STORES.categories, item);
-    for (const item of data.accounts) await dbPut(STORES.accounts, item);
-    for (const item of (Array.isArray(data.agentMemory) ? data.agentMemory : [])) await dbPut(STORES.agentMemory, item);
-    await dbPut(STORES.settings, { key: 'profile', ...DEFAULT_PROFILE, ...(data.profile || {}) });
-  }
+  if (!state.demo) await dbWriteBundle({
+    [STORES.transactions]: data.transactions, [STORES.products]: data.products, [STORES.productCategories]: data.productCategories,
+    [STORES.categories]: data.categories, [STORES.accounts]: data.accounts, [STORES.agentMessages]: [],
+    [STORES.agentMemory]: Array.isArray(data.agentMemory) ? data.agentMemory : [],
+    [STORES.settings]: [{ ...DEFAULT_PROFILE, ...(data.profile || {}), key: 'profile' }],
+  }, true);
+  state.products = data.products;
+  state.productCategories = data.productCategories;
   state.profile = { ...DEFAULT_PROFILE, ...(data.profile || {}), salaryEstimate: { ...DEFAULT_PROFILE.salaryEstimate, ...(data.profile?.salaryEstimate || {}) } };
   state.transactions = sortTransactions(data.transactions);
   state.categories = data.categories;
@@ -2740,12 +2788,13 @@ async function importData(file) {
 
 async function resetData() {
   if (!window.confirm('确定清空当前设备中的全部账本数据吗？此操作不能撤销。')) return;
-  if (!state.demo) {
-    await Promise.all([dbClear(STORES.transactions), dbClear(STORES.categories), dbClear(STORES.accounts), dbClear(STORES.agentMessages), dbClear(STORES.agentMemory)]);
-    await dbPut(STORES.settings, { key: 'profile', ...DEFAULT_PROFILE });
-    for (const category of DEFAULT_CATEGORIES) await dbPut(STORES.categories, category);
-    for (const account of DEFAULT_ACCOUNTS) await dbPut(STORES.accounts, account);
-  }
+  if (!state.demo) await dbWriteBundle({
+    [STORES.transactions]: [], [STORES.products]: [], [STORES.productCategories]: DEFAULT_PRODUCT_CATEGORIES,
+    [STORES.categories]: DEFAULT_CATEGORIES, [STORES.accounts]: DEFAULT_ACCOUNTS, [STORES.agentMessages]: [], [STORES.agentMemory]: [],
+    [STORES.settings]: [{ key: 'profile', ...DEFAULT_PROFILE }],
+  }, true);
+  state.products = [];
+  state.productCategories = DEFAULT_PRODUCT_CATEGORIES.map((item) => ({ ...item }));
   state.profile = { ...DEFAULT_PROFILE, salaryEstimate: { ...DEFAULT_PROFILE.salaryEstimate } };
   state.transactions = [];
   state.agentMessages = [];
@@ -2775,6 +2824,28 @@ document.addEventListener('click', async (event) => {
   const actionTarget = event.target.closest('[data-action]');
   if (!actionTarget) return;
   const { action } = actionTarget.dataset;
+  if (action === 'add-product-row' || action === 'remove-product-row') {
+    const editor = actionTarget.closest('[data-product-editor]');
+    const draftForm = editor.closest('[data-agent-draft-form]');
+    if (draftForm) state.agentDraftEditLocks.add(draftForm.dataset.messageId);
+    if (action === 'remove-product-row') actionTarget.closest('[data-product-row]').remove();
+    else {
+      if (editor.querySelectorAll('[data-product-row]').length >= 50) { toast('最多添加 50 条商品明细。', 'error'); return; }
+      const product = state.products.find((item) => item.id === editor.querySelector('[data-product-reuse]').value);
+      const previous = product && sortTransactions(state.transactions).flatMap((entry) => entry.items || []).find((item) => item.productId === product.id);
+      const item = product ? { ...previous, id: '', paidAmount: '', quantity: 1, productId: product.id, nameSnapshot: product.name, brand: product.brand, variant: product.variant,
+        categoryName: state.productCategories.find((item) => item.id === product.productCategoryId)?.name } : {};
+      editor.querySelector('[data-product-rows]').insertAdjacentHTML('beforeend', productRow(item));
+      editor.querySelector('[data-product-row]:last-child input')?.focus();
+    }
+    return;
+  }
+  if (action === 'view-price-source') {
+    const transaction = state.transactions.find((item) => item.id === actionTarget.dataset.transactionId);
+    if (transaction) openTransactionDialog(transaction);
+    else toast('原账单已删除。', 'error');
+    return;
+  }
   try {
     if (action === 'retry-load') { await loadData(); return; }
     if (action === 'open-transaction') { openTransactionDialog(); return; }
@@ -2880,6 +2951,11 @@ document.addEventListener('click', async (event) => {
 });
 
 document.addEventListener('change', async (event) => {
+  if (event.target.closest('[data-product-editor]')) {
+    updateProductPreviews(event.target.closest('[data-product-editor]'));
+    const form = event.target.closest('[data-agent-draft-form]');
+    if (form) state.agentDraftEditLocks.add(form.dataset.messageId);
+  }
   if (event.target.id === 'ledger-type-filter') { state.ledgerType = event.target.value; render(); }
   if (event.target.id === 'ledger-account-filter') { state.ledgerAccount = event.target.value; render(); }
   const changedDraftForm = event.target.closest('[data-agent-draft-form]');
@@ -2900,6 +2976,7 @@ document.addEventListener('change', async (event) => {
 });
 
 document.addEventListener('input', (event) => {
+  if (event.target.closest('[data-product-editor]')) updateProductPreviews(event.target.closest('[data-product-editor]'));
   const editedDraftForm = event.target.closest('[data-agent-draft-form]');
   if (editedDraftForm) state.agentDraftEditLocks.add(editedDraftForm.dataset.messageId);
   if (event.target.classList.contains('salary-input')) updateSalaryEstimatePreview();
@@ -2970,6 +3047,7 @@ document.addEventListener('submit', async (event) => {
         note: String(data.get('note') || '').trim(),
         tags: String(data.get('tags') || '').split(/[，,]/).map((tag) => tag.trim()).filter(Boolean).slice(0, 8),
         occurredAt,
+        items: normalizeProductItems(readProductEditor(form), { amount, type }),
         source: original?.source || 'manual',
         createdAt: original?.createdAt || now,
         updatedAt: now,
