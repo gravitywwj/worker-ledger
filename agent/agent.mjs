@@ -1,3 +1,4 @@
+import { isProductQuery, parseProductEntry, formatPriceComparison, normalizeProductItems } from '../product-prices.mjs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
@@ -8,7 +9,7 @@ import {
 } from './tools.mjs';
 import { agentResponseJson, normalizeAgentResponse } from './schemas.mjs';
 
-const SKILL_FILES = ['ledger-entry.md', 'ledger-query.md', 'draft-validation.md', 'transaction-correction.md', 'habit-analysis.md', 'memory-preferences.md', 'general-assistant.md'];
+const SKILL_FILES = ['ledger-entry.md', 'ledger-query.md', 'draft-validation.md', 'transaction-correction.md', 'habit-analysis.md', 'memory-preferences.md', 'general-assistant.md', 'product-prices.md'];
 
 function isTransactionRequest(text, candidates) {
   return candidates.length > 0 && /记|花|买|付|消费|支出|收入|工资|薪资|到账|奖金|报销|退款|退回|返款|转账|充值|会员|GPT|OpenAI|外卖|早餐|午饭|午餐|晚餐|地铁|公交|打车|房租|水电|燃气|购物/.test(text);
@@ -49,6 +50,9 @@ export async function createLedgerAgent({ root, complete }) {
         .slice(-12)
         .map((message) => ({ role: message.role, content: String(message.content || '').slice(0, 4000) }));
       const userText = String(history.at(-1)?.content || '');
+      const productQuery = isProductQuery(userText);
+      const productEntry = productQuery ? null : parseProductEntry(userText);
+      if (productEntry?.error) return { reply: agentResponseJson({ kind: 'clarify', reply: productEntry.error }), candidateCount: 0, toolRounds: 0 };
       const candidates = extractTransactionCandidates(userText, {
         today: ledgerContext.today,
         availableCategories: ledgerContext.availableCategories || [],
@@ -58,9 +62,11 @@ export async function createLedgerAgent({ root, complete }) {
         availableCategories: ledgerContext.availableCategories || [],
       });
       const correctionRequest = isCorrectionRequest(userText);
-      const transactionRequest = isTransactionRequest(userText, candidates);
+      const transactionRequest = !productQuery && isTransactionRequest(userText, candidates);
       const needsValidationTool = transactionRequest && candidates.length > 1 && !correctionRequest;
       const system = `${skillText}
+
+商品录入候选（仍需审核）：${jsonText(productEntry)}
 
 ## Agent 工作边界
 
@@ -95,7 +101,7 @@ ${correctionRequest ? '这是纠错任务：优先调用 search_transactions 查
       const baseOptions = {
         maxTokens: 3200,
         thinking: { type: 'disabled' },
-        ...(correctionRequest || !transactionRequest || needsValidationTool ? { tools: AGENT_TOOL_DEFINITIONS, toolChoice: toolChoiceForRequest(transactionRequest, needsValidationTool) } : {}),
+        ...(correctionRequest || !transactionRequest || needsValidationTool ? { tools: AGENT_TOOL_DEFINITIONS, toolChoice: productQuery ? { type: 'function', function: { name: 'compare_product_prices' } } : toolChoiceForRequest(transactionRequest, needsValidationTool) } : {}),
       };
       let completion;
       try {
@@ -114,7 +120,17 @@ ${correctionRequest ? '这是纠错任务：优先调用 search_transactions 查
         if (!toolCalls.length) {
           const reply = assistantContent(message);
           if (!reply) throw new Error('模型没有返回可读取的最终内容。');
-          const normalized = normalizeAgentResponse(reply, { candidates, ledgerContext });
+          let normalized;
+          if (productQuery) {
+            const comparison = ledgerContext.productContext || { status: 'clarify', reply: '请提供已记录的商品名称或品类。', groups: [] };
+            normalized = { kind: comparison.status === 'ok' ? 'answer' : 'clarify', reply: formatPriceComparison(comparison) };
+          } else {
+            normalized = normalizeAgentResponse(reply, { candidates, ledgerContext });
+            if (productEntry?.item && normalized.kind === 'transaction_draft' && normalized.drafts.length === 1) {
+              const draft = normalized.drafts[0];
+              draft.items = normalizeProductItems([productEntry.item], { amount: Math.round(draft.amountYuan * 100), type: draft.type });
+            }
+          }
           return { reply: agentResponseJson(normalized), candidateCount: candidates.length, toolRounds: round };
         }
         conversation.push(message);

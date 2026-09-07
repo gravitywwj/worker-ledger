@@ -1,3 +1,4 @@
+import { normalizeProductItems } from '../product-prices.mjs';
 const VALID_KINDS = new Set(['transaction_draft', 'transaction_update', 'answer', 'clarify', 'memory_suggestion']);
 const VALID_TYPES = new Set(['expense', 'income', 'transfer']);
 
@@ -48,7 +49,7 @@ function normalizeDraft(rawDraft) {
   const occurredAt = asText(draft.occurredAt);
   const note = asText(draft.note);
   const tags = Array.isArray(draft.tags) ? draft.tags.map(asText).filter(Boolean).slice(0, 8) : [];
-  return { type, amountYuan, category, account, toAccount, occurredAt, note, tags };
+  return { type, amountYuan, category, account, toAccount, occurredAt, note, tags, items: normalizeProductItems(draft.items || [], { amount: cents(amountYuan), type }) };
 }
 
 function normalizeUpdate(rawUpdate, context = {}) {

@@ -1,3 +1,4 @@
+import { maskProductMeasurements, normalizeProductItems } from '../product-prices.mjs';
 const CATEGORY_RULES = [
   { id: 'food', keywords: /早餐|午饭|午餐|晚饭|晚餐|夜宵|外卖|咖啡|奶茶|餐饮|吃饭/ },
   { id: 'commute', keywords: /公交卡|交通卡|地铁卡|地铁|公交|打车|出租|网约车|交通|通勤|加油|停车/ },
@@ -38,6 +39,9 @@ const CHINESE_DIGITS = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4,
 const CHINESE_UNITS = { 十: 10, 百: 100, 千: 1000, 万: 10000, 亿: 100000000 };
 
 export const AGENT_TOOL_DEFINITIONS = [
+  { type: 'function', function: { name: 'compare_product_prices',
+    description: '读取浏览器已从完整商品历史计算的本次比价结果，包含最近价、最低价、报价差异和原账单引用。不写账、不改变查询范围。',
+    parameters: { type: 'object', additionalProperties: false, properties: {}, required: [] }, strict: true } },
   {
     type: 'function',
     function: {
@@ -90,6 +94,7 @@ export const AGENT_TOOL_DEFINITIONS = [
                 toAccount: { type: 'string' },
                 occurredAt: { type: 'string' },
                 note: { type: 'string' },
+                items: { type: 'array', items: { type: 'object' }, description: '可选商品明细：nameSnapshot、categoryName、quantity、unitSize、unit、paidAmountYuan、priceBasis。' },
                 tags: { type: 'array', items: { type: 'string' } },
               },
               required: ['type', 'amountYuan', 'category', 'account', 'toAccount', 'occurredAt', 'note', 'tags'],
@@ -316,7 +321,7 @@ function expandWaterElectricity(body, amounts) {
 }
 
 export function extractTransactionCandidates(rawText, options = {}) {
-  const text = String(rawText || '').trim();
+  const text = maskProductMeasurements(String(rawText || '').trim());
   const fallbackDate = baseDate(options.today);
   const candidates = [];
   let currentDate = dateKey(fallbackDate);
@@ -482,13 +487,17 @@ export function validateTransactionDrafts(args = {}, context = {}) {
 }
 
 export function executeAgentTool(name, args, context = {}) {
+  if (name === 'compare_product_prices') return context.ledgerContext?.productContext || { status: 'clarify', reply: '没有本次商品查询结果，请提供商品名称或品类。', groups: [] };
   if (name === 'extract_transaction_candidates') {
     return { candidates: extractTransactionCandidates(args?.text || context.userText || '', { today: context.ledgerContext?.today, availableCategories: context.ledgerContext?.availableCategories || [], availableAccounts: context.ledgerContext?.availableAccounts || [] }) };
   }
   if (name === 'resolve_category_candidates') {
     return { items: resolveCategoryCandidates(args?.items || [], { availableCategories: context.ledgerContext?.availableCategories || [] }) };
   }
-  if (name === 'validate_transaction_drafts') return validateTransactionDrafts(args, context);
+  if (name === 'validate_transaction_drafts') {
+    for (const draft of args?.drafts || []) normalizeProductItems(draft.items || [], { amount: Math.round(Number(draft.amountYuan) * 100), type: draft.type });
+    return validateTransactionDrafts(args, context);
+  }
   if (name === 'query_ledger') return { query: String(args?.query || ''), ledgerContext: context.ledgerContext || {} };
   if (name === 'search_transactions') {
     const keyword = String(args?.keyword || '').trim().toLowerCase();
