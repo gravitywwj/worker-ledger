@@ -113,3 +113,14 @@ test('deterministic product specifications survive an incomplete model draft', a
   assert.equal(result.drafts[0].items[0].unitSize,980);
   assert.equal(result.drafts[0].items[0].paidAmount,14200);
 });
+
+test('offer amounts preserve thousands and reject excessive decimals', () => {
+  assert.equal(parseProductQuote('每瓶980ml，2瓶共1,234.56元').paidAmount,123456);
+  assert.ok(parseProductQuote('每瓶980ml，2瓶共105.123元').error);
+  assert.ok(parseProductQuote('每瓶980ml，2瓶共-142元').error);
+});
+
+test('latest price sorts actual instants across timezone offsets', () => {
+  const data=prepareProductTransactions([tx('later',raw,'2026-01-01T20:00:00Z'),tx('earlier',{...raw,paidAmount:9000},'2026-01-02T00:00:00+08:00')],[],DEFAULT_PRODUCT_CATEGORIES);
+  assert.equal(compareProductPrices(data,{query:'测试酒'}).groups[0].latest.transactionId,'later');
+});

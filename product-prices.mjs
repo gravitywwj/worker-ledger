@@ -101,7 +101,8 @@ const canonicalUnit = (value) => ({ ml: 'ml', 毫升: 'ml', l: 'L', 升: 'L', g:
 export function parseProductQuote(input) {
   const source = String(input || '');
   const sizes = [...source.matchAll(new RegExp('(\\d+(?:\\.\\d+)?)\\s*' + unitToken + '(?![a-z])', 'gi'))];
-  const amounts = [...source.matchAll(/(\d+(?:\.\d{1,2})?)\s*(?:元|块|人民币)/g)];
+  const amounts = [...source.matchAll(/(?<![\d.,-])(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:元|块|人民币)/g)];
+  if (sizes.length && (/-\s*\d/.test(source) || amounts.some((match) => (match[1].split('.')[1] || '').length > 2))) return { error: '报价和规格需为正数，金额最多两位小数。' };
   if (!sizes.length && !amounts.length) return null;
   if (!sizes.length) return null;
   if (!amounts.length) return { error: '请补充这些商品的实付总价，例如每瓶 980 ml，2 瓶共 142 元。' };
@@ -114,7 +115,7 @@ export function parseProductQuote(input) {
   const totalSpecified = /总容量|总重量|合计.*(?:ml|毫升|克|kg)|共\s*\d+(?:\.\d+)?\s*(?:ml|毫升|kg|克)/i.test(source);
   if (countValue > 1 && !totalSpecified && !/每瓶|每包|每袋|每盒|每罐|每件|\/瓶|\/包|\/袋|\/盒|\/罐|\/件|×|\*|\bx\s*\d/i.test(source)) return { error: '这个规格是每件还是全部合计？例如：每瓶 980 ml，2 瓶共 142 元。' };
   if (countValue > 1 && /每瓶.*\d+\s*元|每件.*\d+\s*元/.test(source) && !/共|总价|合计|实付/.test(source)) return { error: '请补充全部商品的实付总价。' };
-  return { quantity: totalSpecified ? 1 : countValue || 1, unitSize: Number(size[1]), unit: canonicalUnit(size[2]), paidAmount: Math.round(Number(amounts[0][1]) * 100), priceBasis: 'actual' };
+  return { quantity: totalSpecified ? 1 : countValue || 1, unitSize: Number(size[1]), unit: canonicalUnit(size[2]), paidAmount: Math.round(Number(amounts[0][1].replaceAll(',', '')) * 100), priceBasis: 'actual' };
 }
 
 export function compareProductPrices({ transactions = [], products = [], productCategories = [] }, { query = '', productId = '', categoryId = '', quote = null } = {}) {
@@ -145,7 +146,7 @@ export function compareProductPrices({ transactions = [], products = [], product
   const groups = matches.slice(0, 20).map((product) => {
     const records = transactions.filter((entry) => entry.type === 'expense').flatMap((transaction) => (transaction.items || [])
       .filter((item) => item.productId === product.id).map((item) => ({ ...item, transactionId: transaction.id, occurredAt: transaction.occurredAt, ...unitPrice(item) })))
-      .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt) || a.id.localeCompare(b.id));
+      .sort((a, b) => new Date(b.occurredAt) - new Date(a.occurredAt) || a.id.localeCompare(b.id));
     const actual = records.filter((item) => item.priceBasis === 'actual');
     const latest = actual[0] || null;
     const lowest = actual.reduce((best, entry) => !best || entry.pricePerBase < best.pricePerBase ? entry : best, null);
