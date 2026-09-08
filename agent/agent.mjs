@@ -9,7 +9,11 @@ import {
 } from './tools.mjs';
 import { agentResponseJson, normalizeAgentResponse } from './schemas.mjs';
 
-const SKILL_FILES = ['ledger-entry.md', 'ledger-query.md', 'draft-validation.md', 'transaction-correction.md', 'habit-analysis.md', 'memory-preferences.md', 'general-assistant.md', 'product-prices.md'];
+const SKILL_FILES = ['ledger-entry.md', 'ledger-query.md', 'draft-validation.md', 'transaction-correction.md', 'habit-analysis.md', 'memory-preferences.md', 'general-assistant.md', 'product-prices.md', 'periodic-review.md'];
+
+function isPeriodicReviewRequest(text) {
+  return /回顾|复盘|阶段总结|月度总结|年度总结|年度回顾|月度回顾/.test(String(text || ''));
+}
 
 function isTransactionRequest(text, candidates) {
   return candidates.length > 0 && /记|花|买|付|消费|支出|收入|工资|薪资|到账|奖金|报销|退款|退回|返款|转账|充值|会员|GPT|OpenAI|外卖|早餐|午饭|午餐|晚餐|地铁|公交|打车|房租|水电|燃气|购物/.test(text);
@@ -62,7 +66,8 @@ export async function createLedgerAgent({ root, complete }) {
         availableCategories: ledgerContext.availableCategories || [],
       });
       const correctionRequest = isCorrectionRequest(userText);
-      const transactionRequest = !productQuery && isTransactionRequest(userText, candidates);
+      const periodicReviewRequest = isPeriodicReviewRequest(userText) && Array.isArray(ledgerContext.periodicReviewFacts);
+      const transactionRequest = !periodicReviewRequest && !productQuery && isTransactionRequest(userText, candidates);
       const needsValidationTool = transactionRequest && candidates.length > 1 && !correctionRequest;
       const system = `${skillText}
 
@@ -74,6 +79,7 @@ export async function createLedgerAgent({ root, complete }) {
 - 查询和消费分析优先调用只读工具；工具返回的是账本事实，不能凭空补充。
 - 用户说“记住”时只能返回待确认的 memory_suggestion，不能假装已经保存。
 - 用户纠错时先通过 search_transactions 定位唯一流水，只返回待确认的 transaction_update，不能直接修改账本。
+- 用户请求回顾、复盘或阶段/年度总结时，只使用账本上下文里的 periodicReviewFacts，不重新计算、不猜数字、不调用查询工具。
 
 ## 当前任务
 
@@ -94,6 +100,7 @@ ${jsonText(ledgerContext)}
 {"kind":"transaction_draft","reply":"简短说明","drafts":[{"type":"expense|income|transfer","amountYuan":数字,"category":"可用分类名称","account":"可用账户名称","toAccount":"转入账户名称或空字符串","occurredAt":"ISO 时间","note":"备注","tags":["标签"]}]}
 或 {"kind":"transaction_update","reply":"等待用户确认修改","update":{"transactionId":"账本上下文中的流水 ID","changes":{"amountYuan":数字,"type":"expense|income|transfer","category":"可用分类名称","account":"可用账户名称","toAccount":"转入账户名称","occurredAt":"ISO 时间","note":"新备注"}}}
 或 {"kind":"answer","reply":"基于账本上下文的回答"}，或 {"kind":"clarify","reply":"只追问一个最关键的缺失信息"}，或 {"kind":"memory_suggestion","reply":"等待用户确认","memory":{"key":"规则键","value":"规则值","label":"规则说明"}}。
+或 {"kind":"periodic_review","headline":"一句话总结","highlights":[{"fact_id":"facts 中的 id","line":"使用 {{fact_id}} 占位符的事实描述"}],"closing":"中性结尾"}。回顾响应也可以省略 kind，但不能输出其他字段或 Markdown。
 
 ${correctionRequest ? '这是纠错任务：优先调用 search_transactions 查找用户指向的流水；必须返回唯一 transactionId 和至少一个明确的 changes 字段。找不到或存在歧义时返回 clarify。' : needsValidationTool ? '这是复杂记账任务：必须为预处理候选中的每一个金额生成一笔草稿，并先调用 validate_transaction_drafts。校验失败时根据工具观察结果修正一次，再返回最终 JSON。' : transactionRequest ? '这是单笔记账任务：根据预处理候选生成一笔结构化草稿并返回最终 JSON。' : '这是查询或普通对话任务；需要账本数据时调用 query_ledger，然后返回最终 JSON。'}
 不要把候选金额合并，不要只返回最后一笔，不要把退款/退回写成支出，不要把工资卡文字当成工资收入。纠错时不要猜测目标或新值，找不到唯一目标就追问。`;
@@ -101,7 +108,7 @@ ${correctionRequest ? '这是纠错任务：优先调用 search_transactions 查
       const baseOptions = {
         maxTokens: 3200,
         thinking: { type: 'disabled' },
-        ...(correctionRequest || !transactionRequest || needsValidationTool ? { tools: AGENT_TOOL_DEFINITIONS, toolChoice: productQuery ? { type: 'function', function: { name: 'compare_product_prices' } } : toolChoiceForRequest(transactionRequest, needsValidationTool) } : {}),
+        ...(!periodicReviewRequest && (correctionRequest || !transactionRequest || needsValidationTool) ? { tools: AGENT_TOOL_DEFINITIONS, toolChoice: productQuery ? { type: 'function', function: { name: 'compare_product_prices' } } : toolChoiceForRequest(transactionRequest, needsValidationTool) } : {}),
       };
       let completion;
       try {
