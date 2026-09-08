@@ -1,5 +1,6 @@
 import { normalizeProductItems } from '../product-prices.mjs';
-const VALID_KINDS = new Set(['transaction_draft', 'transaction_update', 'answer', 'clarify', 'memory_suggestion']);
+import { normalizePeriodicReviewPayload } from './periodic-review.mjs';
+const VALID_KINDS = new Set(['transaction_draft', 'transaction_update', 'answer', 'clarify', 'memory_suggestion', 'periodic_review']);
 const VALID_TYPES = new Set(['expense', 'income', 'transfer']);
 
 function asText(value) {
@@ -89,9 +90,25 @@ function normalizeUpdate(rawUpdate, context = {}) {
   return { transactionId, changes };
 }
 
+function isPeriodicReviewPayload(value) {
+  return value && typeof value === 'object'
+    && typeof value.headline === 'string'
+    && Array.isArray(value.highlights)
+    && typeof value.closing === 'string';
+}
+
 export function normalizeAgentResponse(rawReply, context = {}) {
   const parsed = typeof rawReply === 'string' ? extractJsonObject(rawReply) : rawReply;
+  const reviewFacts = context.ledgerContext?.periodicReviewFacts;
+  if (Array.isArray(reviewFacts) && isPeriodicReviewPayload(parsed)) {
+    const review = normalizePeriodicReviewPayload(parsed, reviewFacts);
+    return { kind: 'periodic_review', reply: review.headline, ...review };
+  }
   if (!parsed || typeof parsed !== 'object' || !VALID_KINDS.has(parsed.kind)) throw new Error('模型返回了未知操作。');
+  if (parsed.kind === 'periodic_review') {
+    const review = normalizePeriodicReviewPayload(parsed, reviewFacts);
+    return { kind: parsed.kind, reply: review.headline, ...review };
+  }
   const reply = asText(parsed.reply);
   if (!reply) throw new Error('模型返回缺少可读说明。');
 
