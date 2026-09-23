@@ -141,6 +141,7 @@ const state = {
   ledgerType: 'all',
   ledgerAccount: 'all',
   reportPeriod: 'month',
+  weatherIndex: 0,
   agentMessages: [],
   agentMemory: [],
   agentSending: false,
@@ -379,6 +380,39 @@ function statsForRange(start, end) {
     if (item.type === 'expense') stats.expense += number(item.amount);
     return stats;
   }, { income: 0, expense: 0, balance: 0, transactions });
+}
+
+function ledgerWeather(stats, budgetCents, index = 0) {
+  const budgetRate = budgetCents > 0 ? (stats.expense / budgetCents) * 100 : 0;
+  let options;
+
+  if (!stats.transactions.length) {
+    options = [
+      { iconName: 'ph-sparkle', tone: 'clear', title: '本月还在热身', copy: '第一笔记下之后，这里的数字就会开始变得有用。' },
+      { iconName: 'ph-pencil-line', tone: 'clear', title: '空白也是一种起点', copy: '今天发生的第一笔收入或支出，值得被好好记住。' },
+      { iconName: 'ph-sun-dim', tone: 'clear', title: '账本天气：晴', copy: '还没有乌云，先从一笔最容易记的开始吧。' },
+    ];
+  } else if (budgetCents > 0 && budgetRate >= 100) {
+    options = [
+      { iconName: 'ph-cloud-warning', tone: 'cloud', title: '预算雷达亮起', copy: '本月支出已经超过预算 ' + money(stats.expense - budgetCents) + '，可以从最近流水里找找原因。' },
+      { iconName: 'ph-umbrella', tone: 'cloud', title: '今天带把伞', copy: '预算已经用完，先看清剩余支出，再决定下一步。' },
+      { iconName: 'ph-binoculars', tone: 'cloud', title: '适合做一次小复盘', copy: '按分类扫一眼，通常比凭感觉猜更轻松。' },
+    ];
+  } else if (stats.balance < 0) {
+    options = [
+      { iconName: 'ph-cloud-rain', tone: 'rain', title: '账本有点多云', copy: '本月支出暂时跑在收入前面，先把数字看清楚就已经很有帮助。' },
+      { iconName: 'ph-magnifying-glass', tone: 'rain', title: '适合找一笔意外', copy: '看看最近流水，也许能发现一笔被忽略的支出。' },
+      { iconName: 'ph-wind', tone: 'rain', title: '先记账，再判断', copy: '不用急着给自己下结论，持续记录会让下个月更清楚。' },
+    ];
+  } else {
+    options = [
+      { iconName: 'ph-sun', tone: 'clear', title: '账本天气不错', copy: '目前结余 ' + money(stats.balance) + '，继续保持这份清楚感。' },
+      { iconName: 'ph-leaf', tone: 'clear', title: '数字在慢慢长出秩序', copy: '已经记录 ' + stats.transactions.length + ' 笔，回头看趋势会更有意思。' },
+      { iconName: 'ph-compass', tone: 'clear', title: '方向感在线', copy: '每一笔都让月底的自己少猜一点，多知道一点。' },
+    ];
+  }
+
+  return options[Math.abs(index) % options.length];
 }
 
 function monthlyStats() {
@@ -868,6 +902,7 @@ function renderHome() {
   const balanceRate = stats.income > 0 ? Math.max(0, (stats.balance / stats.income) * 100) : 0;
   const budgetCents = centsFromYuan(state.profile.monthlyBudget);
   const budgetRate = budgetCents > 0 ? Math.min(100, (stats.expense / budgetCents) * 100) : 0;
+  const weather = ledgerWeather(stats, budgetCents, state.weatherIndex);
   const accountRows = activeAccounts().slice(0, 4).map((account) => `
     <div class="account-row">
       <span class="account-icon">${icon(accountIcon(account))}</span>
@@ -894,6 +929,18 @@ function renderHome() {
         <strong class="summary-amount">${money(stats.balance)}</strong>
         <span class="balance-rate">结余率 ${NUMBER_FORMATTER.format(balanceRate)}%</span>
       </div>
+    </section>
+
+    <section class="ledger-weather ${escapeHtml(weather.tone)}" aria-label="账本天气">
+      <span class="ledger-weather-icon">${icon(weather.iconName)}</span>
+      <div class="ledger-weather-copy">
+        <span class="ledger-weather-label">账本天气</span>
+        <strong>${escapeHtml(weather.title)}</strong>
+        <p>${escapeHtml(weather.copy)}</p>
+      </div>
+      <button class="quiet-button ledger-weather-refresh" type="button" data-action="refresh-weather" aria-label="换一句账本天气提示" title="换一句">
+        ${icon('ph-arrow-clockwise')}<span>换一句</span>
+      </button>
     </section>
 
     <section class="home-workspace">
@@ -2935,6 +2982,12 @@ document.addEventListener('click', async (event) => {
     if (action === 'previous-month') { shiftMonth(-1); return; }
     if (action === 'next-month') { shiftMonth(1); return; }
     if (action === 'open-search') { navigate('ledger', { focusSearch: true }); return; }
+    if (action === 'refresh-weather') {
+      state.weatherIndex += 1;
+      render();
+      requestAnimationFrame(() => document.querySelector('.ledger-weather')?.classList.add('is-refreshing'));
+      return;
+    }
     if (action === 'open-agent-settings') {
       navigate('settings');
       requestAnimationFrame(() => document.querySelector('#agent-model-settings')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
