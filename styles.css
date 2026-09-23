@@ -252,6 +252,44 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .balance-panel { display: flex; flex-direction: column; justify-content: center; min-height: 164px; padding: 24px 28px; }
 .balance-rate { margin-top: 12px; color: var(--ink-muted); font-size: 12px; }
 
+.ledger-weather {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 76px;
+  margin: 16px 0 18px;
+  padding: 12px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface-subtle);
+  transition: background-color 160ms ease, border-color 160ms ease;
+}
+.ledger-weather.clear { background: #f5faf7; border-color: #dbece1; }
+.ledger-weather.cloud { background: #fbfaf5; border-color: #ece5d3; }
+.ledger-weather.rain { background: #faf6f5; border-color: #eee0de; }
+.ledger-weather-icon {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 42px;
+  height: 42px;
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--primary);
+  font-size: 22px;
+}
+.ledger-weather.cloud .ledger-weather-icon { color: var(--warning); }
+.ledger-weather.rain .ledger-weather-icon { color: var(--expense); }
+.ledger-weather-copy { min-width: 0; flex: 1; }
+.ledger-weather-label { display: block; color: var(--ink-muted); font-size: 11px; }
+.ledger-weather-copy strong { display: inline-block; margin-top: 1px; color: var(--ink); font-size: 14px; font-weight: 720; }
+.ledger-weather-copy p { display: inline; margin: 0 0 0 8px; color: var(--ink-soft); font-size: 12px; }
+.ledger-weather-refresh { flex: 0 0 auto; min-height: 34px; padding-inline: 8px; font-size: 12px; }
+.ledger-weather-refresh .ph { font-size: 16px; transition: transform 260ms var(--ease-out); }
+.ledger-weather-refresh:hover .ph { transform: rotate(35deg); }
+.ledger-weather.is-refreshing .ledger-weather-icon { animation: weather-pop 420ms var(--ease-out); }
+@keyframes weather-pop { 0% { transform: scale(.86); opacity: .65; } 65% { transform: scale(1.06); } 100% { transform: scale(1); opacity: 1; } }
+
 .home-workspace {
   display: grid;
   grid-template-columns: minmax(640px, 2.08fr) minmax(300px, .9fr);
@@ -476,6 +514,15 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .agent-typing span:nth-child(3) { animation-delay: 240ms; }
 @keyframes agent-typing { 50% { opacity: .35; transform: translateY(-2px); } }
 .agent-draft-card { width: min(620px, 100%); padding: 16px; border: 1px solid var(--line-strong); border-radius: var(--radius-md); background: var(--surface); }
+.agent-review-heading { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.agent-review-heading > div { display: flex; align-items: center; gap: 10px; }
+.agent-review-heading > div > .ph { color: var(--primary); font-size: 20px; }
+.agent-review-heading span { display: grid; gap: 3px; }
+.agent-review-heading strong { font-size: 14px; }
+.agent-review-heading small { color: var(--ink-muted); font-size: 10px; }
+.agent-review-list { display: grid; gap: 8px; margin: 0; padding: 12px 0 0 20px; border-top: 1px solid var(--line); color: var(--ink-soft); font-size: 12px; line-height: 1.6; }
+.agent-review-list strong { color: var(--ink); font-variant-numeric: tabular-nums; }
+.agent-review-closing { margin: 12px 0 0; padding-top: 10px; border-top: 1px solid var(--line); color: var(--ink-muted); font-size: 11px; }
 .agent-draft-heading, .agent-draft-heading > div, .agent-draft-result { display: flex; align-items: center; gap: 10px; }
 .agent-draft-heading { justify-content: space-between; margin-bottom: 14px; }
 .agent-draft-heading > div > .ph { color: var(--primary); font-size: 19px; }
@@ -709,6 +756,8 @@ button.record-method-item:hover strong, button.record-method-item:hover > .ph { 
   .summary-pair, .balance-panel { min-height: 132px; }
   .summary-metric, .balance-panel { padding: 20px; }
   .summary-amount { font-size: 27px; }
+  .ledger-weather { align-items: flex-start; }
+  .ledger-weather-copy p { display: block; margin: 2px 0 0; }
   .home-side, .report-side { grid-template-columns: 1fr; }
   .home-side .budget-panel { grid-column: auto; }
   .transaction-head { display: none; }

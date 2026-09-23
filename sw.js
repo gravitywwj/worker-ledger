@@ -1,12 +1,12 @@
-const CACHE_NAME = 'worker-ledger-v27';
+const CACHE_NAME = 'worker-ledger-v28';
 const APP_SHELL = [
   './',
   './product-prices.mjs',
   './product-ui.mjs',
   './product-backup.mjs',
   './index.html',
-  './styles.css?v=17',
-  './app.js?v=31',
+  './styles.css?v=18',
+  './app.js?v=32',
   './assets/phosphor/style.css?v=1',
   './assets/phosphor/Phosphor.woff2',
   './manifest.webmanifest',

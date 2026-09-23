@@ -2,6 +2,7 @@
 
 import { DEFAULT_PRODUCT_CATEGORIES, normalizeProductItems, prepareProductTransactions, isProductQuery, parseProductQuote, compareProductPrices, formatPriceComparison, maskProductMeasurements, parseProductEntry } from './product-prices.mjs';
 import { normalizeBackup } from './product-backup.mjs';
+import { buildPeriodicReviewFacts, normalizePeriodicReviewPayload, periodicReviewPlaceholderIds } from './agent/periodic-review.mjs';
 import { productRow, renderProductEditor, readProductEditor, updateProductPreviews, renderPriceSources } from './product-ui.mjs';
 
 const DB_NAME = 'worker-ledger';
@@ -140,6 +141,7 @@ const state = {
   ledgerType: 'all',
   ledgerAccount: 'all',
   reportPeriod: 'month',
+  weatherIndex: 0,
   agentMessages: [],
   agentMemory: [],
   agentSending: false,
@@ -378,6 +380,39 @@ function statsForRange(start, end) {
     if (item.type === 'expense') stats.expense += number(item.amount);
     return stats;
   }, { income: 0, expense: 0, balance: 0, transactions });
+}
+
+function ledgerWeather(stats, budgetCents, index = 0) {
+  const budgetRate = budgetCents > 0 ? (stats.expense / budgetCents) * 100 : 0;
+  let options;
+
+  if (!stats.transactions.length) {
+    options = [
+      { iconName: 'ph-sparkle', tone: 'clear', title: '本月还在热身', copy: '第一笔记下之后，这里的数字就会开始变得有用。' },
+      { iconName: 'ph-pencil-line', tone: 'clear', title: '空白也是一种起点', copy: '今天发生的第一笔收入或支出，值得被好好记住。' },
+      { iconName: 'ph-sun-dim', tone: 'clear', title: '账本天气：晴', copy: '还没有乌云，先从一笔最容易记的开始吧。' },
+    ];
+  } else if (budgetCents > 0 && budgetRate >= 100) {
+    options = [
+      { iconName: 'ph-cloud-warning', tone: 'cloud', title: '预算雷达亮起', copy: '本月支出已经超过预算 ' + money(stats.expense - budgetCents) + '，可以从最近流水里找找原因。' },
+      { iconName: 'ph-umbrella', tone: 'cloud', title: '今天带把伞', copy: '预算已经用完，先看清剩余支出，再决定下一步。' },
+      { iconName: 'ph-binoculars', tone: 'cloud', title: '适合做一次小复盘', copy: '按分类扫一眼，通常比凭感觉猜更轻松。' },
+    ];
+  } else if (stats.balance < 0) {
+    options = [
+      { iconName: 'ph-cloud-rain', tone: 'rain', title: '账本有点多云', copy: '本月支出暂时跑在收入前面，先把数字看清楚就已经很有帮助。' },
+      { iconName: 'ph-magnifying-glass', tone: 'rain', title: '适合找一笔意外', copy: '看看最近流水，也许能发现一笔被忽略的支出。' },
+      { iconName: 'ph-wind', tone: 'rain', title: '先记账，再判断', copy: '不用急着给自己下结论，持续记录会让下个月更清楚。' },
+    ];
+  } else {
+    options = [
+      { iconName: 'ph-sun', tone: 'clear', title: '账本天气不错', copy: '目前结余 ' + money(stats.balance) + '，继续保持这份清楚感。' },
+      { iconName: 'ph-leaf', tone: 'clear', title: '数字在慢慢长出秩序', copy: '已经记录 ' + stats.transactions.length + ' 笔，回头看趋势会更有意思。' },
+      { iconName: 'ph-compass', tone: 'clear', title: '方向感在线', copy: '每一笔都让月底的自己少猜一点，多知道一点。' },
+    ];
+  }
+
+  return options[Math.abs(index) % options.length];
 }
 
 function monthlyStats() {
@@ -867,6 +902,7 @@ function renderHome() {
   const balanceRate = stats.income > 0 ? Math.max(0, (stats.balance / stats.income) * 100) : 0;
   const budgetCents = centsFromYuan(state.profile.monthlyBudget);
   const budgetRate = budgetCents > 0 ? Math.min(100, (stats.expense / budgetCents) * 100) : 0;
+  const weather = ledgerWeather(stats, budgetCents, state.weatherIndex);
   const accountRows = activeAccounts().slice(0, 4).map((account) => `
     <div class="account-row">
       <span class="account-icon">${icon(accountIcon(account))}</span>
@@ -893,6 +929,18 @@ function renderHome() {
         <strong class="summary-amount">${money(stats.balance)}</strong>
         <span class="balance-rate">结余率 ${NUMBER_FORMATTER.format(balanceRate)}%</span>
       </div>
+    </section>
+
+    <section class="ledger-weather ${escapeHtml(weather.tone)}" aria-label="账本天气">
+      <span class="ledger-weather-icon">${icon(weather.iconName)}</span>
+      <div class="ledger-weather-copy">
+        <span class="ledger-weather-label">账本天气</span>
+        <strong>${escapeHtml(weather.title)}</strong>
+        <p>${escapeHtml(weather.copy)}</p>
+      </div>
+      <button class="quiet-button ledger-weather-refresh" type="button" data-action="refresh-weather" aria-label="换一句账本天气提示" title="换一句">
+        ${icon('ph-arrow-clockwise')}<span>换一句</span>
+      </button>
     </section>
 
     <section class="home-workspace">
@@ -1632,6 +1680,45 @@ function buildLocalAgentCorrection(text) {
   };
 }
 
+function isPeriodicReviewRequest(text) {
+  return /回顾|复盘|阶段总结|月度总结|年度总结|年度回顾|月度回顾/.test(String(text || ''));
+}
+
+function periodicReviewData(text) {
+  const annual = /年度|今年|年终/.test(String(text || ''));
+  const transactions = state.transactions.map((transaction) => ({
+    type: transaction.type,
+    amount: transaction.amount,
+    occurredAt: transaction.occurredAt,
+    deletedAt: transaction.deletedAt,
+    category: getCategory(transaction.categoryId).label,
+    note: transaction.note,
+  }));
+  return buildPeriodicReviewFacts(transactions, { annual, year: state.selectedMonth.getFullYear() });
+}
+
+function periodicReviewFallback(text) {
+  const review = periodicReviewData(text);
+  const factMap = new Map(review.facts.map((fact) => [fact.id, fact]));
+  const highlights = [];
+  const addHighlight = (factId, line) => {
+    if (factMap.has(factId)) highlights.push({ fact_id: factId, line });
+  };
+  addHighlight('total_income', '累计收入 {{total_income}}');
+  addHighlight('total_expense', '累计支出 {{total_expense}}');
+  addHighlight('top_category', '钱大多花在了{{top_category}}上，累计 {{top_category_amount}}');
+  addHighlight('biggest_single_expense', '最大方的一笔是{{biggest_single_expense_note}}，花了 {{biggest_single_expense}}');
+  addHighlight('best_saving_month', '{{best_saving_month}}是结余最高的月份，结余 {{best_saving_month_amount}}');
+  addHighlight('streak_positive_months', '连续 {{streak_positive_months}} 个月结余为正');
+  const headline = review.coverageMonths >= 3 ? '这段时间，日子过得挺明白' : '先看这一小段账';
+  const closing = review.coverageMonths === 0
+    ? '目前还没有可用的流水事实。'
+    : review.coverageMonths === 1
+      ? '目前只有一个月数据，还看不出规律。'
+      : '数字都在这儿，怎么花是你的自由';
+  return { kind: 'periodic_review', reply: headline, headline, highlights: highlights.slice(0, 5), closing, facts: review.facts };
+}
+
 function localAgentAnswer(text) {
   const normalized = text.replace(/\s/g, '');
   if (isAgentCorrectionRequest(text)) return buildLocalAgentCorrection(text);
@@ -1670,6 +1757,7 @@ function localAgentAnswer(text) {
 }
 
 function localAgentResponse(text) {
+  if (isPeriodicReviewRequest(text)) return periodicReviewFallback(text);
   if (isProductQuery(text)) {
     const comparison = compareProductPrices(state, { query: text, quote: parseProductQuote(text) });
     return { kind: comparison.status === 'ok' ? 'answer' : 'clarify', reply: formatPriceComparison(comparison), comparison };
@@ -1782,11 +1870,13 @@ function ledgerContextForAgent(query = '') {
   const stats = monthlyStats();
   const previous = statsForPreviousMonth();
   const categories = reportCategoryData(stats.transactions).map(({ category, amount }) => ({ id: category.id, label: category.label, amountYuan: yuanFromCents(amount) }));
+  const periodicReview = isPeriodicReviewRequest(query) ? periodicReviewData(query) : null;
   return {
     productContext: isProductQuery(query) ? compareProductPrices(state, { query, quote: parseProductQuote(query) }) : undefined,
     selectedMonth: monthKey(state.selectedMonth),
     today: dateKey(new Date()),
     currency: 'CNY',
+    ...(periodicReview ? { periodicReviewFacts: periodicReview.facts, periodicReviewMeta: { coverageMonths: periodicReview.coverageMonths, annual: periodicReview.annual, year: periodicReview.year } } : {}),
     currentMonth: { incomeYuan: yuanFromCents(stats.income), expenseYuan: yuanFromCents(stats.expense), balanceYuan: yuanFromCents(stats.balance), count: stats.transactions.length },
     previousMonth: { incomeYuan: yuanFromCents(previous.income), expenseYuan: yuanFromCents(previous.expense), balanceYuan: yuanFromCents(previous.balance), count: previous.transactions.length },
     categories,
@@ -1805,13 +1895,18 @@ function ledgerContextForAgent(query = '') {
   };
 }
 
-function parseAgentModelReply(rawReply) {
+function parseAgentModelReply(rawReply, periodicFacts = []) {
   const cleaned = String(rawReply || '').replace(/^```(?:json)?\s*/i, '').replace(/```$/i, '').trim();
   const start = cleaned.indexOf('{');
   const end = cleaned.lastIndexOf('}');
   if (start < 0 || end < start) throw new Error('模型返回格式不完整。');
   const parsed = JSON.parse(cleaned.slice(start, end + 1));
-  if (!['transaction_draft', 'transaction_update', 'answer', 'clarify', 'memory_suggestion'].includes(parsed.kind)) throw new Error('模型返回了未知操作。');
+  const isPeriodicReview = parsed.kind === 'periodic_review' || (typeof parsed.headline === 'string' && Array.isArray(parsed.highlights) && typeof parsed.closing === 'string');
+  if (!isPeriodicReview && !['transaction_draft', 'transaction_update', 'answer', 'clarify', 'memory_suggestion'].includes(parsed.kind)) throw new Error('模型返回了未知操作。');
+  if (isPeriodicReview) {
+    const review = normalizePeriodicReviewPayload(parsed, periodicFacts);
+    return { kind: 'periodic_review', reply: String(parsed.reply || review.headline), ...review };
+  }
   if (parsed.kind === 'transaction_draft') {
     const rawDrafts = Array.isArray(parsed.drafts) ? parsed.drafts : [parsed.draft];
     const drafts = rawDrafts.map((draft) => normalizeAgentDraft(draft)).filter(Boolean);
@@ -1842,12 +1937,14 @@ function parseAgentModelReply(rawReply) {
 async function remoteAgentResponse(options = {}) {
   const { messages: requestMessages, ...requestOptions } = options;
   const messages = requestMessages || state.agentMessages.slice(-12).map((message) => ({ role: message.role, content: message.content }));
+  const latestText = messages.at(-1)?.content || '';
   const response = await postJson('/api/agent/chat', {
     config: state.agentConfig,
     messages,
-    ledgerContext: ledgerContextForAgent(messages.at(-1)?.content || ''),
+    ledgerContext: ledgerContextForAgent(latestText),
   }, requestOptions);
-  return parseAgentModelReply(response.reply);
+  const periodicFacts = isPeriodicReviewRequest(latestText) ? periodicReviewData(latestText).facts : [];
+  return parseAgentModelReply(response.reply, periodicFacts);
 }
 
 function withTimeout(promise, milliseconds, message) {
@@ -1907,6 +2004,7 @@ function agentMessageDataFromResult(result) {
   const data = { ...agentDraftDataFromResult(result), ...(result?.comparison ? { comparison: result.comparison } : {}) };
   if (result?.kind === 'transaction_update' && result.editSuggestion) return { ...data, editSuggestion: result.editSuggestion, editStatus: 'pending' };
   if (result?.kind === 'memory_suggestion' && result.memory) return { ...data, memorySuggestion: result.memory, memoryStatus: 'pending' };
+  if (result?.kind === 'periodic_review') return { ...data, periodicReview: { headline: result.headline, highlights: result.highlights, closing: result.closing, facts: result.facts || [] } };
   return data;
 }
 function agentDraftDataFromResult(result) {
@@ -2159,6 +2257,35 @@ async function confirmAgentEdit(messageId) {
   requestAnimationFrame(scrollAgentToLatest);
 }
 
+function periodicFactDisplayValue(fact) {
+  if (!fact) return '';
+  if (fact.valueType === 'currency') return money(centsFromYuan(fact.value));
+  if (fact.valueType === 'count') return NUMBER_FORMATTER.format(number(fact.value));
+  return String(fact.value ?? '');
+}
+
+function renderPeriodicReviewLine(line, factsById) {
+  if (!periodicReviewPlaceholderIds(line).length) return escapeHtml(line);
+  const source = String(line || '');
+  const pattern = /\{\{\s*([^{}\s]+)\s*\}\}/g;
+  let cursor = 0;
+  let output = '';
+  for (const match of source.matchAll(pattern)) {
+    output += escapeHtml(source.slice(cursor, match.index));
+    const fact = factsById.get(match[1]);
+    output += fact ? `<strong>${escapeHtml(periodicFactDisplayValue(fact))}</strong>` : escapeHtml(match[0]);
+    cursor = match.index + match[0].length;
+  }
+  return output + escapeHtml(source.slice(cursor));
+}
+
+function renderPeriodicReview(review) {
+  if (!review) return '';
+  const factsById = new Map((Array.isArray(review.facts) ? review.facts : []).map((fact) => [fact.id, fact]));
+  const highlights = (Array.isArray(review.highlights) ? review.highlights : []).map((highlight) => `<li>${renderPeriodicReviewLine(highlight.line, factsById)}</li>`).join('');
+  return `<section class="agent-draft-card agent-review-card"><div class="agent-review-heading"><div>${icon('ph-chart-line')}<span><strong>${escapeHtml(review.headline)}</strong><small>数字来自本地账本事实</small></span></div></div><ul class="agent-review-list">${highlights}</ul><p class="agent-review-closing">${escapeHtml(review.closing)}</p></section>`;
+}
+
 function renderAgentMessage(message) {
   const assistant = message.role === 'assistant';
   return `
@@ -2170,6 +2297,7 @@ function renderAgentMessage(message) {
         ${assistant ? renderAgentDraft(message) : ''}
         ${assistant ? renderAgentEditSuggestion(message) : ''}
         ${assistant ? renderAgentMemorySuggestion(message) : ''}
+        ${assistant ? renderPeriodicReview(message.periodicReview) : ''}
         <time datetime="${escapeHtml(message.createdAt)}">${escapeHtml(timeLabel(message.createdAt))}</time>
       </div>
     </article>`;
@@ -2185,7 +2313,7 @@ function renderAgent() {
     ? state.agentMessages.map(renderAgentMessage).join('')
     : `<article class="agent-message assistant"><span class="agent-avatar">${icon('ph-chat-circle-dots')}</span><div class="agent-message-content"><div class="agent-bubble"><strong>你好，我是账本助手。</strong><br>你可以直接说“午餐 28 元，微信支付”，也可以问“这个月花了多少”。记账草稿需要你确认后才会写入。</div></div></article>`;
   const prompts = [
-    '酒水历史单价是多少？','今天午餐 28 元，微信支付', '本月花了多少？', '本月支出最多的是哪类？', '餐饮比上月多吗？', '分析我的消费习惯', '哪些可能是固定支出？'];
+    '酒水历史单价是多少？','今天午餐 28 元，微信支付', '本月花了多少？', '本月支出最多的是哪类？', '餐饮比上月多吗？', '分析我的消费习惯', '哪些可能是固定支出？', '看看阶段回顾'];
   return `
     ${pageHeader('智能助手', '一句话记账，查询收支，也能比较商品单价。', `<button class="secondary-button" type="button" data-action="open-agent-settings">${icon('ph-sliders-horizontal')}模型设置</button>`)}
     <div class="agent-workspace">
@@ -2854,6 +2982,12 @@ document.addEventListener('click', async (event) => {
     if (action === 'previous-month') { shiftMonth(-1); return; }
     if (action === 'next-month') { shiftMonth(1); return; }
     if (action === 'open-search') { navigate('ledger', { focusSearch: true }); return; }
+    if (action === 'refresh-weather') {
+      state.weatherIndex += 1;
+      render();
+      requestAnimationFrame(() => document.querySelector('.ledger-weather')?.classList.add('is-refreshing'));
+      return;
+    }
     if (action === 'open-agent-settings') {
       navigate('settings');
       requestAnimationFrame(() => document.querySelector('#agent-model-settings')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));

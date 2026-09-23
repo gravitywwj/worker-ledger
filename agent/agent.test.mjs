@@ -5,6 +5,7 @@ import test from 'node:test';
 import { createLedgerAgent } from './agent.mjs';
 import { executeAgentTool, extractTransactionCandidates, validateTransactionDrafts } from './tools.mjs';
 import { normalizeAgentResponse } from './schemas.mjs';
+import { buildPeriodicReviewFacts, normalizePeriodicReviewPayload } from './periodic-review.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const categories = [
@@ -136,4 +137,63 @@ test('uses a read-only search tool before returning a transaction update', async
   assert.equal(calls, 2);
   assert.equal(parsed.kind, 'transaction_update');
   assert.equal(parsed.update.transactionId, 'tx-1');
+});
+
+test('builds periodic review facts without counting transfers', () => {
+  const result = buildPeriodicReviewFacts([
+    { occurredAt: '2026-01-10T12:00:00.000Z', type: 'income', amountYuan: 5000 },
+    { occurredAt: '2026-01-12T12:00:00.000Z', type: 'expense', amountYuan: 1000, category: '餐饮', note: '外卖' },
+    { occurredAt: '2026-02-10T12:00:00.000Z', type: 'income', amountYuan: 5000 },
+    { occurredAt: '2026-02-12T12:00:00.000Z', type: 'expense', amountYuan: 1200, category: '餐饮', note: '聚餐' },
+    { occurredAt: '2026-02-15T12:00:00.000Z', type: 'transfer', amountYuan: 9000, category: '转账' },
+  ]);
+  const facts = Object.fromEntries(result.facts.map((fact) => [fact.id, fact.value]));
+  assert.equal(result.coverageMonths, 2);
+  assert.equal(facts.total_income, 10000);
+  assert.equal(facts.total_expense, 2200);
+  assert.equal(facts.top_category, '餐饮');
+  assert.equal(facts.streak_positive_months, 2);
+});
+
+test('validates periodic review placeholders against local facts', () => {
+  const facts = [
+    { id: 'total_income', value: 5000, label: '累计收入', valueType: 'currency' },
+    { id: 'top_category', value: '餐饮', label: '支出最多的分类', valueType: 'text' },
+  ];
+  const review = normalizePeriodicReviewPayload({
+    headline: '这段时间，账本记得挺清楚',
+    highlights: [{ fact_id: 'top_category', line: '主要花在{{top_category}}' }],
+    closing: '数字都在这儿，怎么花是你的自由',
+  }, facts);
+  assert.equal(review.highlights[0].fact_id, 'top_category');
+  assert.throws(() => normalizePeriodicReviewPayload({
+    headline: '这段时间，账本记得挺清楚',
+    highlights: [{ fact_id: 'total_income', line: '累计{{missing_fact}}' }],
+    closing: '结束',
+  }, facts), /不存在的 fact_id/);
+});
+
+test('runs the periodic review prompt without query tools and normalizes its response', async () => {
+  let optionsSeen;
+  const facts = [{ id: 'total_income', value: 5000, label: '累计收入', valueType: 'currency' }];
+  const complete = async (_config, messages, options = {}) => {
+    optionsSeen = options;
+    assert.match(messages[0].content, /阶段\/年度回顾文案技能/);
+    assert.match(messages[0].content, /total_income/);
+    return { message: { role: 'assistant', content: JSON.stringify({
+      headline: '这段时间，账本记得挺清楚',
+      highlights: [{ fact_id: 'total_income', line: '累计收入{{total_income}}' }],
+      closing: '数字都在这儿，怎么花是你的自由',
+    }) } };
+  };
+  const agent = await createLedgerAgent({ root, complete });
+  const result = await agent.run({
+    config: { baseUrl: 'http://fake.local', model: 'fake' },
+    messages: [{ role: 'user', content: '看看阶段回顾' }],
+    ledgerContext: { ...context, periodicReviewFacts: facts },
+  });
+  const parsed = JSON.parse(result.reply);
+  assert.equal(optionsSeen.tools, undefined);
+  assert.equal(parsed.kind, 'periodic_review');
+  assert.equal(parsed.highlights[0].fact_id, 'total_income');
 });
