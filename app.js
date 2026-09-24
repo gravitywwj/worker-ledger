@@ -422,6 +422,68 @@ function monthlyStats() {
   return stats;
 }
 
+function integrationSummary() {
+  const now = new Date();
+  const months = [now, new Date(now.getFullYear(), now.getMonth() - 1, 1)].map((date) => {
+    const month = monthKey(date);
+    const transactions = state.transactions.filter((item) =>
+      !item.deletedAt && ['income', 'expense'].includes(item.type) && monthKey(item.occurredAt) === month);
+    const categories = new Map();
+    let income = 0;
+    let expense = 0;
+    for (const item of transactions) {
+      const amount = Math.trunc(number(item.amount));
+      if (item.type === 'income') income += amount;
+      else {
+        expense += amount;
+        const label = getCategory(item.categoryId).label;
+        categories.set(label, (categories.get(label) || 0) + amount);
+      }
+    }
+    return {
+      month, income_fen: income, expense_fen: expense, balance_fen: income - expense,
+      transaction_count: transactions.length,
+      expense_categories: [...categories].map(([label, amount_fen]) => ({ label, amount_fen }))
+        .sort((a, b) => b.amount_fen - a.amount_fen).slice(0, 30),
+    };
+  });
+  return { currency: 'CNY', months };
+}
+
+async function syncIntegrationSummary() {
+  if (state.demo || state.error) return;
+  try {
+    await fetch('/api/integration/summary', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(integrationSummary()),
+    });
+  } catch {
+    // The ledger remains usable if its local integration endpoint is unavailable.
+  }
+}
+
+let integrationDraftReceiving = false;
+async function receiveIntegrationDraft() {
+  if (state.demo || state.error || state.agentSending || integrationDraftReceiving) return;
+  integrationDraftReceiving = true;
+  try {
+    const response = await fetch('/api/integration/drafts');
+    if (!response.ok) return;
+    const { draft } = await response.json();
+    if (!draft?.id || !draft?.text) return;
+    if (!state.agentMessages.some((message) => message.integrationDraftId === draft.id)) {
+      await sendAgentMessage(draft.text, draft.id);
+    }
+    if (!state.agentMessages.some((message) => message.integrationDraftId === draft.id)) return;
+    const acknowledged = await fetch(`/api/integration/drafts/${encodeURIComponent(draft.id)}`, { method: 'DELETE' });
+    if (acknowledged.ok) navigate('agent');
+  } catch {
+    // Keep the pending draft on the local server for the next ledger visit.
+  } finally {
+    integrationDraftReceiving = false;
+  }
+}
+
 function accountBalance(accountId, transactions = state.transactions) {
   const account = state.accounts.find((item) => item.id === accountId);
   let balance = Math.trunc(number(account?.openingBalance));
@@ -671,6 +733,10 @@ async function loadData() {
   } finally {
     state.loading = false;
     render();
+    if (!state.error && !state.demo) {
+      void syncIntegrationSummary();
+      void receiveIntegrationDraft();
+    }
   }
 }
 
@@ -699,6 +765,7 @@ async function persistTransactions(transactions, successMessage = '这些流水�
   state.products = prepared.products;
   state.productCategories = prepared.productCategories;
   setSavedStatus(); render(); toast(successMessage);
+  void syncIntegrationSummary();
 }
 // Related stores succeed or roll back together.
 function dbWriteBundle(bundle, replaceAll = false) {
@@ -2074,7 +2141,7 @@ async function enhanceAgentMessageInBackground({ messageId, requestMessages, loc
   }
 }
 
-async function sendAgentMessage(text) {
+async function sendAgentMessage(text, integrationDraftId = '') {
   const content = String(text || '').trim();
   if (!content || state.agentSending) return;
   if (content.length > AGENT_MAX_INPUT_LENGTH) {
@@ -2083,7 +2150,7 @@ async function sendAgentMessage(text) {
   }
   state.agentSending = true;
   try {
-    await persistAgentMessage(agentMessage('user', content));
+    await persistAgentMessage(agentMessage('user', content, integrationDraftId ? { integrationDraftId } : {}));
   } catch (error) {
     state.agentSending = false;
     throw error;
@@ -2868,6 +2935,7 @@ async function removeTransaction(transactionId) {
   state.transactions = state.transactions.filter((item) => item.id !== transactionId);
   render();
   toast('流水已删除。');
+  void syncIntegrationSummary();
 }
 
 async function exportData() {
@@ -2912,6 +2980,7 @@ async function importData(file) {
   state.agentMemory = Array.isArray(data.agentMemory) ? data.agentMemory : [];
   render();
   toast('备份已导入。');
+  void syncIntegrationSummary();
 }
 
 async function resetData() {
@@ -2931,6 +3000,7 @@ async function resetData() {
   state.agentMemory = [];
   navigate('home');
   toast('本地账本已清空。');
+  void syncIntegrationSummary();
 }
 
 document.addEventListener('click', async (event) => {
@@ -3256,6 +3326,7 @@ window.addEventListener('resize', () => {
   window.clearTimeout(resizeTimer);
   resizeTimer = window.setTimeout(drawCharts, 140);
 });
+window.addEventListener('focus', () => { void receiveIntegrationDraft(); });
 
 function registerServiceWorker() {
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
