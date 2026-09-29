@@ -1,4 +1,5 @@
 node_modules/
+.local/
 
 # Local design and browser QA artifacts
 .design-references/
