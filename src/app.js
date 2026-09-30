@@ -2,7 +2,7 @@
 
 import { DEFAULT_PRODUCT_CATEGORIES, normalizeProductItems, prepareProductTransactions, isProductQuery, parseProductQuote, compareProductPrices, formatPriceComparison, maskProductMeasurements, parseProductEntry } from './product-prices.mjs';
 import { normalizeBackup } from './product-backup.mjs';
-import { buildPeriodicReviewFacts, normalizePeriodicReviewPayload, periodicReviewPlaceholderIds } from './agent/periodic-review.mjs';
+import { buildPeriodicReviewFacts, normalizePeriodicReviewPayload, periodicReviewPlaceholderIds } from '../agent/periodic-review.mjs';
 import { productRow, renderProductEditor, readProductEditor, updateProductPreviews, renderPriceSources } from './product-ui.mjs';
 
 const DB_NAME = 'worker-ledger';
@@ -21,7 +21,7 @@ const STORES = {
 const DEFAULT_PROFILE = {
   bookName: '日常账本',
   currency: 'CNY',
-  monthlyBudget: 10000,
+  monthlyBudget: 0,
   salaryEstimate: {
     gross: 0,
     socialInsurance: 0,
@@ -141,6 +141,7 @@ const state = {
   ledgerType: 'all',
   ledgerAccount: 'all',
   reportPeriod: 'month',
+  reportWeekDate: null,
   weatherIndex: 0,
   agentMessages: [],
   agentMemory: [],
@@ -353,9 +354,7 @@ function accountIcon(account) {
 
 function periodBounds(period = 'month') {
   if (period === 'week') {
-    const anchor = monthKey(new Date()) === monthKey(state.selectedMonth)
-      ? new Date()
-      : new Date(state.selectedMonth.getFullYear(), state.selectedMonth.getMonth(), 15);
+    const anchor = state.reportWeekDate || weekAnchorForSelectedMonth();
     const weekday = anchor.getDay() || 7;
     const start = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() - weekday + 1, 0, 0, 0, 0);
     const end = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 6, 23, 59, 59, 999);
@@ -364,6 +363,12 @@ function periodBounds(period = 'month') {
   const start = new Date(state.selectedMonth.getFullYear(), state.selectedMonth.getMonth(), 1, 0, 0, 0, 0);
   const end = new Date(state.selectedMonth.getFullYear(), state.selectedMonth.getMonth() + 1, 0, 23, 59, 59, 999);
   return { start, end };
+}
+
+function weekAnchorForSelectedMonth() {
+  return monthKey(new Date()) === monthKey(state.selectedMonth)
+    ? new Date()
+    : new Date(state.selectedMonth.getFullYear(), state.selectedMonth.getMonth(), 15);
 }
 
 function transactionsInRange(start, end) {
@@ -764,7 +769,16 @@ async function persistTransactions(transactions, successMessage = '这些流水�
   state.transactions = sortTransactions([...state.transactions.filter((item) => !ids.has(item.id)), ...prepared.transactions]);
   state.products = prepared.products;
   state.productCategories = prepared.productCategories;
-  setSavedStatus(); render(); toast(successMessage);
+  const latestDate = prepared.transactions.reduce((latest, item) => {
+    const date = new Date(item.occurredAt);
+    return !latest || date > latest ? date : latest;
+  }, null);
+  if (latestDate) {
+    state.selectedMonth = new Date(latestDate.getFullYear(), latestDate.getMonth(), 1);
+    state.reportWeekDate = latestDate;
+  }
+  setSavedStatus(); render();
+  toast(state.demo ? '演示记录只在本次打开期间保留，刷新后会重置。' : successMessage);
   void syncIntegrationSummary();
 }
 // Related stores succeed or roll back together.
@@ -848,7 +862,7 @@ async function clearAgentMessages() {
 function setSavedStatus() {
   const element = document.querySelector('#save-status');
   if (!element) return;
-  element.textContent = `已保存 ${timeLabel(new Date())}`;
+  element.textContent = state.demo ? '演示数据，不会保存' : `已保存 ${timeLabel(new Date())}`;
 }
 
 function setLoading(active) {
@@ -1024,7 +1038,8 @@ function renderHome() {
           <div class="panel-heading"><h3>账户概览</h3><button class="text-button" type="button" data-view="accounts">管理账户</button></div>
           <div class="panel-body">
             <div class="account-list">${accountRows || '<p class="panel-note">还没有账户。</p>'}</div>
-            <div class="account-total"><span>资产合计</span><strong>${money(totalAssets())}</strong></div>
+            <div class="account-total"><span>账面余额合计</span><strong>${money(totalAssets())}</strong></div>
+            <p class="panel-note">按期初余额和已记录流水计算。</p>
           </div>
         </section>
 
@@ -1039,7 +1054,7 @@ function renderHome() {
         <section class="side-panel budget-panel">
           <div class="panel-heading"><h3>本月预算</h3><button class="text-button" type="button" data-view="settings">设置预算</button></div>
           <div class="panel-body">
-            <div class="budget-line"><span>总预算 <strong>${state.profile.monthlyBudget > 0 ? money(budgetCents) : '未设置'}</strong></span><span>已用 ${NUMBER_FORMATTER.format(budgetRate)}%</span></div>
+            <div class="budget-line"><span>总预算 <strong>${state.profile.monthlyBudget > 0 ? money(budgetCents) : '未设置'}</strong></span><span>已用 ${state.profile.monthlyBudget > 0 ? `${NUMBER_FORMATTER.format(budgetRate)}%` : '未设置'}</span></div>
             <div class="progress-track"><div class="progress-bar ${budgetRate >= 100 ? 'danger' : budgetRate >= 80 ? 'warning' : ''}" style="width:${budgetRate}%"></div></div>
             <div class="budget-line"><span>剩余预算</span><strong>${state.profile.monthlyBudget > 0 ? money(Math.max(0, budgetCents - stats.expense)) : '设置后显示'}</strong></div>
           </div>
@@ -1113,8 +1128,8 @@ function renderReports() {
     ${pageHeader('报表', '周报看近期变化，月报看完整收支和分类结构。', `<button class="secondary-button" type="button" data-view="ledger">${icon('ph-list-bullets')}查看流水</button>`)}
     <div class="toolbar">
       <div class="period-switch">
-        <button class="${state.reportPeriod === 'week' ? 'primary-button' : 'secondary-button'}" type="button" data-action="report-period" data-period="week">每周</button>
-        <button class="${state.reportPeriod === 'month' ? 'primary-button' : 'secondary-button'}" type="button" data-action="report-period" data-period="month">每月</button>
+        <button class="${state.reportPeriod === 'week' ? 'primary-button' : 'secondary-button'}" type="button" data-action="report-period" data-period="week" aria-pressed="${state.reportPeriod === 'week'}">每周</button>
+        <button class="${state.reportPeriod === 'month' ? 'primary-button' : 'secondary-button'}" type="button" data-action="report-period" data-period="month" aria-pressed="${state.reportPeriod === 'month'}">每月</button>
       </div>
       <div class="month-control">
         <button class="icon-button" type="button" data-action="previous-month" aria-label="上一期">${icon('ph-caret-left')}</button>
@@ -2536,7 +2551,7 @@ function renderAccounts() {
   return `
     ${pageHeader('账户', '银行卡、支付平台和现金分开记录，余额由期初金额与流水自动计算。', `<button class="primary-button" type="button" data-action="open-account">${icon('ph-plus')}添加账户</button>`)}
     <section class="summary-panel balance-panel" style="margin-bottom:18px">
-      <span class="summary-label">账户资产合计</span>
+      <span class="summary-label">账户账面余额合计</span>
       <strong class="summary-amount income">${money(totalAssets())}</strong>
       <span class="balance-rate">共 ${activeAccounts().length} 个有效账户</span>
     </section>
@@ -2652,10 +2667,11 @@ function render() {
   const view = document.querySelector('#app-view');
   if (!view) return;
   setLoading(state.loading);
+  let content;
   if (state.error) {
-    view.innerHTML = renderError();
+    content = renderError();
   } else if (state.loading) {
-    view.innerHTML = renderSkeleton();
+    content = renderSkeleton();
   } else {
     const views = {
       home: renderHome,
@@ -2666,7 +2682,12 @@ function render() {
       categories: renderCategories,
       settings: renderSettings,
     };
-    view.innerHTML = (views[state.activeView] || views.home)();
+    content = (views[state.activeView] || views.home)();
+  }
+  view.innerHTML = `${state.demo ? '<div class="demo-banner" role="status">演示模式：修改不会写入本地账本，刷新后恢复。</div>' : ''}${content}`;
+  if (state.demo) {
+    const storageLabel = document.querySelector('.storage-status strong');
+    if (storageLabel) storageLabel.textContent = '演示模式';
   }
   document.querySelectorAll('[data-view]').forEach((item) => item.classList.toggle('active', item.dataset.view === state.activeView));
   updateProductPreviews(view);
@@ -2690,6 +2711,17 @@ function shiftMonth(delta) {
   render();
 }
 
+function shiftPeriod(delta) {
+  if (state.activeView === 'reports' && state.reportPeriod === 'week') {
+    const { start } = periodBounds('week');
+    state.reportWeekDate = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 7 * delta);
+    state.selectedMonth = new Date(state.reportWeekDate.getFullYear(), state.reportWeekDate.getMonth(), 1);
+    render();
+    return;
+  }
+  shiftMonth(delta);
+}
+
 function openDialog(content) {
   const dialog = document.querySelector('#app-dialog');
   if (!dialog) return;
@@ -2707,7 +2739,10 @@ function closeDialog() {
 function openTransactionDialog(transaction = null, prefill = {}) {
   const type = prefill.type || transaction?.type || 'expense';
   const amount = prefill.amount ?? (transaction ? yuanFromCents(transaction.amount) : '');
-  const categoryId = prefill.categoryId || transaction?.categoryId || state.categories.find((category) => category.type === type)?.id || 'food';
+  const defaultCategoryId = type === 'income' ? 'salary' : 'food';
+  const categoryId = prefill.categoryId || transaction?.categoryId
+    || state.categories.find((category) => category.id === defaultCategoryId && category.type === type)?.id
+    || state.categories.find((category) => category.type === type)?.id || '';
   const accountId = prefill.accountId || transaction?.accountId || activeAccounts()[0]?.id || '';
   const occurredAt = prefill.occurredAt || transaction?.occurredAt || new Date();
   const note = prefill.note ?? transaction?.note ?? '';
@@ -3049,8 +3084,8 @@ document.addEventListener('click', async (event) => {
     if (action === 'open-transaction') { openTransactionDialog(); return; }
     if (action === 'close-dialog') { closeDialog(); return; }
     if (action === 'set-transaction-type') { updateTransactionType(actionTarget.dataset.type); return; }
-    if (action === 'previous-month') { shiftMonth(-1); return; }
-    if (action === 'next-month') { shiftMonth(1); return; }
+    if (action === 'previous-month') { shiftPeriod(-1); return; }
+    if (action === 'next-month') { shiftPeriod(1); return; }
     if (action === 'open-search') { navigate('ledger', { focusSearch: true }); return; }
     if (action === 'refresh-weather') {
       state.weatherIndex += 1;
@@ -3137,7 +3172,13 @@ document.addEventListener('click', async (event) => {
       return;
     }
     if (action === 'open-category') { openCategoryDialog(); return; }
-    if (action === 'report-period') { state.reportPeriod = actionTarget.dataset.period; render(); return; }
+    if (action === 'report-period') {
+      const period = actionTarget.dataset.period;
+      if (period === 'week') state.reportWeekDate = weekAnchorForSelectedMonth();
+      state.reportPeriod = period;
+      render();
+      return;
+    }
     if (action === 'export-data') { await exportData(); return; }
     if (action === 'import-data') { document.querySelector('#backup-file')?.click(); return; }
     if (action === 'use-salary-estimate') {
@@ -3342,6 +3383,7 @@ function initialize() {
   state.agentConfig = loadAgentConfig();
   if (new URLSearchParams(location.search).get('qa') === '1') document.documentElement.dataset.qa = 'true';
   if (state.demo) state.selectedMonth = new Date(2026, 7, 1);
+  if (state.demo) setSavedStatus();
   if (localStorage.getItem('worker-ledger-sidebar') === 'collapsed') document.querySelector('#app-shell')?.classList.add('sidebar-collapsed');
   render();
   registerServiceWorker();

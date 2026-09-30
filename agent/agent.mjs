@@ -1,4 +1,4 @@
-import { isProductQuery, parseProductEntry, formatPriceComparison, normalizeProductItems } from '../product-prices.mjs';
+import { isProductQuery, parseProductEntry, formatPriceComparison, normalizeProductItems } from '../src/product-prices.mjs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {

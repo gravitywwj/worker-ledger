@@ -9,7 +9,7 @@ probe.listen(0, '127.0.0.1');
 await once(probe, 'listening');
 const port = probe.address().port;
 await new Promise(resolve => probe.close(resolve));
-const server = spawn(process.execPath, ['server.mjs'], { cwd: new URL('..', import.meta.url), env: { ...process.env, PORT: String(port) }, windowsHide: true, stdio: 'pipe' });
+const server = spawn(process.execPath, ['server/server.mjs'], { cwd: new URL('..', import.meta.url), env: { ...process.env, PORT: String(port) }, windowsHide: true, stdio: 'pipe' });
 let serverOutput = '';
 server.stderr.on('data', chunk => { serverOutput += chunk; });
 let browser;

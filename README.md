@@ -64,12 +64,18 @@ npm start
 
 ## 项目文件
 
-- `index.html`：应用壳、侧栏与移动端导航。
-- `app.js`：本地数据访问、统计、页面渲染和交互。
-- `styles.css`：选中方案 1 的设计系统与响应式规则。
-- `PRODUCT.md`：当前产品定位与边界。
-- `DESIGN.md`：当前界面规范。
-- `产品优化与迭代交接说明-v1.0.md`：产品、Figma 和后续研发路线图。
+```text
+index.html, sw.js, manifest.webmanifest  PWA 页面入口与离线配置
+src/                                     前端脚本、样式与共享业务模块
+server/                                  本地 HTTP 服务
+agent/                                   智能助手编排、工具和规则
+assets/                                  图标字体等静态资源
+tests/                                   自动化测试
+docs/                                    产品、设计与交接文档
+.local/                                  本机运行数据与日志（不纳入 Git）
+```
+
+根目录保留启动文件、项目配置和入口文档；前端代码统一放在 `src/`，本地服务放在 `server/`。
 
 ## 商品明细与历史比价
 

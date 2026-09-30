@@ -132,6 +132,15 @@ input::placeholder, textarea::placeholder { color: #68766f; opacity: 1; }
 
 .main-content { position: relative; min-width: 0; padding: 30px 36px 56px; background: var(--bg); }
 #app-view { width: 100%; max-width: 1320px; margin: 0 auto; }
+.demo-banner {
+  margin-bottom: 14px;
+  padding: 10px 14px;
+  border: 1px solid #ead8a8;
+  border-radius: var(--radius-sm);
+  background: #fff9e8;
+  color: #604b1f;
+  font-size: 13px;
+}
 .loading-line {
   position: fixed;
   z-index: 80;
@@ -675,7 +684,17 @@ button.record-method-item:hover strong, button.record-method-item:hover > .ph { 
 .amount-field { position: relative; }
 .amount-field > span { position: absolute; left: 13px; bottom: 10px; color: var(--ink-soft); }
 .amount-field .text-input { padding-left: 30px; font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }
+.dialog-actions {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 22px;
+  padding: 12px 0 2px;
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+}
 
 .toast-region { position: fixed; z-index: 70; right: 22px; bottom: 22px; display: grid; gap: 10px; pointer-events: none; }
 .toast {
@@ -811,7 +830,7 @@ button.record-method-item:hover strong, button.record-method-item:hover > .ph { 
     bottom: 0;
     left: 0;
     display: grid;
-    grid-template-columns: repeat(5, 1fr);
+    grid-template-columns: repeat(6, 1fr);
     height: calc(68px + env(safe-area-inset-bottom));
     padding: 6px 6px env(safe-area-inset-bottom);
     border-top: 1px solid var(--line);

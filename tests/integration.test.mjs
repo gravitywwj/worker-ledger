@@ -13,7 +13,7 @@ test('local summary and draft API keeps money aggregated and drafts pending', as
   const port = probe.address().port;
   await new Promise((resolve) => probe.close(resolve));
   const directory = await mkdtemp(join(tmpdir(), 'ledger-integration-'));
-  const server = spawn(process.execPath, ['server.mjs'], {
+  const server = spawn(process.execPath, ['server/server.mjs'], {
     cwd: new URL('..', import.meta.url),
     env: { ...process.env, PORT: String(port), LEDGER_INTEGRATION_DIR: directory },
     stdio: 'ignore',
@@ -33,6 +33,13 @@ test('local summary and draft API keeps money aggregated and drafts pending', as
       catch { await delay(100); }
     }
     assert.equal(ready, true);
+    const page = await fetch(base + '/');
+    assert.equal(page.status, 200);
+    assert.match(await page.text(), /src\/app\.js/);
+    for (const path of ['/src/app.js', '/src/styles.css', '/src/product-prices.mjs', '/agent/periodic-review.mjs']) {
+      const asset = await fetch(base + path);
+      assert.equal(asset.status, 200, `${path} should be served`);
+    }
     assert.equal((await request('/api/integration/summary'))[1].status, 'not_shared');
     const summary = { currency: 'CNY', months: [{ month: '2026-09', income_fen: 10000, expense_fen: 2800,
       transaction_count: 1, expense_categories: [{ label: '餐饮', amount_fen: 2800 }] }] };

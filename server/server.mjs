@@ -3,9 +3,9 @@ import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createLedgerAgent } from './agent/agent.mjs';
+import { createLedgerAgent } from '../agent/agent.mjs';
 
-const root = fileURLToPath(new URL('.', import.meta.url));
+const root = fileURLToPath(new URL('../', import.meta.url));
 const port = Number(process.env.PORT || 4173);
 const maxRequestBytes = 1024 * 1024;
 const integrationDir = resolve(process.env.LEDGER_INTEGRATION_DIR || resolve(root, '.local'));

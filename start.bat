@@ -22,7 +22,7 @@ pause
 exit /b 1
 
 :node_found
-if not exist "%~dp0server.mjs" goto missing_server
+if not exist "%~dp0server\server.mjs" goto missing_server
 
 echo 正在启动打工人小账本...
 echo Node.js: "%NODE_EXE%"
@@ -30,13 +30,13 @@ echo 服务地址: http://127.0.0.1:4173/
 echo 请保持此窗口开启；关闭窗口即可停止服务。
 echo.
 start "" "http://127.0.0.1:4173/"
-"%NODE_EXE%" "%~dp0server.mjs"
+"%NODE_EXE%" "%~dp0server\server.mjs"
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if "%EXIT_CODE%"=="0" goto finished
 echo.
 echo [错误] 服务启动失败，退出码: %EXIT_CODE%
-echo 常见原因：端口 4173 已被占用，或 server.mjs 启动报错。
+echo 常见原因：端口 4173 已被占用，或 server\server.mjs 启动报错。
 echo.
 
 :finished
@@ -44,6 +44,6 @@ pause
 exit /b %EXIT_CODE%
 
 :missing_server
-echo [错误] 找不到 server.mjs，请确认此脚本位于项目根目录。
+echo [错误] 找不到 server\server.mjs，请确认此脚本位于项目根目录。
 pause
 exit /b 1

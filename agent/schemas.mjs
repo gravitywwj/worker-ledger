@@ -1,4 +1,4 @@
-import { normalizeProductItems } from '../product-prices.mjs';
+import { normalizeProductItems } from '../src/product-prices.mjs';
 import { normalizePeriodicReviewPayload } from './periodic-review.mjs';
 const VALID_KINDS = new Set(['transaction_draft', 'transaction_update', 'answer', 'clarify', 'memory_suggestion', 'periodic_review']);
 const VALID_TYPES = new Set(['expense', 'income', 'transfer']);

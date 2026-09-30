@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULT_PRODUCT_CATEGORIES, normalizeProductItems, prepareProductTransactions, unitPrice, compareProductPrices, formatPriceComparison, parseProductQuote, parseProductEntry, isProductQuery } from '../product-prices.mjs';
-import { normalizeBackup } from '../product-backup.mjs';
+import { DEFAULT_PRODUCT_CATEGORIES, normalizeProductItems, prepareProductTransactions, unitPrice, compareProductPrices, formatPriceComparison, parseProductQuote, parseProductEntry, isProductQuery } from '../src/product-prices.mjs';
+import { normalizeBackup } from '../src/product-backup.mjs';
 import { extractTransactionCandidates, executeAgentTool } from '../agent/tools.mjs';
 import { createLedgerAgent } from '../agent/agent.mjs';
 import { normalizeAgentResponse } from '../agent/schemas.mjs';

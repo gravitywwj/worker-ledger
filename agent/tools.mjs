@@ -1,4 +1,4 @@
-import { maskProductMeasurements, normalizeProductItems } from '../product-prices.mjs';
+import { maskProductMeasurements, normalizeProductItems } from '../src/product-prices.mjs';
 const CATEGORY_RULES = [
   { id: 'food', keywords: /早餐|午饭|午餐|晚饭|晚餐|夜宵|外卖|咖啡|奶茶|餐饮|吃饭/ },
   { id: 'commute', keywords: /公交卡|交通卡|地铁卡|地铁|公交|打车|出租|网约车|交通|通勤|加油|停车/ },
