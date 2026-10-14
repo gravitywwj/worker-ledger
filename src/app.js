@@ -47,6 +47,7 @@ const AGENT_STORAGE_KEYS = {
 };
 
 let agentVoiceRecognition = null;
+let agentOcrWorkerPromise = null;
 
 const DEFAULT_CATEGORIES = [
   { id: 'food', label: '餐饮', icon: 'ph-fork-knife', type: 'expense' },
@@ -123,6 +124,9 @@ const NUMBER_FORMATTER = new Intl.NumberFormat('zh-CN', { maximumFractionDigits:
 const DEMO_MODE = new URLSearchParams(location.search).get('demo') === '1';
 const VALID_VIEWS = ['home', 'agent', 'ledger', 'reports', 'accounts', 'categories', 'settings'];
 const AGENT_MAX_INPUT_LENGTH = 1000;
+const AGENT_OCR_MAX_IMAGE_BYTES = 12 * 1024 * 1024;
+const AGENT_OCR_MAX_IMAGE_PIXELS = 20_000_000;
+const AGENT_OCR_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/bmp']);
 const REMOTE_AGENT_SINGLE_TIMEOUT_MS = 45000;
 const REMOTE_AGENT_MULTI_TIMEOUT_MS = 90000;
 
@@ -149,6 +153,9 @@ const state = {
   agentMessages: [],
   agentMemory: [],
   agentSending: false,
+  agentOcrProcessing: false,
+  agentOcrStatus: '',
+  agentOcrPendingText: '',
   agentRemoteJobs: 0,
   agentDraftEditLocks: new Set(),
   agentVoiceStatus: 'idle',
@@ -1912,6 +1919,90 @@ function setAgentVoiceState(status, message = '') {
   state.agentVoiceMessage = message;
 }
 
+function setAgentOcrStatus(message) {
+  state.agentOcrStatus = message;
+  const hint = document.querySelector('#agent-composer-hint');
+  if (hint && state.agentVoiceStatus !== 'listening') hint.textContent = message || 'Enter 发送，Shift + Enter 换行';
+}
+
+async function getAgentOcrWorker() {
+  if (!agentOcrWorkerPromise) {
+    agentOcrWorkerPromise = (async () => {
+      const { createWorker } = (await import('../node_modules/tesseract.js/dist/tesseract.esm.min.js')).default;
+      return createWorker('chi_sim', 1, {
+        workerPath: new URL('../node_modules/tesseract.js/dist/worker.min.js', import.meta.url).href,
+        corePath: new URL('../node_modules/tesseract.js-core/tesseract-core-lstm.wasm.js', import.meta.url).href,
+        langPath: new URL('../node_modules/@tesseract.js-data/chi_sim/4.0.0_best_int', import.meta.url).href,
+        gzip: true,
+        logger: ({ status, progress }) => {
+          const labels = {
+            'loading tesseract core': '正在加载本地 OCR 引擎',
+            'loading language traineddata': '正在加载本地中文模型',
+            'initializing api': '正在初始化识别器',
+            'recognizing text': '正在识别截图',
+          };
+          const label = labels[status] || '正在准备本地识别';
+          setAgentOcrStatus(Number.isFinite(progress) ? `${label} ${Math.round(progress * 100)}%` : label);
+        },
+      });
+    })();
+  }
+  try {
+    return await agentOcrWorkerPromise;
+  } catch (error) {
+    agentOcrWorkerPromise = null;
+    throw error;
+  }
+}
+
+async function recognizeAgentScreenshot(file) {
+  if (state.agentOcrProcessing) return;
+  if (!AGENT_OCR_IMAGE_TYPES.has(String(file.type || '').toLowerCase())) throw new Error('仅支持 PNG、JPG、WEBP 或 BMP 图片。');
+  if (!file.size || file.size > AGENT_OCR_MAX_IMAGE_BYTES) throw new Error('图片需小于 12 MB。');
+
+  state.agentOcrProcessing = true;
+  setAgentOcrStatus('正在检查截图…');
+  if (state.activeView === 'agent') renderAgentPreservingComposer();
+  try {
+    if (typeof createImageBitmap !== 'function') throw new Error('当前浏览器无法读取图片，请更新浏览器后重试。');
+    const image = await createImageBitmap(file);
+    const exceedsPixelLimit = image.width * image.height > AGENT_OCR_MAX_IMAGE_PIXELS;
+    image.close();
+    if (exceedsPixelLimit) throw new Error('图片尺寸过大，请裁剪后重试。');
+
+    const worker = await getAgentOcrWorker();
+    const { data } = await worker.recognize(new Uint8Array(await file.arrayBuffer()));
+    const recognizedText = String(data.text || '').trim();
+    if (!recognizedText) {
+      setAgentOcrStatus('未识别到文字，请选择更清晰的截图。');
+      toast('未识别到文字，请选择更清晰的截图。', 'error');
+      return;
+    }
+
+    const input = document.querySelector('#agent-input');
+    const currentText = input?.value.trimEnd() || state.agentOcrPendingText.trimEnd();
+    const combinedText = [currentText, recognizedText].filter(Boolean).join('\n');
+    if (input) {
+      input.value = combinedText;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    } else {
+      state.agentOcrPendingText = combinedText;
+    }
+    setAgentOcrStatus(combinedText.length > AGENT_MAX_INPUT_LENGTH
+      ? `识别完成，文字超过 ${AGENT_MAX_INPUT_LENGTH} 字，请删减后发送。`
+      : '识别完成，文字已填入输入框，可编辑后发送。');
+  } catch (error) {
+    const message = error?.message || String(error) || '截图识别失败，请重试。';
+    setAgentOcrStatus(message);
+    toast(message, 'error');
+  } finally {
+    state.agentOcrProcessing = false;
+    if (state.activeView === 'agent') renderAgentPreservingComposer();
+  }
+}
+
 function agentVoiceErrorMessage(errorCode) {
   const messages = {
     'not-allowed': '浏览器没有授予麦克风权限，请允许后重试。',
@@ -2222,6 +2313,8 @@ async function sendAgentMessage(text, integrationDraftId = '') {
     state.agentSending = false;
     throw error;
   }
+  state.agentOcrPendingText = '';
+  state.agentOcrStatus = '';
   let localResult;
   try { localResult = localAgentResponse(content); }
   catch (error) { localResult = { kind: 'clarify', reply: error instanceof Error ? error.message : '请核对商品规格和金额。' }; }
@@ -2448,7 +2541,8 @@ function renderAgent() {
   const voiceListening = state.agentVoiceStatus === 'listening';
   const voiceHint = voiceListening
     ? '正在听，请说出金额、收支和支付账户…'
-    : state.agentVoiceMessage || 'Enter 发送，Shift + Enter 换行；语音结束后自动整理为待审核草稿';
+    : state.agentVoiceMessage || 'Enter 发送，Shift + Enter 换行；截图文字在本机识别';
+  const composerHint = state.agentOcrStatus || voiceHint;
   const messages = state.agentMessages.length
     ? state.agentMessages.map(renderAgentMessage).join('')
     : `<article class="agent-message assistant"><span class="agent-avatar">${icon('ph-chat-circle-dots')}</span><div class="agent-message-content"><div class="agent-bubble"><strong>你好，我是账本助手。</strong><br>你可以直接说“午餐 28 元，微信支付”，也可以问“这个月花了多少”。记账草稿需要你确认后才会写入。</div></div></article>`;
@@ -2466,10 +2560,12 @@ function renderAgent() {
         <div class="agent-mobile-prompts">${prompts.slice(0, 2).map((prompt) => `<button type="button" data-agent-prompt="${escapeHtml(prompt)}">${escapeHtml(prompt)}</button>`).join('')}</div>
         <form class="agent-composer" id="agent-chat-form">
           <label class="visually-hidden" for="agent-input">发送给账本助手</label>
-          <textarea id="agent-input" name="message" rows="1" maxlength="${AGENT_MAX_INPUT_LENGTH}" placeholder="说一笔收支，或问问本月账单" ${state.agentSending ? 'disabled' : ''}></textarea>
-          <button class="agent-voice-button ${voiceListening ? 'listening' : ''}" type="button" data-action="toggle-agent-voice" ${state.agentSending ? 'disabled' : ''} aria-label="${voiceListening ? '结束语音输入' : '开始语音输入'}" aria-pressed="${voiceListening}" title="${voiceListening ? '结束语音输入' : '开始语音输入'}">${icon(voiceListening ? 'ph-stop' : 'ph-microphone')}</button>
-          <button class="agent-send-button" type="submit" ${state.agentSending ? 'disabled' : ''} aria-label="发送消息">${icon(state.agentSending ? 'ph-circle-notch' : 'ph-arrow-up')}</button>
-          <small><span>${voiceHint}</span><span id="agent-input-count">0/${AGENT_MAX_INPUT_LENGTH}</span></small>
+          <textarea id="agent-input" name="message" rows="1" maxlength="${AGENT_MAX_INPUT_LENGTH}" placeholder="说一笔收支，或问问本月账单" ${state.agentSending ? 'disabled' : ''}>${escapeHtml(state.agentOcrPendingText)}</textarea>
+          <button class="agent-ocr-button" type="button" data-action="select-agent-screenshot" ${state.agentSending || state.agentOcrProcessing ? 'disabled' : ''} aria-label="上传截图识别文字" title="本机识别截图文字">${icon('ph-image')}</button>
+          <input id="agent-screenshot-input" class="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp,image/bmp" />
+          <button class="agent-voice-button ${voiceListening ? 'listening' : ''}" type="button" data-action="toggle-agent-voice" ${state.agentSending || state.agentOcrProcessing ? 'disabled' : ''} aria-label="${voiceListening ? '结束语音输入' : '开始语音输入'}" aria-pressed="${voiceListening}" title="${voiceListening ? '结束语音输入' : '开始语音输入'}">${icon(voiceListening ? 'ph-stop' : 'ph-microphone')}</button>
+          <button class="agent-send-button" type="submit" ${state.agentSending || state.agentOcrProcessing ? 'disabled' : ''} aria-label="发送消息">${icon(state.agentSending ? 'ph-circle-notch' : 'ph-arrow-up')}</button>
+          <small><span id="agent-composer-hint" role="status" aria-live="polite">${escapeHtml(composerHint)}</span><span id="agent-input-count">${state.agentOcrPendingText.length}/${AGENT_MAX_INPUT_LENGTH}</span></small>
         </form>
       </section>
       <aside class="agent-side">
@@ -2480,7 +2576,7 @@ function renderAgent() {
         </div></section>
         <section class="side-panel agent-connection-card"><div class="panel-heading"><h3>模型连接</h3><span class="agent-status ${connection.className}">${icon(connection.iconName)}${escapeHtml(connection.label)}</span></div><div class="panel-body"><p>常见记账与查账可在本地完成。连接兼容模型后，可以理解更灵活的表达。</p><button class="secondary-button button-full" type="button" data-action="open-agent-settings">${icon('ph-plugs-connected')}配置并测试连接</button></div></section>         <section class="side-panel"><div class="panel-heading"><h3>已确认偏好</h3><span class="panel-note">${state.agentMemory.length} 条</span></div><div class="panel-body agent-memory-list">${state.agentMemory.length ? state.agentMemory.slice().reverse().slice(0, 4).map((memory) => `<div class="agent-memory-list-item"><span>${icon('ph-brain')}<strong>${escapeHtml(memory.label || memory.key)}</strong></span><button class="row-action danger" type="button" data-action="delete-agent-memory" data-memory-id="${escapeHtml(memory.id)}" aria-label="删除${escapeHtml(memory.label || memory.key)}">${icon('ph-trash')}</button></div>`).join('') : '<p class="panel-note">你说“记住……”时，我会先给你确认，未确认不会保存。</p>'}<button class="secondary-button button-full" type="button" data-action="open-agent-memory">管理偏好记忆</button></div></section>
         <section class="side-panel"><div class="panel-heading"><h3>试着这样问</h3></div><div class="panel-body agent-prompt-list">${prompts.map((prompt) => `<button type="button" data-agent-prompt="${escapeHtml(prompt)}">${icon('ph-arrow-bend-down-right')}<span>${escapeHtml(prompt)}</span></button>`).join('')}</div></section>
-        <section class="side-panel"><div class="panel-heading"><h3>数据边界</h3></div><div class="panel-body agent-privacy-note">${icon('ph-shield-check')}<p>写入前需要确认。模型会收到必要汇总、近期流水与本次匹配的商品价格，API Key 不会进入账本备份。</p></div></section>
+        <section class="side-panel"><div class="panel-heading"><h3>数据边界</h3></div><div class="panel-body agent-privacy-note">${icon('ph-shield-check')}<p>截图只在本机识别，图片不会上传或保存。发送后，识别文字会和手动输入一样进入助手；已配置模型时也会发给模型。记账草稿需确认后写入。</p></div></section>
       </aside>
     </div>`;
 }
@@ -3165,6 +3261,10 @@ document.addEventListener('click', async (event) => {
       return;
     }
     if (action === 'toggle-agent-voice') { toggleAgentVoiceInput(); return; }
+    if (action === 'select-agent-screenshot') {
+      document.querySelector('#agent-screenshot-input')?.click();
+      return;
+    }
     if (action === 'clear-agent-chat') {
       if (!state.agentMessages.length) { toast('当前没有聊天记录。'); return; }
       if (window.confirm('清空当前设备中的 Agent 聊天记录吗？账本流水不会受影响。')) await clearAgentMessages();
@@ -3262,6 +3362,14 @@ document.addEventListener('click', async (event) => {
 });
 
 document.addEventListener('change', async (event) => {
+  if (event.target.id === 'agent-screenshot-input') {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    try { await recognizeAgentScreenshot(file); }
+    catch (error) { toast(error instanceof Error ? error.message : '截图识别失败，请重试。', 'error'); }
+    return;
+  }
   if (event.target.closest('[data-product-editor]')) {
     updateProductPreviews(event.target.closest('[data-product-editor]'));
     const form = event.target.closest('[data-agent-draft-form]');
@@ -3293,6 +3401,7 @@ document.addEventListener('input', (event) => {
   if (editedDraftForm) state.agentDraftEditLocks.add(editedDraftForm.dataset.messageId);
   if (event.target.classList.contains('salary-input')) updateSalaryEstimatePreview();
   if (event.target.id === 'agent-input') {
+    state.agentOcrPendingText = '';
     event.target.style.height = 'auto';
     event.target.style.height = `${Math.min(132, event.target.scrollHeight)}px`;
     const counter = document.querySelector('#agent-input-count');

@@ -604,7 +604,10 @@ button.record-method-item:hover strong, button.record-method-item:hover > .ph { 
 .agent-composer > small span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-input-count { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
 .agent-input-count.limit { color: var(--expense); font-weight: 700; }
-.agent-voice-button, .agent-send-button { display: grid; place-items: center; width: 40px; height: 40px; padding: 0; border-radius: var(--radius-sm); font-size: 19px; transition: background-color 160ms ease, color 160ms ease, transform 120ms var(--ease-out); }
+.agent-ocr-button, .agent-voice-button, .agent-send-button { display: grid; place-items: center; width: 40px; height: 40px; padding: 0; border-radius: var(--radius-sm); font-size: 19px; transition: background-color 160ms ease, color 160ms ease, transform 120ms var(--ease-out); }
+.agent-ocr-button { position: absolute; right: 112px; bottom: 30px; border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink-soft); }
+.agent-ocr-button:hover { border-color: var(--primary); color: var(--primary); }
+.agent-ocr-button:disabled { opacity: .55; cursor: wait; }
 .agent-voice-button { position: absolute; right: 64px; bottom: 30px; border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink-soft); }
 .agent-voice-button:hover { border-color: var(--primary); color: var(--primary); }
 .agent-voice-button.listening { border-color: var(--expense); background: var(--expense-soft); color: var(--expense); }

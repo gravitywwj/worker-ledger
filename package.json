@@ -11,6 +11,8 @@
     "test:browser": "node tests/run-browser.mjs"
   },
   "dependencies": {
-    "@phosphor-icons/web": "^2.1.1"
+    "@phosphor-icons/web": "^2.1.1",
+    "@tesseract.js-data/chi_sim": "^1.0.0",
+    "tesseract.js": "^7.0.0"
   }
 }

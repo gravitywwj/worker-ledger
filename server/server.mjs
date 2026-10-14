@@ -21,6 +21,7 @@ const mimeTypes = {
   '.svg': 'image/svg+xml',
   '.woff2': 'font/woff2',
   '.webmanifest': 'application/manifest+json; charset=utf-8',
+  '.wasm': 'application/wasm',
 };
 
 function sendJson(response, statusCode, payload) {

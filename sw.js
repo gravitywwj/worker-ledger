@@ -7,7 +7,7 @@ const APP_SHELL = [
   './src/transaction-history.mjs',
   './agent/periodic-review.mjs',
   './index.html',
-  './src/styles.css?v=20',
+  './src/styles.css?v=21',
   './src/app.js?v=37',
   './assets/phosphor/style.css?v=1',
   './assets/phosphor/Phosphor.woff2',
@@ -31,6 +31,19 @@ self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
   const requestUrl = new URL(event.request.url);
   const isAppAsset = requestUrl.origin === self.location.origin && /\/(?:|index\.html|src\/(?:app\.js|styles\.css|transaction-history\.mjs|product-(?:backup|prices|ui)\.mjs)|sw\.js|manifest\.webmanifest|favicon\.svg|style\.css|Phosphor\.woff2)$/.test(requestUrl.pathname);
+  const isOcrAsset = requestUrl.origin === self.location.origin && /^\/node_modules\/(?:tesseract\.js\/dist\/(?:tesseract\.esm\.min\.js|worker\.min\.js)|tesseract\.js-core\/tesseract-core-lstm\.wasm(?:\.js)?|@tesseract\.js-data\/chi_sim\/4\.0\.0_best_int\/chi_sim\.traineddata\.gz)$/.test(requestUrl.pathname);
+  if (isOcrAsset) {
+    event.respondWith((async () => {
+      const cached = await caches.match(event.request);
+      if (cached) return cached;
+      const response = await fetch(event.request);
+      if (response.ok) {
+        try { await (await caches.open(CACHE_NAME)).put(event.request, response.clone()); } catch {}
+      }
+      return response;
+    })());
+    return;
+  }
   if (isAppAsset) {
     event.respondWith(
       fetch(event.request)
