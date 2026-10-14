@@ -84,8 +84,11 @@ function normalizeUpdate(rawUpdate, context = {}) {
   if (Object.hasOwn(changes, 'category') && !changes.category) errors.push('修改后的分类不能为空。');
   if (Object.hasOwn(changes, 'account') && !changes.account) errors.push('修改后的账户不能为空。');
   if (Object.hasOwn(changes, 'note') && !changes.note) errors.push('修改后的备注不能为空。');
-  const transactions = Array.isArray(context.ledgerContext?.recentTransactions) ? context.ledgerContext.recentTransactions : [];
-  if (transactionId && transactions.length && !transactions.some((item) => item?.id === transactionId)) errors.push('目标流水不在可修改的近期流水范围内。');
+  const ledgerContext = context.ledgerContext || {};
+  const transactions = [...(Array.isArray(ledgerContext.recentTransactions) ? ledgerContext.recentTransactions : []),
+    ...(Array.isArray(ledgerContext.historyQuery?.transactions) ? ledgerContext.historyQuery.transactions : [])];
+  const hasScope = Array.isArray(ledgerContext.recentTransactions) || Array.isArray(ledgerContext.historyQuery?.transactions);
+  if (transactionId && hasScope && !transactions.some((item) => item?.id === transactionId)) errors.push('目标流水不在可修改的近期流水范围或本次历史查询结果内。');
   if (errors.length) throw new Error(`模型修改建议校验失败：${errors.join(' ')}`);
   return { transactionId, changes };
 }

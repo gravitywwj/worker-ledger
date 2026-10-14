@@ -1,4 +1,5 @@
 import { maskProductMeasurements, normalizeProductItems } from '../src/product-prices.mjs';
+import { buildTransactionHistoryIndex, searchTransactionHistory } from '../src/transaction-history.mjs';
 const CATEGORY_RULES = [
   { id: 'food', keywords: /早餐|午饭|午餐|晚饭|晚餐|夜宵|外卖|咖啡|奶茶|餐饮|吃饭/ },
   { id: 'commute', keywords: /公交卡|交通卡|地铁卡|地铁|公交|打车|出租|网约车|交通|通勤|加油|停车/ },
@@ -123,16 +124,20 @@ export const AGENT_TOOL_DEFINITIONS = [
     type: 'function',
     function: {
       name: 'search_transactions',
-      description: '按关键词、类型或时间读取流水摘要，只读，不写入账本。',
+      description: '只读查询本次本地历史检索结果，支持同义词、类型、日期和金额；scope 表示查询范围，countIsPartial 为 true 时不能把返回条数当作全量。',
       parameters: {
         type: 'object',
         additionalProperties: false,
         properties: {
           keyword: { type: 'string', description: '商户、备注或分类关键词，可为空' },
           type: { type: 'string', enum: ['expense', 'income', 'transfer', ''], description: '流水类型，可为空' },
-          limit: { type: 'integer', minimum: 1, maximum: 50, description: '最多返回条数' },
+          startDate: { type: 'string', description: '开始日期 YYYY-MM-DD，可为空' },
+          endDate: { type: 'string', description: '结束日期 YYYY-MM-DD，可为空' },
+          minAmountYuan: { type: ['number', 'null'], minimum: 0, description: '最低金额（元），不限制时为 null' },
+          maxAmountYuan: { type: ['number', 'null'], minimum: 0, description: '最高金额（元），不限制时为 null' },
+          limit: { type: 'integer', minimum: 1, maximum: 20, description: '最多返回 20 条摘要' },
         },
-        required: ['keyword', 'type', 'limit'],
+        required: ['keyword', 'type', 'startDate', 'endDate', 'minAmountYuan', 'maxAmountYuan', 'limit'],
       },
       strict: true,
     },
@@ -413,9 +418,10 @@ function ledgerItems(context) {
 function normalizedItem(item) {
   return {
     id: String(item.id || ''),
+    ...(item.date ? { date: item.date } : {}),
     occurredAt: item.occurredAt,
     type: item.type,
-    amountYuan: number(item.amountYuan ?? item.amount),
+    amountYuan: number(item.amountYuan ?? Number(item.amount) / 100),
     category: String(item.category || ''),
     account: String(item.account || ''),
     note: String(item.note || ''),
@@ -498,17 +504,19 @@ export function executeAgentTool(name, args, context = {}) {
     for (const draft of args?.drafts || []) normalizeProductItems(draft.items || [], { amount: Math.round(Number(draft.amountYuan) * 100), type: draft.type });
     return validateTransactionDrafts(args, context);
   }
-  if (name === 'query_ledger') return { query: String(args?.query || ''), ledgerContext: context.ledgerContext || {} };
+  if (name === 'query_ledger') {
+    const { recentTransactions, analysisTransactions, historyQuery, ...facts } = context.ledgerContext || {};
+    const { transactions, ...historyFacts } = historyQuery || {};
+    return { query: String(args?.query || ''), ledgerContext: { ...facts, ...(historyQuery ? { historyQuery: historyFacts } : {}) } };
+  }
   if (name === 'search_transactions') {
-    const keyword = String(args?.keyword || '').trim().toLowerCase();
-    const type = String(args?.type || '');
-    const limit = Math.min(50, Math.max(1, Number(args?.limit) || 20));
-    const items = ledgerItems(context).map(normalizedItem).filter((item) => {
-      const matchesType = !type || item.type === type;
-      const haystack = [item.category, item.account, item.note, ...item.tags].join(' ').toLowerCase();
-      return matchesType && (!keyword || haystack.includes(keyword));
-    });
-    return { count: items.length, transactions: items.slice(0, limit) };
+    const historyQuery = context.ledgerContext?.historyQuery;
+    const index = buildTransactionHistoryIndex(historyQuery?.transactions || ledgerItems(context));
+    const result = searchTransactionHistory(index, { ...args, limit: Math.min(20, Number(args?.limit) || 20) });
+    return { count: result.count, countIsPartial: Boolean(historyQuery?.hasMore),
+      fullHistory: Boolean(historyQuery?.fullHistory), sourceMatchCount: historyQuery?.count ?? result.count,
+      scope: historyQuery?.query || '本次提供的流水候选', hasMore: result.hasMore || Boolean(historyQuery?.hasMore),
+      transactions: result.transactions.map(normalizedItem) };
   }
   if (name === 'analyze_spending_habits') return analyzeHabits(context, args?.months);
   if (name === 'get_user_preferences') return { preferences: context.ledgerContext?.userPreferences || [] };

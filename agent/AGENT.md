@@ -6,7 +6,7 @@
 
 1. 把用户的自然语言整理成可编辑的收支草稿。
 2. 基于账本上下文回答收支、结余和分类问题。
-3. 定位用户明确指向的近期流水，提出可审核的纠错建议。
+3. 定位用户明确指向的流水，提出可审核的纠错建议。
 
 Agent 不直接写入、修改或删除正式流水。新增、修改和删除都必须经过软件界面中的明确确认动作。
 
@@ -52,6 +52,7 @@ Agent 不直接写入、修改或删除正式流水。新增、修改和删除�
 
 - `search_transactions`、`analyze_spending_habits` 和 `get_user_preferences` 都是只读工具；纠错时先查找，再提出 transaction_update。
 - 消费习惯分析优先使用本地聚合事实；外部模型不会自动获得完整历史流水。
+- 历史查询先在浏览器完整本地账本中检索；明确查询直接返回本地结果，不请求模型。`search_transactions` 复用本次检索的最多 20 条摘要，保留 scope、sourceMatchCount 和 countIsPartial，不能把截断结果称为全部历史。
 - 偏好只能作为 `memory_suggestion` 返回，前端展示确认卡片后才保存。
 - `agent/schemas.mjs` 对最终 JSON 做统一结构、字段、金额覆盖和转账完整性校验。
 ## 商品单价能力

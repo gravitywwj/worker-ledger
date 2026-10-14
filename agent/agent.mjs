@@ -69,6 +69,15 @@ export async function createLedgerAgent({ root, complete }) {
       const periodicReviewRequest = isPeriodicReviewRequest(userText) && Array.isArray(ledgerContext.periodicReviewFacts);
       const transactionRequest = !periodicReviewRequest && !productQuery && isTransactionRequest(userText, candidates);
       const needsValidationTool = transactionRequest && candidates.length > 1 && !correctionRequest;
+      const modelContext = { ...ledgerContext };
+      if (transactionRequest && !correctionRequest) {
+        delete modelContext.recentTransactions;
+        delete modelContext.analysisTransactions;
+      }
+      if (modelContext.historyQuery) {
+        const { transactions, ...historyFacts } = modelContext.historyQuery;
+        modelContext.historyQuery = historyFacts;
+      }
       const system = `${skillText}
 
 商品录入候选（仍需审核）：${jsonText(productEntry)}
@@ -92,7 +101,7 @@ ${jsonText(candidates)}
 ${jsonText(categoryHints)}
 
 账本上下文：
-${jsonText(ledgerContext)}
+${jsonText(modelContext)}
 
 ## 最终输出契约
 

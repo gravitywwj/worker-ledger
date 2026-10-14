@@ -2,7 +2,7 @@
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { once } from 'node:events';
-import { runBrowserAcceptance } from './browser-acceptance.mjs';
+import { runBrowserAcceptance, runHistoryAcceptance } from './browser-acceptance.mjs';
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const probe = createServer();
 probe.listen(0, '127.0.0.1');
@@ -25,6 +25,7 @@ try {
   const channel = process.env.PLAYWRIGHT_CHANNEL || (process.platform === 'win32' ? 'msedge' : undefined);
   browser = await chromium.launch({ headless: true, ...(channel ? { channel } : {}) });
   console.log(await runBrowserAcceptance(await browser.newPage(), base));
+  console.log(await runHistoryAcceptance(await browser.newPage(), base));
 } finally {
   if (browser) await browser.close();
   server.kill();

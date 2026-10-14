@@ -4,6 +4,7 @@ import { DEFAULT_PRODUCT_CATEGORIES, normalizeProductItems, prepareProductTransa
 import { normalizeBackup } from './product-backup.mjs';
 import { buildPeriodicReviewFacts, normalizePeriodicReviewPayload, periodicReviewPlaceholderIds } from '../agent/periodic-review.mjs';
 import { productRow, renderProductEditor, readProductEditor, updateProductPreviews, renderPriceSources } from './product-ui.mjs';
+import { buildTransactionHistoryIndex, searchTransactionHistory, findDuplicateTransactions, normalizeTransactionNote, parseHistoryQuery } from './transaction-history.mjs';
 
 const DB_NAME = 'worker-ledger';
 const DB_VERSION = 6;
@@ -140,6 +141,8 @@ const state = {
   searchTerm: '',
   ledgerType: 'all',
   ledgerAccount: 'all',
+  ledgerScope: 'month',
+  ledgerPage: 0,
   reportPeriod: 'month',
   reportWeekDate: null,
   weatherIndex: 0,
@@ -158,6 +161,7 @@ const state = {
 
 let searchTimer = null;
 let resizeTimer = null;
+let transactionHistoryCache = null;
 
 function id() {
   return globalThis.crypto?.randomUUID?.() || `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -292,6 +296,29 @@ function monthKey(dateInput = new Date()) {
 function dateKey(dateInput) {
   const date = new Date(dateInput);
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function transactionHistoryIndex() {
+  if (!transactionHistoryCache || transactionHistoryCache.transactions !== state.transactions) {
+    transactionHistoryCache = { transactions: state.transactions, index: buildTransactionHistoryIndex(state.transactions, state) };
+  }
+  return transactionHistoryCache.index;
+}
+
+function confirmPossibleDuplicates(transactions) {
+  const results = findDuplicateTransactions(transactionHistoryIndex(), transactions);
+  if (!results.length) return true;
+  const details = results.slice(0, 4).flatMap(({ candidate, count, matches }) => {
+    const type = candidate.type === 'income' ? '收入' : '支出';
+    const lines = matches.map(({ transaction: existing, kind, draftMatch, reason }) => {
+      const note = String(existing.note || getCategory(existing.categoryId).label).replace(/\s+/g, ' ').slice(0, 32);
+      return `· ${draftMatch ? '本次草稿' : kind === 'possible_duplicate' ? '疑似重复' : '历史相似'}：${dateKey(existing.occurredAt)} ${type} ${money(existing.amount)} · ${note}（${reason}）`;
+    });
+    if (count > matches.length) lines.push(`另有 ${count - matches.length} 条历史相似记录`);
+    return lines;
+  });
+  if (results.length > 4) details.push(`另有 ${results.length - 4} 笔待入账流水存在相似记录`);
+  return window.confirm(`发现疑似重复或历史相似的流水：\n${details.join('\n')}\n\n不同日期的相似记录可能是正常的重复收支。\n按“确定”继续保存，按“取消”返回修改。`);
 }
 
 function monthLabel(dateInput = state.selectedMonth) {
@@ -777,6 +804,7 @@ async function persistTransactions(transactions, successMessage = '这些流水�
     state.selectedMonth = new Date(latestDate.getFullYear(), latestDate.getMonth(), 1);
     state.reportWeekDate = latestDate;
   }
+  state.ledgerPage = 0;
   setSavedStatus(); render();
   toast(state.demo ? '演示记录只在本次打开期间保留，刷新后会重置。' : successMessage);
   void syncIntegrationSummary();
@@ -803,6 +831,7 @@ async function persistAccount(account, successMessage = '账户已保存。') {
   const existingIndex = state.accounts.findIndex((item) => item.id === account.id);
   if (existingIndex >= 0) state.accounts[existingIndex] = account;
   else state.accounts.push(account);
+  transactionHistoryCache = null;
   setSavedStatus();
   render();
   toast(successMessage);
@@ -811,6 +840,7 @@ async function persistAccount(account, successMessage = '账户已保存。') {
 async function persistCategory(category) {
   if (!state.demo) await dbPut(STORES.categories, category);
   state.categories.push(category);
+  transactionHistoryCache = null;
   setSavedStatus();
   render();
   toast('分类已添加。');
@@ -1065,39 +1095,41 @@ function renderHome() {
 
 function filteredLedgerTransactions() {
   const { start, end } = periodBounds('month');
-  const query = state.searchTerm.trim().toLowerCase();
-  return transactionsInRange(start, end).filter((item) => {
-    if (state.ledgerType !== 'all' && item.type !== state.ledgerType) return false;
-    if (state.ledgerAccount !== 'all' && item.accountId !== state.ledgerAccount && item.toAccountId !== state.ledgerAccount) return false;
-    if (!query) return true;
-    const category = getCategory(item.categoryId);
-    const searchable = [category.label, accountName(item.accountId), item.note, ...(item.tags || [])].join(' ').toLowerCase();
-    return searchable.includes(query);
-  });
+  const query = { keyword: state.searchTerm, type: state.ledgerType, accountId: state.ledgerAccount, limit: 50,
+    ...(state.ledgerScope === 'month' ? { startDate: dateKey(start), endDate: dateKey(end) } : {}) };
+  let result = searchTransactionHistory(transactionHistoryIndex(), { ...query, offset: state.ledgerPage * 50 });
+  const lastPage = Math.max(0, Math.ceil(result.count / 50) - 1);
+  if (state.ledgerPage > lastPage) {
+    state.ledgerPage = lastPage;
+    result = searchTransactionHistory(transactionHistoryIndex(), { ...query, offset: lastPage * 50 });
+  }
+  return result;
 }
 
 function renderLedger() {
-  const transactions = filteredLedgerTransactions();
+  const result = filteredLedgerTransactions();
   return `
-    ${pageHeader('流水', '按月份、类型、账户或关键词查找，每笔金额都能追溯到原始记录。', `<button class="primary-button" type="button" data-action="open-transaction">${icon('ph-plus')}记一笔</button>`)}
+    ${pageHeader('流水', '查询当前月份或全部历史，支持关键词、同义词和金额，每笔流水可查看原账单。', `<button class="primary-button" type="button" data-action="open-transaction">${icon('ph-plus')}记一笔</button>`)}
     <div class="toolbar">
       <div class="filter-row">
         <label class="search-input-wrap">
           ${icon('ph-magnifying-glass')}
-          <input class="text-input" id="ledger-search" type="search" placeholder="搜索分类、备注或标签" value="${escapeHtml(state.searchTerm)}" />
+          <input class="text-input" id="ledger-search" type="search" placeholder="搜索备注、分类、标签或金额" value="${escapeHtml(state.searchTerm)}" />
         </label>
+        <label class="field compact-select"><span>范围</span><select class="select-input" id="ledger-scope-filter"><option value="month" ${state.ledgerScope === 'month' ? 'selected' : ''}>当前月份</option><option value="all" ${state.ledgerScope === 'all' ? 'selected' : ''}>全部历史</option></select></label>
         <label class="field compact-select"><span>类型</span><select class="select-input" id="ledger-type-filter"><option value="all">全部类型</option><option value="expense" ${state.ledgerType === 'expense' ? 'selected' : ''}>支出</option><option value="income" ${state.ledgerType === 'income' ? 'selected' : ''}>收入</option><option value="transfer" ${state.ledgerType === 'transfer' ? 'selected' : ''}>转账</option></select></label>
         <label class="field compact-select"><span>账户</span><select class="select-input" id="ledger-account-filter"><option value="all">全部账户</option>${accountOptions(state.ledgerAccount)}</select></label>
       </div>
-      <div class="month-control">
+      <div class="month-control ${state.ledgerScope === 'all' ? 'hidden' : ''}">
         <button class="icon-button" type="button" data-action="previous-month" aria-label="上个月">${icon('ph-caret-left')}</button>
         <strong>${escapeHtml(monthLabel())}</strong>
         <button class="icon-button" type="button" data-action="next-month" aria-label="下个月">${icon('ph-caret-right')}</button>
       </div>
     </div>
     <section class="content-panel transaction-table ledger-list">
-      <div class="panel-heading"><h2>${transactions.length} 笔流水</h2><span class="panel-note">金额单位：人民币</span></div>
-      ${transactionTable(transactions, { actions: true })}
+      <div class="panel-heading"><h2>${result.count} 笔流水</h2><span class="panel-note">收入 ${money(result.incomeAmount)} · 支出 ${money(result.expenseAmount)}</span></div>
+      ${result.count ? transactionTable(result.transactions, { actions: true }) : '<div class="empty-state"><h3>没有匹配的流水</h3><p>当前查询条件下没有记录。</p></div>'}
+      ${result.count > 50 ? `<div class="panel-heading"><span class="panel-note">第 ${state.ledgerPage + 1} / ${Math.ceil(result.count / 50)} 页</span><div class="button-row"><button class="secondary-button" type="button" data-action="ledger-previous-page" ${state.ledgerPage === 0 ? 'disabled' : ''}>上一页</button><button class="secondary-button" type="button" data-action="ledger-next-page" ${!result.hasMore ? 'disabled' : ''}>下一页</button></div></div>` : ''}
     </section>`;
 }
 
@@ -1639,6 +1671,7 @@ function applyAgentEditChanges(before, changes) {
 function findAgentCorrectionTargets(text, changeIndex) {
   const source = String(text || '');
   const reference = changeIndex >= 0 ? source.slice(0, changeIndex) : source;
+  const canonicalReference = normalizeTransactionNote(reference);
   const referenceAmounts = agentAmountMatches(reference).map((item) => centsFromYuan(item.amountYuan));
   const referenceDate = correctionDate(reference, -1);
   const latestCue = /刚才|刚刚|上一笔|最后一笔|最近一笔|这笔|那笔/.test(source);
@@ -1651,7 +1684,7 @@ function findAgentCorrectionTargets(text, changeIndex) {
     let score = 0;
     if (referenceAmounts.includes(Number(transaction.amount))) score += 10;
     if (referenceDate && dateKey(transaction.occurredAt) === dateKey(referenceDate)) score += 4;
-    if (note && note.length >= 2 && source.toLowerCase().includes(note.toLowerCase())) score += 8;
+    if (note && note.length >= 2 && canonicalReference.includes(normalizeTransactionNote(note))) score += 8;
     if (source.includes(category.label)) score += 3;
     if (account?.name && source.includes(account.name)) score += 3;
     if (/刚才|刚刚|上一笔|最后一笔|最近一笔/.test(source) && index === 0) score += 8;
@@ -1844,6 +1877,13 @@ function localAgentResponse(text) {
     const comparison = compareProductPrices(state, { query: text, quote: parseProductQuote(text) });
     return { kind: comparison.status === 'ok' ? 'answer' : 'clarify', reply: formatPriceComparison(comparison), comparison };
   }
+  const historyQuery = isAgentCorrectionRequest(text) ? null : ledgerHistoryQuery(text);
+  if (historyQuery) {
+    const lines = historyQuery.transactions.map((item) => `${item.date} · ${agentDraftTypeLabel(item.type)} ${money(centsFromYuan(item.amountYuan))} · ${item.note || item.category} · ${item.account}`);
+    const reply = `已查询完整本地历史，匹配 ${historyQuery.count} 笔。收入 ${money(centsFromYuan(historyQuery.incomeYuan))}，支出 ${money(centsFromYuan(historyQuery.expenseYuan))}。`
+      + (lines.length ? `\n${lines.join('\n')}` : '') + (historyQuery.hasMore ? '\n当前显示前 20 笔，流水页可查询全部匹配。' : '');
+    return { kind: 'answer', reply, historyQuery };
+  }
   const answer = localAgentAnswer(text);
   if (answer) return answer;
   const transactionIntent = /记|花|买|付|消费|购物|日用|支出|收入|工资|薪资|到账|奖金|报销|退款|转账|充值|会员|订阅|GPT|OpenAI|外卖|早餐|午饭|午餐|晚餐|地铁|公交|打车|房租|盒马|超市|买菜|家政|洗衣液|垃圾桶|枕头|锅|刀具|锅铲|水电|燃气|天然气|话费/.test(text);
@@ -1948,12 +1988,32 @@ function toggleAgentVoiceInput() {
   }
 }
 
+function agentHistorySnapshot(item) {
+  return { id: item.id, date: dateKey(item.occurredAt), occurredAt: item.occurredAt, type: item.type,
+    amountYuan: yuanFromCents(item.amount), category: getCategory(item.categoryId).label,
+    account: accountName(item.accountId), note: item.note, tags: item.tags || [] };
+}
+
+function ledgerHistoryQuery(text) {
+  const query = parseHistoryQuery(text, state);
+  if (!query) return null;
+  const result = searchTransactionHistory(transactionHistoryIndex(), { ...query, limit: 20 });
+  return { query, fullHistory: true, count: result.count, totalCount: result.totalCount, hasMore: result.hasMore,
+    incomeYuan: yuanFromCents(result.incomeAmount), expenseYuan: yuanFromCents(result.expenseAmount),
+    transactions: result.transactions.map(agentHistorySnapshot) };
+}
+
 function ledgerContextForAgent(query = '') {
   const stats = monthlyStats();
   const previous = statsForPreviousMonth();
   const categories = reportCategoryData(stats.transactions).map(({ category, amount }) => ({ id: category.id, label: category.label, amountYuan: yuanFromCents(amount) }));
   const periodicReview = isPeriodicReviewRequest(query) ? periodicReviewData(query) : null;
+  const historyQuery = isAgentCorrectionRequest(query) ? null : ledgerHistoryQuery(query);
+  const recentTransactions = isAgentCorrectionRequest(query)
+    ? findAgentCorrectionTargets(query, correctionChangeIndex(query)).candidates
+    : historyQuery ? [] : sortTransactions(state.transactions).slice(0, 30);
   return {
+    ...(historyQuery ? { historyQuery } : {}),
     productContext: isProductQuery(query) ? compareProductPrices(state, { query, quote: parseProductQuote(query) }) : undefined,
     selectedMonth: monthKey(state.selectedMonth),
     today: dateKey(new Date()),
@@ -1964,16 +2024,7 @@ function ledgerContextForAgent(query = '') {
     categories,
     availableCategories: state.categories.map((item) => ({ label: item.label, type: item.type })),
     availableAccounts: activeAccounts().map((item) => ({ name: item.name, type: item.type })),
-    recentTransactions: sortTransactions(state.transactions).slice(0, 30).map((item) => ({
-      id: item.id,
-      occurredAt: item.occurredAt,
-      type: item.type,
-      amountYuan: yuanFromCents(item.amount),
-      category: getCategory(item.categoryId).label,
-      account: accountName(item.accountId),
-      note: item.note,
-      tags: item.tags || [],
-    })),
+    recentTransactions: recentTransactions.map(agentHistorySnapshot),
   };
 }
 
@@ -2083,7 +2134,8 @@ function agentDraftsFromResult(result) {
 }
 
 function agentMessageDataFromResult(result) {
-  const data = { ...agentDraftDataFromResult(result), ...(result?.comparison ? { comparison: result.comparison } : {}) };
+  const data = { ...agentDraftDataFromResult(result), ...(result?.comparison ? { comparison: result.comparison } : {}),
+    ...(result?.historyQuery ? { historyQuery: result.historyQuery } : {}) };
   if (result?.kind === 'transaction_update' && result.editSuggestion) return { ...data, editSuggestion: result.editSuggestion, editStatus: 'pending' };
   if (result?.kind === 'memory_suggestion' && result.memory) return { ...data, memorySuggestion: result.memory, memoryStatus: 'pending' };
   if (result?.kind === 'periodic_review') return { ...data, periodicReview: { headline: result.headline, highlights: result.highlights, closing: result.closing, facts: result.facts || [] } };
@@ -2175,7 +2227,7 @@ async function sendAgentMessage(text, integrationDraftId = '') {
   catch (error) { localResult = { kind: 'clarify', reply: error instanceof Error ? error.message : '请核对商品规格和金额。' }; }
   const localDrafts = agentDraftsFromResult(localResult);
   const remoteTimeoutMs = localDrafts.length > 1 ? REMOTE_AGENT_MULTI_TIMEOUT_MS : REMOTE_AGENT_SINGLE_TIMEOUT_MS;
-  const remoteEnabled = hasRemoteAgentConfig();
+  const remoteEnabled = hasRemoteAgentConfig() && !localResult?.historyQuery;
   const requestMessages = state.agentMessages.slice(-12).map((message) => ({ role: message.role, content: message.content }));
   const immediateResult = localResult || {
     kind: 'answer',
@@ -2368,6 +2420,11 @@ function renderPeriodicReview(review) {
   return `<section class="agent-draft-card agent-review-card"><div class="agent-review-heading"><div>${icon('ph-chart-line')}<span><strong>${escapeHtml(review.headline)}</strong><small>数字来自本地账本事实</small></span></div></div><ul class="agent-review-list">${highlights}</ul><p class="agent-review-closing">${escapeHtml(review.closing)}</p></section>`;
 }
 
+function renderHistorySources(historyQuery) {
+  if (!historyQuery?.transactions?.length) return '';
+  return `<div class="price-sources">${historyQuery.transactions.map((item) => `<button class="text-button" type="button" data-action="view-history-source" data-transaction-id="${escapeHtml(item.id)}">查看 ${escapeHtml(item.date)} · ${escapeHtml(String(item.note || item.category).slice(0, 24))} 的原账单</button>`).join('')}</div>`;
+}
+
 function renderAgentMessage(message) {
   const assistant = message.role === 'assistant';
   return `
@@ -2376,6 +2433,7 @@ function renderAgentMessage(message) {
       <div class="agent-message-content">
         <div class="agent-bubble">${escapeHtml(message.content).replaceAll('\\n', '<br>')}</div>
         ${renderPriceSources(message.comparison)}
+        ${renderHistorySources(message.historyQuery)}
         ${assistant ? renderAgentDraft(message) : ''}
         ${assistant ? renderAgentEditSuggestion(message) : ''}
         ${assistant ? renderAgentMemorySuggestion(message) : ''}
@@ -2514,6 +2572,11 @@ async function confirmAgentDraft(form) {
       createdAt: now,
       updatedAt: now,
     }));
+    if (!confirmPossibleDuplicates(transactions)) {
+      delete form.dataset.submitting;
+      if (submitButton) submitButton.disabled = false;
+      return;
+    }
     const committedDrafts = transactions.map((transaction) => ({
       type: transaction.type,
       amountYuan: yuanFromCents(transaction.amount),
@@ -2633,7 +2696,7 @@ function renderSettings() {
           <ul class="privacy-list">
             <li>${icon('ph-check-circle')}<span>不要求注册账号</span></li>
             <li>${icon('ph-check-circle')}<span>不会自动同步或上传完整账本</span></li>
-            <li>${icon('ph-check-circle')}<span>使用外部模型时，仅在提问后发送必要汇总与近期流水</span></li>
+            <li>${icon('ph-check-circle')}<span>使用外部模型时，仅发送必要汇总和本次相关流水摘要</span></li>
             <li>${icon('ph-check-circle')}<span>备份文件可在另一台设备导入</span></li>
           </ul>
           <div class="backup-actions"><button class="secondary-button button-full" type="button" data-action="export-data">${icon('ph-download-simple')}导出备份</button><button class="secondary-button button-full" type="button" data-action="import-data">${icon('ph-upload-simple')}导入备份</button></div>
@@ -2708,6 +2771,7 @@ function navigate(view, options = {}) {
 
 function shiftMonth(delta) {
   state.selectedMonth = new Date(state.selectedMonth.getFullYear(), state.selectedMonth.getMonth() + delta, 1);
+  state.ledgerPage = 0;
   render();
 }
 
@@ -3073,7 +3137,7 @@ document.addEventListener('click', async (event) => {
     }
     return;
   }
-  if (action === 'view-price-source') {
+  if (action === 'view-price-source' || action === 'view-history-source') {
     const transaction = state.transactions.find((item) => item.id === actionTarget.dataset.transactionId);
     if (transaction) openTransactionDialog(transaction);
     else toast('原账单已删除。', 'error');
@@ -3086,6 +3150,8 @@ document.addEventListener('click', async (event) => {
     if (action === 'set-transaction-type') { updateTransactionType(actionTarget.dataset.type); return; }
     if (action === 'previous-month') { shiftPeriod(-1); return; }
     if (action === 'next-month') { shiftPeriod(1); return; }
+    if (action === 'ledger-previous-page') { state.ledgerPage = Math.max(0, state.ledgerPage - 1); render(); return; }
+    if (action === 'ledger-next-page') { state.ledgerPage += 1; render(); return; }
     if (action === 'open-search') { navigate('ledger', { focusSearch: true }); return; }
     if (action === 'refresh-weather') {
       state.weatherIndex += 1;
@@ -3201,8 +3267,9 @@ document.addEventListener('change', async (event) => {
     const form = event.target.closest('[data-agent-draft-form]');
     if (form) state.agentDraftEditLocks.add(form.dataset.messageId);
   }
-  if (event.target.id === 'ledger-type-filter') { state.ledgerType = event.target.value; render(); }
-  if (event.target.id === 'ledger-account-filter') { state.ledgerAccount = event.target.value; render(); }
+  if (event.target.id === 'ledger-type-filter') { state.ledgerType = event.target.value; state.ledgerPage = 0; render(); }
+  if (event.target.id === 'ledger-account-filter') { state.ledgerAccount = event.target.value; state.ledgerPage = 0; render(); }
+  if (event.target.id === 'ledger-scope-filter') { state.ledgerScope = event.target.value; state.ledgerPage = 0; render(); }
   const changedDraftForm = event.target.closest('[data-agent-draft-form]');
   if (changedDraftForm) state.agentDraftEditLocks.add(changedDraftForm.dataset.messageId);
   if (event.target.classList.contains('agent-draft-type')) {
@@ -3236,6 +3303,7 @@ document.addEventListener('input', (event) => {
   }
   if (event.target.id === 'ledger-search') {
     state.searchTerm = event.target.value;
+    state.ledgerPage = 0;
     const position = event.target.selectionStart;
     window.clearTimeout(searchTimer);
     searchTimer = window.setTimeout(() => {
@@ -3252,6 +3320,12 @@ document.addEventListener('submit', async (event) => {
   event.preventDefault();
   const form = event.target;
   const data = new FormData(form);
+  const manualSubmitButton = form.id === 'transaction-form' ? form.querySelector('button[type="submit"]') : null;
+  if (form.id === 'transaction-form') {
+    if (form.dataset.submitting === 'true') return;
+    form.dataset.submitting = 'true';
+    if (manualSubmitButton) manualSubmitButton.disabled = true;
+  }
   try {
     if (form.id === 'agent-chat-form') {
       await sendAgentMessage(data.get('message'));
@@ -3297,6 +3371,7 @@ document.addEventListener('submit', async (event) => {
         createdAt: original?.createdAt || now,
         updatedAt: now,
       };
+      if (!original && !confirmPossibleDuplicates([transaction])) return;
       await persistTransaction(transaction, original ? '流水修改已保存。' : '这笔流水已保存。');
       closeDialog();
       return;
@@ -3342,6 +3417,11 @@ document.addEventListener('submit', async (event) => {
     }
   } catch (error) {
     toast(error instanceof Error ? error.message : '保存失败，请重试。', 'error');
+  } finally {
+    if (form.id === 'transaction-form') {
+      delete form.dataset.submitting;
+      if (manualSubmitButton) manualSubmitButton.disabled = false;
+    }
   }
 });
 

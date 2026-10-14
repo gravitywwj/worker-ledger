@@ -1,13 +1,14 @@
-const CACHE_NAME = 'worker-ledger-v30';
+const CACHE_NAME = 'worker-ledger-v33';
 const APP_SHELL = [
   './',
   './src/product-prices.mjs',
   './src/product-ui.mjs',
   './src/product-backup.mjs',
+  './src/transaction-history.mjs',
   './agent/periodic-review.mjs',
   './index.html',
   './src/styles.css?v=20',
-  './src/app.js?v=34',
+  './src/app.js?v=37',
   './assets/phosphor/style.css?v=1',
   './assets/phosphor/Phosphor.woff2',
   './manifest.webmanifest',
@@ -29,7 +30,7 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
   const requestUrl = new URL(event.request.url);
-  const isAppAsset = requestUrl.origin === self.location.origin && /\/(?:|index\.html|src\/(?:app\.js|styles\.css|product-(?:backup|prices|ui)\.mjs)|sw\.js|manifest\.webmanifest|favicon\.svg|style\.css|Phosphor\.woff2)$/.test(requestUrl.pathname);
+  const isAppAsset = requestUrl.origin === self.location.origin && /\/(?:|index\.html|src\/(?:app\.js|styles\.css|transaction-history\.mjs|product-(?:backup|prices|ui)\.mjs)|sw\.js|manifest\.webmanifest|favicon\.svg|style\.css|Phosphor\.woff2)$/.test(requestUrl.pathname);
   if (isAppAsset) {
     event.respondWith(
       fetch(event.request)

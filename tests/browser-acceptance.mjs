@@ -62,6 +62,7 @@ export async function runBrowserAcceptance(page, base) {
   await ask('测试酒历史单价');
   await p.getByText(/历史最低 5.00 元/).waitFor();
   await p.getByRole('link',{name:'流水',exact:true}).click();
+  await p.locator('#ledger-scope-filter').selectOption('all');
   const latest=(await read('transactions')).find(t=>t.source==='agent');
   p.once('dialog',dialog=>dialog.accept());
   await p.locator('[data-action="delete-transaction"][data-transaction-id="'+latest.id+'"]').click();
@@ -97,4 +98,112 @@ export async function runBrowserAcceptance(page, base) {
   check(errors.length===0,'browser errors: '+errors.join('; '));
   await context.close();
   return 'PASS: v5→v6, 41 legacy records, beyond-30 history, manual entry, quote no-write, draft approval, catalog reuse, v3 export/import, v2 import, reload persistence, atomic import rollback, edit/delete price sync, offline reload, zero page errors';
+}
+
+export async function runHistoryAcceptance(page, base) {
+  const context = await page.context().browser().newContext({ viewport: { width: 1280, height: 900 }, timezoneId: 'Asia/Hong_Kong' });
+  const p = await context.newPage();
+  const errors = [];
+  const check = (value, message) => { if (!value) throw new Error(message); };
+  p.on('pageerror', error => errors.push(error.message));
+  let modelRequests = 0;
+  await p.route('**/api/agent/chat', route => {
+    modelRequests += 1;
+    return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ reply: JSON.stringify({ kind: 'answer', reply: 'fixture response' }) }) });
+  });
+  const read = async () => p.evaluate(async () => new Promise((resolve, reject) => {
+    const request = indexedDB.open('worker-ledger');
+    request.onsuccess = () => {
+      const db = request.result;
+      const get = db.transaction('transactions').objectStore('transactions').getAll();
+      get.onsuccess = () => { db.close(); resolve(get.result); };
+      get.onerror = () => reject(get.error);
+    };
+    request.onerror = () => reject(request.error);
+  }));
+  try {
+    await p.goto(base);
+    await p.getByRole('button', { name: '记一笔', exact: true }).waitFor();
+    await p.evaluate(async () => {
+      localStorage.setItem('worker-ledger-agent-config', JSON.stringify({ baseUrl: 'https://model.invalid/v1', model: 'fixture' }));
+      await new Promise((resolve, reject) => {
+        const request = indexedDB.open('worker-ledger');
+        request.onsuccess = () => {
+          const db = request.result;
+          const tx = db.transaction('transactions', 'readwrite');
+          const store = tx.objectStore('transactions');
+          store.clear();
+          const entry = { type: 'expense', categoryId: 'food', accountId: 'wechat', tags: [] };
+          store.put({ ...entry, id: 'old-breakfast', amount: 3000, occurredAt: '2020-01-01T02:00:00Z', note: '早餐' });
+          store.put({ ...entry, id: 'old-salary', type: 'income', amount: 500000, categoryId: 'salary', accountId: 'salary-card', occurredAt: '2020-08-01T02:00:00Z', note: '薪资' });
+          for (let i = 0; i < 60; i++) store.put({ ...entry, id: `recent-${i}`, amount: 10000 + i, occurredAt: new Date(Date.now() - i * 60000).toISOString(), note: `其他采购${i}` });
+          tx.oncomplete = () => { db.close(); resolve(); };
+          tx.onerror = () => reject(tx.error);
+        };
+        request.onerror = () => reject(request.error);
+      });
+    });
+    await p.reload();
+    await p.getByRole('link', { name: '流水', exact: true }).click();
+    await p.locator('#ledger-scope-filter').selectOption('all');
+    await p.getByRole('heading', { name: '62 笔流水', exact: true }).waitFor();
+    check(await p.locator('.ledger-list .transaction-row').count() === 50, 'full history rendered without a page limit');
+    await p.getByRole('button', { name: '下一页', exact: true }).click();
+    check(await p.locator('.ledger-list .transaction-row').count() === 12, 'history page two lost old records');
+    await p.locator('#ledger-search').fill('早饭');
+    await p.getByRole('heading', { name: '1 笔流水', exact: true }).waitFor();
+    check(await p.locator('[data-transaction-id="old-breakfast"]').count() === 2, 'history synonym query missed an older-than-30 bill');
+    await p.locator('#ledger-search').fill('30元');
+    await p.waitForFunction(() => document.querySelector('#ledger-search')?.value === '30元' && document.querySelector('.ledger-list .transaction-row')?.textContent.includes('早餐'));
+    await p.locator('#ledger-search').fill('');
+    await p.getByRole('heading', { name: '62 笔流水', exact: true }).waitFor();
+    await p.getByRole('button', { name: '记一笔', exact: true }).click();
+    await p.getByRole('spinbutton', { name: '¥ 金额', exact: true }).fill('30');
+    await p.getByRole('textbox', { name: '备注', exact: true }).fill('早饭');
+    let warning = '';
+    p.once('dialog', async dialog => { warning = dialog.message(); await dialog.dismiss(); });
+    await p.getByRole('button', { name: '保存这一笔', exact: true }).click();
+    check(warning.includes('2020-01-01') && warning.includes('历史相似'), 'save warning missed old synonym bill');
+    check((await read()).length === 62, 'cancelled duplicate was saved');
+    check(await p.getByRole('dialog').isVisible(), 'cancel discarded the entry form');
+    p.once('dialog', dialog => dialog.accept());
+    await p.locator('#transaction-form').evaluate(form => { form.requestSubmit(); form.requestSubmit(); });
+    await p.getByRole('dialog').waitFor({ state: 'hidden' });
+    check((await read()).length === 63, 'approved historical match or duplicate-submit guard failed');
+    await p.getByRole('link', { name: '智能助手', exact: true }).click();
+    const ask = async text => { await p.locator('#agent-input').fill(text); await p.getByRole('button', { name: '发送消息', exact: true }).click(); };
+    await ask('查询2020年1月早饭账单');
+    await p.getByText(/已查询完整本地历史，匹配 1 笔/).waitFor();
+    check(modelRequests === 0, 'explicit history query consumed a model request');
+    await p.getByRole('button', { name: '查看 2020-01-01 · 早餐 的原账单', exact: true }).click();
+    check(await p.getByRole('textbox', { name: '备注', exact: true }).inputValue() === '早餐', 'history source opened the wrong bill');
+    await p.getByRole('textbox', { name: '备注', exact: true }).fill('旧账修正');
+    await p.getByRole('button', { name: '保存修改', exact: true }).click();
+    await p.getByRole('dialog').waitFor({ state: 'hidden' });
+    await ask('查询2020年1月早饭账单');
+    await p.getByText(/已查询完整本地历史，匹配 0 笔/).waitFor();
+    check(modelRequests === 0, 'query after edit consumed a model request');
+    await ask('今天工资收入5000元，工资卡到账');
+    const draft = p.locator('[data-agent-draft-form]').last();
+    await draft.waitFor();
+    check(await draft.locator('[name="type"]').inputValue() === 'income', 'salary fixture must exercise the income branch');
+    p.once('dialog', dialog => dialog.dismiss());
+    await draft.getByRole('button', { name: /确认.*入账/ }).click();
+    check((await read()).length === 63, 'cancelled salary draft was written');
+    check(await draft.getByRole('button', { name: /确认.*入账/ }).isEnabled(), 'cancel left draft submission locked');
+    p.once('dialog', dialog => dialog.accept());
+    await draft.getByRole('button', { name: /确认.*入账/ }).click();
+    await p.getByText(/已写入账本/).waitFor();
+    check((await read()).length === 64, 'accepted salary synonym draft was not written');
+    await p.evaluate(async () => { await navigator.serviceWorker.ready; });
+    await context.setOffline(true);
+    await p.reload();
+    await p.locator('#agent-input').waitFor();
+    await ask('查询2020年8月工资收入');
+    await p.getByText(/2020-08-01 · 收入/).last().waitFor();
+    check(errors.length === 0, 'browser errors: ' + errors.join('; '));
+    return 'PASS: full-history paging, old-bill synonym search, amount search, cancel/accept manual and Agent duplicate warnings, original bill navigation, cache refresh after edit, zero model calls for history queries, offline history module, zero page errors';
+  } finally {
+    await context.close();
+  }
 }
