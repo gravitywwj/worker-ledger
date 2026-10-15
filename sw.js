@@ -1,14 +1,15 @@
-const CACHE_NAME = 'worker-ledger-v33';
+const CACHE_NAME = 'worker-ledger-v34';
 const APP_SHELL = [
   './',
   './src/product-prices.mjs',
   './src/product-ui.mjs',
   './src/product-backup.mjs',
   './src/transaction-history.mjs',
+  './src/transaction-reconciliation.mjs',
   './agent/periodic-review.mjs',
   './index.html',
-  './src/styles.css?v=21',
-  './src/app.js?v=37',
+  './src/styles.css?v=22',
+  './src/app.js?v=38',
   './assets/phosphor/style.css?v=1',
   './assets/phosphor/Phosphor.woff2',
   './manifest.webmanifest',
@@ -30,7 +31,7 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
   const requestUrl = new URL(event.request.url);
-  const isAppAsset = requestUrl.origin === self.location.origin && /\/(?:|index\.html|src\/(?:app\.js|styles\.css|transaction-history\.mjs|product-(?:backup|prices|ui)\.mjs)|sw\.js|manifest\.webmanifest|favicon\.svg|style\.css|Phosphor\.woff2)$/.test(requestUrl.pathname);
+  const isAppAsset = requestUrl.origin === self.location.origin && /\/(?:|index\.html|src\/(?:app\.js|styles\.css|transaction-(?:history|reconciliation)\.mjs|product-(?:backup|prices|ui)\.mjs)|sw\.js|manifest\.webmanifest|favicon\.svg|style\.css|Phosphor\.woff2)$/.test(requestUrl.pathname);
   const isOcrAsset = requestUrl.origin === self.location.origin && /^\/node_modules\/(?:tesseract\.js\/dist\/(?:tesseract\.esm\.min\.js|worker\.min\.js)|tesseract\.js-core\/tesseract-core-lstm\.wasm(?:\.js)?|@tesseract\.js-data\/chi_sim\/4\.0\.0_best_int\/chi_sim\.traineddata\.gz)$/.test(requestUrl.pathname);
   if (isOcrAsset) {
     event.respondWith((async () => {

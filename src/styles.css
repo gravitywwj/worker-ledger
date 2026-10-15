@@ -684,6 +684,21 @@ button.record-method-item:hover strong, button.record-method-item:hover > .ph { 
 .type-segment button.active { background: var(--surface); color: var(--primary); box-shadow: 0 1px 3px rgb(20 40 30 / 8%); }
 .type-segment button[data-type="expense"].active { color: var(--expense); }
 .dialog-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px; }
+.field-hint { margin: 10px 0; color: var(--ink-soft); font-size: 12px; line-height: 1.6; }
+.statement-details { margin: 16px 0; padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.statement-details > summary { min-height: 32px; cursor: pointer; font-weight: 650; }
+.statement-details[open] > summary { margin-bottom: 12px; }
+.statement-details > summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+.statement-list { padding: 0; list-style: none; }
+.statement-list li { padding: 10px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.statement-list p { margin: 4px 0; color: var(--ink-soft); }
+.transaction-note small { margin-left: 8px; color: var(--ink-soft); font-size: 11px; }
+.reconciliation-record { padding: 14px 0; overflow-wrap: anywhere; }
+.reconciliation-record h3 { margin-bottom: 8px; font-size: 14px; }
+.reconciliation-record p { margin: 4px 0; }
+.reconciliation-record p:not(:first-of-type) { color: var(--ink-soft); }
+.reconciliation-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }
+.reconciliation-actions button { min-height: 44px; }
 .amount-field { position: relative; }
 .amount-field > span { position: absolute; left: 13px; bottom: 10px; color: var(--ink-soft); }
 .amount-field .text-input { padding-left: 30px; font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }

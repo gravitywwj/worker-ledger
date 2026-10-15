@@ -5,6 +5,7 @@ import { normalizeBackup } from './product-backup.mjs';
 import { buildPeriodicReviewFacts, normalizePeriodicReviewPayload, periodicReviewPlaceholderIds } from '../agent/periodic-review.mjs';
 import { productRow, renderProductEditor, readProductEditor, updateProductPreviews, renderPriceSources } from './product-ui.mjs';
 import { buildTransactionHistoryIndex, searchTransactionHistory, findDuplicateTransactions, normalizeTransactionNote, parseHistoryQuery } from './transaction-history.mjs';
+import { PAYMENT_CHANNELS, normalizeTransactionDetails, statementEntry, statementIdentity, associateTransaction, parseTransactionRouting, statementHints, maskStatementReferences } from './transaction-reconciliation.mjs';
 
 const DB_NAME = 'worker-ledger';
 const DB_VERSION = 6;
@@ -312,20 +313,90 @@ function transactionHistoryIndex() {
   return transactionHistoryCache.index;
 }
 
-function confirmPossibleDuplicates(transactions) {
-  const results = findDuplicateTransactions(transactionHistoryIndex(), transactions);
-  if (!results.length) return true;
-  const details = results.slice(0, 4).flatMap(({ candidate, count, matches }) => {
-    const type = candidate.type === 'income' ? '收入' : '支出';
-    const lines = matches.map(({ transaction: existing, kind, draftMatch, reason }) => {
-      const note = String(existing.note || getCategory(existing.categoryId).label).replace(/\s+/g, ' ').slice(0, 32);
-      return `· ${draftMatch ? '本次草稿' : kind === 'possible_duplicate' ? '疑似重复' : '历史相似'}：${dateKey(existing.occurredAt)} ${type} ${money(existing.amount)} · ${note}（${reason}）`;
+function reconciliationSummary(transaction) {
+  const route = transaction.type === 'transfer' ? `${accountName(transaction.accountId)} → ${accountName(transaction.toAccountId)}` : transaction.accountId ? accountName(transaction.accountId) : '实际账户待确认';
+  return `<p><strong>${escapeHtml(dateKey(transaction.occurredAt))} · ${agentDraftTypeLabel(transaction.type)} · ${money(transaction.amount)}</strong></p>
+    <p>${escapeHtml(route)} · 渠道：${escapeHtml(transaction.paymentChannel || '未填写')}</p><p>${escapeHtml(transaction.note || '未填写备注')}</p>`;
+}
+
+function chooseReconciliation(candidate, matches, position, total) {
+  return new Promise((resolve) => {
+    const dialog = document.createElement('dialog');
+    dialog.className = 'app-dialog reconciliation-dialog';
+    dialog.setAttribute('aria-labelledby', 'reconciliation-title');
+    dialog.innerHTML = `<div class="dialog-content">
+      <div class="dialog-header"><div><h2 id="reconciliation-title">核对疑似重复流水</h2><p>第 ${position} / ${total} 笔。相似记录也可能是独立收支，请核对后选择。</p></div></div>
+      <section class="reconciliation-record"><h3>本次录入</h3>${reconciliationSummary(candidate)}</section>
+      <label class="field"><span>选择要核对的已有记录</span><select class="select-input" data-reconciliation-target>${matches.map(({ transaction, kind }, index) => `<option value="${index}">${kind === 'similar_history' ? '历史相似' : '疑似重复'} · ${escapeHtml(dateKey(transaction.occurredAt))} · ${money(transaction.amount)} · ${escapeHtml(accountName(transaction.accountId))} · ${escapeHtml(transaction.note || '无备注')}</option>`).join('')}</select></label>
+      <section class="reconciliation-record" data-reconciliation-existing></section>
+      <p class="field-hint" data-reconciliation-reason></p><p class="field-hint" data-reconciliation-impact></p>
+      <div class="reconciliation-actions">
+        <button class="primary-button" type="button" data-reconciliation="link">同一笔，补充来源</button>
+        <button class="secondary-button" type="button" data-reconciliation="correct">修正账户并关联</button>
+        <button class="secondary-button" type="button" data-reconciliation="new">另记一笔</button>
+        <button class="text-button" type="button" data-reconciliation="cancel">返回修改</button>
+      </div><p class="field-hint">补充来源保留原金额和账户，不重复计算收支。返回修改或关闭会取消本批核对。</p>
+    </div>`;
+    const select = dialog.querySelector('[data-reconciliation-target]');
+    const refresh = () => {
+      const match = matches[Number(select.value)];
+      const existing = match.transaction;
+      dialog.querySelector('[data-reconciliation-existing]').innerHTML = `<h3>已有记录</h3>${reconciliationSummary(existing)}`;
+      dialog.querySelector('[data-reconciliation-reason]').textContent = match.reason + (match.accountConflict ? '；两笔实际账户不同，请核对扣款或到账账户。' : '');
+      const sameAmount = candidate.amount === existing.amount;
+      const convertible = candidate.type === existing.type || candidate.type === 'transfer';
+      const canCorrect = sameAmount && convertible && !!candidate.accountId && (candidate.type !== 'transfer' || (!!candidate.toAccountId && candidate.toAccountId !== candidate.accountId));
+      const correctButton = dialog.querySelector('[data-reconciliation="correct"]');
+      correctButton.disabled = !canCorrect;
+      correctButton.textContent = candidate.type === 'transfer' && existing.type !== 'transfer' ? '改为内部转账并关联' : '修正账户并关联';
+      dialog.querySelector('[data-reconciliation="link"]').disabled = !sameAmount || (candidate.type !== existing.type && existing.type !== 'transfer');
+      dialog.querySelector('[data-reconciliation="new"]').disabled = matches.some((item) => item.sameStatement);
+      let impact = sameAmount ? '关联后不新增流水。' : '两笔金额不同，不能直接关联，请返回核对金额。';
+      if (canCorrect) {
+        const corrected = associateTransaction(existing, candidate, true);
+        const accountIds = [...new Set([existing.accountId, existing.toAccountId, corrected.accountId, corrected.toAccountId].filter(Boolean))];
+        const impactFor = (accountId, transaction) => (transaction.type === 'income' && transaction.accountId === accountId ? transaction.amount : 0)
+          - (['expense', 'transfer'].includes(transaction.type) && transaction.accountId === accountId ? transaction.amount : 0)
+          + (transaction.type === 'transfer' && transaction.toAccountId === accountId ? transaction.amount : 0);
+        const changes = accountIds.map((accountId) => ({ accountId, delta: impactFor(accountId, corrected) - impactFor(accountId, existing) })).filter((item) => item.delta);
+        if (changes.length) impact += ` 修正账户的余额影响：${changes.map(({ accountId, delta }) => `${accountName(accountId)} ${delta > 0 ? '增加' : '减少'} ${money(Math.abs(delta))}`).join('；')}。`;
+      }
+      if (matches.some((item) => item.sameStatement)) impact += ' 该来源交易单号已存在，不能另记一笔。';
+      dialog.querySelector('[data-reconciliation-impact]').textContent = impact;
+    };
+    const finish = (choice) => { dialog.close(); dialog.remove(); resolve(choice); };
+    dialog.addEventListener('cancel', (event) => { event.preventDefault(); finish(null); });
+    dialog.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-reconciliation]');
+      if (!button || button.disabled) return;
+      const mode = button.dataset.reconciliation;
+      finish(mode === 'cancel' ? null : { mode, targetId: matches[Number(select.value)].transaction.id });
     });
-    if (count > matches.length) lines.push(`另有 ${count - matches.length} 条历史相似记录`);
-    return lines;
+    select.addEventListener('change', refresh);
+    document.body.append(dialog); refresh(); dialog.showModal();
   });
-  if (results.length > 4) details.push(`另有 ${results.length - 4} 笔待入账流水存在相似记录`);
-  return window.confirm(`发现疑似重复或历史相似的流水：\n${details.join('\n')}\n\n不同日期的相似记录可能是正常的重复收支。\n按“确定”继续保存，按“取消”返回修改。`);
+}
+
+async function reconcileTransactions(transactions) {
+  const pending = new Map();
+  const resolvedIds = [];
+  for (const [position, candidate] of transactions.entries()) {
+    const previous = findDuplicateTransactions(transactionHistoryIndex(), [candidate], 8)[0]?.matches || [];
+    const current = findDuplicateTransactions(buildTransactionHistoryIndex([...pending.values()], state), [candidate], 8)[0]?.matches || [];
+    const matches = [...current, ...previous.filter((match) => !pending.has(match.transaction.id))];
+    if (!matches.length) {
+      pending.set(candidate.id, candidate); resolvedIds.push(candidate.id); continue;
+    }
+    const choice = await chooseReconciliation(candidate, matches, position + 1, transactions.length);
+    if (!choice) return null;
+    if (choice.mode === 'new') {
+      pending.set(candidate.id, candidate); resolvedIds.push(candidate.id); continue;
+    }
+    const original = pending.get(choice.targetId) || state.transactions.find((item) => item.id === choice.targetId);
+    pending.set(original.id, associateTransaction(original, candidate, choice.mode === 'correct'));
+    resolvedIds.push(original.id);
+  }
+  return { transactions: [...pending.values()], resolved: resolvedIds.map((transactionId) => pending.get(transactionId)) };
 }
 
 function monthLabel(dateInput = state.selectedMonth) {
@@ -797,6 +868,22 @@ async function persistTransaction(transaction, successMessage = '这笔流水已
 }
 async function persistTransactions(transactions, successMessage = '这些流水已保存。') {
   if (!transactions.length) return;
+  const replacing = new Set(transactions.map((item) => item.id));
+  const statementOwners = new Map();
+  for (const transaction of [...state.transactions.filter((item) => !item.deletedAt && !replacing.has(item.id)), ...transactions]) {
+    if (replacing.has(transaction.id)) {
+      if (!['expense', 'income', 'transfer'].includes(transaction.type) || !Number.isSafeInteger(transaction.amount) || transaction.amount <= 0) throw new Error('流水金额或类型无效。');
+      if (!state.accounts.some((item) => item.id === transaction.accountId)) throw new Error('请确认实际扣款或到账账户。');
+      if (transaction.type === 'transfer' && (!state.accounts.some((item) => item.id === transaction.toAccountId) || transaction.accountId === transaction.toAccountId)) throw new Error('内部转账需要两个不同的本人账户。');
+      Object.assign(transaction, normalizeTransactionDetails(transaction));
+    }
+    for (const entry of transaction.statementEntries || []) {
+      if (replacing.has(transaction.id) && entry.accountId && !state.accounts.some((account) => account.id === entry.accountId)) throw new Error('流水来源账户无效。');
+      const key = statementIdentity(entry);
+      if (key && statementOwners.has(key) && statementOwners.get(key) !== transaction.id) throw new Error('该来源账户的交易单号已存在，请关联原记录。');
+      if (key) statementOwners.set(key, transaction.id);
+    }
+  }
   const prepared = prepareProductTransactions(transactions, state.products, state.productCategories);
   if (!state.demo) await dbWriteBundle({ [STORES.transactions]: prepared.transactions, [STORES.products]: prepared.products, [STORES.productCategories]: prepared.productCategories });
   const ids = new Set(prepared.transactions.map((item) => item.id));
@@ -962,10 +1049,48 @@ function categoryOptions(type, selected = '') {
     .join('');
 }
 
-function accountOptions(selected = '') {
-  return activeAccounts()
+function accountOptions(selected = '', pending = false) {
+  return (pending ? `<option value="" ${selected ? '' : 'selected'}>待确认实际账户</option>` : '') + activeAccounts()
     .map((account) => `<option value="${escapeHtml(account.id)}" ${account.id === selected ? 'selected' : ''}>${escapeHtml(account.name)}</option>`)
     .join('');
+}
+
+function paymentChannelOptions(selected = '') {
+  return `<option value="">未填写</option>${PAYMENT_CHANNELS.map((channel) => `<option value="${channel}" ${channel === selected ? 'selected' : ''}>${channel}</option>`).join('')}`;
+}
+
+function renderStatementFields(transaction = {}, sourceText = '') {
+  const entries = transaction.statementEntries || [];
+  const hints = statementHints(sourceText);
+  return `<details class="statement-details"><summary>流水来源${entries.length ? `（${entries.length} 份）` : '（可选）'}</summary>
+    ${entries.length ? `<ul class="statement-list">${entries.map((entry) => `<li><strong>${escapeHtml(entry.source)}${entry.accountId ? ` · ${escapeHtml(accountName(entry.accountId))}` : ''}</strong>
+      <p>${escapeHtml(dateKey(entry.occurredAt))} · ${agentDraftTypeLabel(entry.type)} · ${money(entry.amount)}${entry.postedAt ? ` · 入账：${escapeHtml(dateKey(entry.postedAt))}` : ''}</p>
+      ${entry.externalId ? `<p>交易单号：${escapeHtml(entry.externalId)}</p>` : ''}<p>${escapeHtml(entry.note || '无原始说明')}</p></li>`).join('')}</ul><p class="field-hint">已有来源保留。下方填写另一份流水的信息后，保存时补充来源。</p>` : ''}
+    <div class="dialog-form-grid">
+      <label class="field"><span>流水来源名称</span><input class="text-input" name="statementSource" maxlength="80" value="${escapeHtml(hints.source)}" placeholder="如：微信账单、工资卡流水" /></label>
+      <label class="field"><span>来源账户（可选）</span><select class="select-input" name="statementAccountId"><option value="">未填写</option>${accountOptions()}</select></label>
+      <label class="field"><span>交易单号（可选）</span><input class="text-input" name="externalId" maxlength="120" value="${escapeHtml(hints.externalId)}" /></label>
+      <label class="field"><span>账单入账时间（可选）</span><input class="text-input" name="postedAt" type="datetime-local" /></label>
+      <label class="field field-span-2"><span>流水原始说明（可选）</span><textarea class="text-area" name="statementNote" maxlength="4000">${escapeHtml(sourceText)}</textarea></label>
+    </div><p class="field-hint">来源账户表示这份流水来自哪个账户。支付渠道和来源信息不直接改变余额。</p>
+  </details>`;
+}
+
+function readTransactionDetails(container, transaction, original = null) {
+  const read = (name) => container.querySelector(`[name="${name}"]`)?.value.trim() || '';
+  const paymentChannel = read('paymentChannel');
+  const source = read('statementSource');
+  const externalId = read('externalId');
+  if (externalId && !source) throw new Error('填写交易单号时，需要同时填写流水来源名称。');
+  const postedAt = read('postedAt') ? parseLocalDateTime(read('postedAt')) : '';
+  if (read('postedAt') && !postedAt) throw new Error('账单入账时间无效。');
+  const entries = original ? [...(original.statementEntries?.length ? original.statementEntries : [statementEntry(original)])] : [];
+  const hasSource = source || externalId || postedAt || read('statementNote') || read('statementAccountId');
+  if (!original || hasSource) entries.push(statementEntry({ ...transaction, paymentChannel }, {
+    ...(source ? { source } : {}), accountId: read('statementAccountId') || (source ? '' : transaction.accountId || ''), externalId, postedAt,
+    note: read('statementNote') || transaction.note || '',
+  }));
+  return normalizeTransactionDetails({ paymentChannel, statementEntries: entries });
 }
 
 function transactionRow(item, options = {}) {
@@ -983,7 +1108,7 @@ function transactionRow(item, options = {}) {
       <span class="transaction-type ${escapeHtml(item.type)}">${typeLabel}</span>
       <span class="transaction-title">${escapeHtml(category.label)}</span>
       <span class="transaction-account">${escapeHtml(accountName(item.accountId))}</span>
-      <span class="transaction-note">${escapeHtml(item.note || '未填写备注')}</span>
+      <span class="transaction-note">${escapeHtml(item.note || '未填写备注')}${item.paymentChannel ? `<small>渠道：${escapeHtml(item.paymentChannel)}</small>` : ''}${item.statementEntries?.length > 1 ? `<small>已关联 ${item.statementEntries.length} 份来源</small>` : ''}</span>
       <strong class="transaction-amount ${escapeHtml(item.type)}">${escapeHtml(signedMoney(item))}</strong>
       ${actions}
     </div>`;
@@ -1263,11 +1388,7 @@ function agentAmountFromText(text) {
 }
 
 function inferAgentType(text) {
-  if (/退款|退回|退还|返还|返款|返现/.test(text)) return 'income';
-  if (/转账|转到|转入|转出/.test(text)) return 'transfer';
-  if (/支出|消费|花费|付款|付了|买了|购买|充值|扣款|外卖|餐饮/.test(text)) return 'expense';
-  if (/收入|工资到账|薪资到账|工资收入|薪资收入|奖金到账|报销到账|退款到账|兼职收入|补贴到账|收到/.test(text)) return 'income';
-  return 'expense';
+  return parseTransactionRouting(text, activeAccounts()).type;
 }
 
 function rememberedAgentCategory(text, type) {
@@ -1327,32 +1448,6 @@ function inferAgentCategory(text, type) {
   return state.categories.find((category) => category.type === type)?.id || (type === 'income' ? 'other-income' : 'other');
 }
 
-function inferAgentAccount(text, excludedId = '', fallbackId = '') {
-  const normalized = text.toLowerCase();
-  const remembered = rememberedAgentAccount(text);
-  if (remembered?.accountId && activeAccounts().some((account) => account.id === remembered.accountId && account.id !== excludedId)) return remembered.accountId;
-  const aliases = [
-    ['农行工资卡', 'salary-card'],
-    ['微信', 'wechat'],
-    ['支付宝', 'alipay'],
-    ['工资卡', 'salary-card'],
-  ];
-  const matches = [];
-  for (const [label, accountId] of aliases) {
-    const index = normalized.indexOf(label.toLowerCase());
-    if (index >= 0 && accountId !== excludedId && activeAccounts().some((item) => item.id === accountId)) matches.push({ accountId, index });
-  }
-  for (const account of activeAccounts()) {
-    const index = normalized.indexOf(account.name.toLowerCase());
-    if (index >= 0 && account.id !== excludedId) matches.push({ accountId: account.id, index });
-  }
-  matches.sort((a, b) => a.index - b.index);
-  return matches[0]?.accountId
-    || activeAccounts().find((item) => item.id === fallbackId && item.id !== excludedId)?.id
-    || activeAccounts().find((item) => item.id !== excludedId)?.id
-    || '';
-}
-
 function inferAgentOccurredAt(text) {
   const date = new Date();
   if (/前天/.test(text)) date.setDate(date.getDate() - 2);
@@ -1409,7 +1504,7 @@ function resolveAgentAccountId(value, fallbackId = '') {
   const aliases = { 农行工资卡: 'salary-card', 工资卡: 'salary-card', 银行卡: 'salary-card' };
   const aliasId = aliases[raw];
   if (aliasId && activeAccounts().some((account) => account.id === aliasId)) return aliasId;
-  return activeAccounts().find((account) => account.id === fallbackId)?.id || activeAccounts()[0]?.id || '';
+  return activeAccounts().find((account) => account.id === fallbackId)?.id || '';
 }
 
 function normalizeAgentDraft(rawDraft = {}) {
@@ -1424,9 +1519,7 @@ function normalizeAgentDraft(rawDraft = {}) {
   const accountId = resolveAgentAccountId(accountValue);
   const occurredAt = new Date(rawDraft.occurredAt || Date.now());
   const resolvedToAccountId = resolveAgentAccountId(toAccountValue);
-  const toAccountId = type === 'transfer'
-    ? resolvedToAccountId !== accountId ? resolvedToAccountId : activeAccounts().find((item) => item.id !== accountId)?.id || ''
-    : '';
+  const toAccountId = type === 'transfer' && resolvedToAccountId !== accountId ? resolvedToAccountId : '';
   return {
     type,
     amountYuan,
@@ -1435,6 +1528,8 @@ function normalizeAgentDraft(rawDraft = {}) {
     toAccountId,
     occurredAt: Number.isNaN(occurredAt.getTime()) ? new Date().toISOString() : occurredAt.toISOString(),
     note: note || (type === 'income' ? '收入' : type === 'transfer' ? '账户转账' : '支出'),
+    ...normalizeTransactionDetails({ paymentChannel: rawDraft.paymentChannel }),
+    sourceText: String(rawDraft.sourceText || '').slice(0, 4000),
     items: normalizeProductItems(rawDraft.items || [], { amount: centsFromYuan(amountYuan), type }),
     tags: Array.isArray(rawDraft.tags) ? rawDraft.tags.map((tag) => String(tag).trim()).filter(Boolean).slice(0, 8) : [],
   };
@@ -1534,14 +1629,14 @@ function waterAndElectricityEachAmount(text) {
 }
 
 function buildLocalAgentDrafts(text) {
-  text = maskProductMeasurements(text);
   const drafts = [];
-  const groups = splitAgentTransactionGroups(text);
+  const groups = splitAgentTransactionGroups(text).map((group) => ({ ...group, body: maskStatementReferences(maskProductMeasurements(group.body)) }));
   let occurredAt = new Date().toISOString();
   let accountId = '';
   for (const group of groups) {
     if (group.dateText) occurredAt = inferAgentOccurredAt(group.dateText, occurredAt);
-    accountId = inferAgentAccount(`${group.raw} ${group.body}`, '', accountId);
+    const groupRouting = parseTransactionRouting(group.body, activeAccounts());
+    if (groupRouting.accountId) accountId = groupRouting.accountId;
     const waterEach = waterAndElectricityEachAmount(group.body);
     const detectedAmounts = agentAmountMatches(group.body);
     const amounts = waterEach
@@ -1559,14 +1654,17 @@ function buildLocalAgentDrafts(text) {
       const withoutAmount = clause.replace(/(?:[¥￥]\s*)?\d+(?:,\d{3})*(?:\.\d{1,2})?\s*(?:万|千)?\s*(?:元|块钱|块|人民币)?/, ' ');
       const clauseHint = inferAgentItemNote(withoutAmount);
       const hint = clauseHint || groupHint || inferAgentNote(group.body, groupType);
-      const type = inferAgentType(hasAgentSemanticText(withoutAmount) ? withoutAmount : hint || group.body) || groupType;
+      const routing = amounts.length === 1 ? groupRouting : parseTransactionRouting(clause, activeAccounts());
+      const type = routing.type === 'transfer' ? 'transfer' : inferAgentType(hasAgentSemanticText(withoutAmount) ? withoutAmount : hint || group.body) || groupType;
       const note = amount.noteOverride || hint;
       const draft = normalizeAgentDraft({
         type,
         amountYuan: amount.amountYuan,
         categoryId: type === 'transfer' ? 'transfer' : inferAgentCategory(note || group.body, type),
-        accountId: inferAgentAccount(group.body, '', accountId),
-        toAccountId: type === 'transfer' ? inferAgentAccount(group.body, accountId, '') : '',
+        accountId: routing.accountId || (!routing.paymentChannel ? accountId || rememberedAgentAccount(group.body)?.accountId : ''),
+        toAccountId: type === 'transfer' ? routing.toAccountId : '',
+        paymentChannel: routing.paymentChannel,
+        sourceText: group.raw,
         occurredAt,
         note,
         tags: ['Agent 记账'],
@@ -1895,7 +1993,7 @@ function localAgentResponse(text) {
   if (answer) return answer;
   const transactionIntent = /记|花|买|付|消费|购物|日用|支出|收入|工资|薪资|到账|奖金|报销|退款|转账|充值|会员|订阅|GPT|OpenAI|外卖|早餐|午饭|午餐|晚餐|地铁|公交|打车|房租|盒马|超市|买菜|家政|洗衣液|垃圾桶|枕头|锅|刀具|锅铲|水电|燃气|天然气|话费/.test(text);
   if (transactionIntent) {
-    const productEntry = parseProductEntry(text);
+    const productEntry = parseProductEntry(maskStatementReferences(text));
     if (productEntry?.error) return { kind: 'clarify', reply: productEntry.error };
     const drafts = buildLocalAgentDrafts(text);
     if (productEntry?.item && drafts.length === 1) drafts[0].items = normalizeProductItems([productEntry.item], { amount: centsFromYuan(drafts[0].amountYuan), type: drafts[0].type });
@@ -2082,7 +2180,8 @@ function toggleAgentVoiceInput() {
 function agentHistorySnapshot(item) {
   return { id: item.id, date: dateKey(item.occurredAt), occurredAt: item.occurredAt, type: item.type,
     amountYuan: yuanFromCents(item.amount), category: getCategory(item.categoryId).label,
-    account: accountName(item.accountId), note: item.note, tags: item.tags || [] };
+    account: accountName(item.accountId), note: item.note, tags: item.tags || [],
+    ...(item.paymentChannel ? { paymentChannel: item.paymentChannel } : {}) };
 }
 
 function ledgerHistoryQuery(text) {
@@ -2379,11 +2478,14 @@ function renderAgentDraftEntry(draft, index) {
         <label class="field"><span>类型</span><select class="select-input agent-draft-type" name="type"><option value="expense" ${draft.type === 'expense' ? 'selected' : ''}>支出</option><option value="income" ${draft.type === 'income' ? 'selected' : ''}>收入</option><option value="transfer" ${draft.type === 'transfer' ? 'selected' : ''}>转账</option></select></label>
         <label class="field"><span>金额</span><input class="text-input" name="amount" type="number" min="0.01" step="0.01" value="${number(draft.amountYuan)}" required /></label>
         <label class="field"><span>分类</span><select class="select-input agent-draft-category" name="categoryId">${categoryOptions(draft.type, draft.categoryId)}</select></label>
-        <label class="field"><span>账户</span><select class="select-input" name="accountId" required>${accountOptions(draft.accountId)}</select></label>
-        <label class="field agent-draft-transfer ${draft.type === 'transfer' ? '' : 'hidden'}"><span>转入账户</span><select class="select-input" name="toAccountId">${accountOptions(draft.toAccountId)}</select></label>
+        <label class="field"><span>实际扣款 / 到账账户</span><select class="select-input" name="accountId">${accountOptions(draft.accountId, true)}</select></label>
+        <label class="field agent-draft-transfer ${draft.type === 'transfer' ? '' : 'hidden'}"><span>本人转入账户</span><select class="select-input" name="toAccountId">${accountOptions(draft.toAccountId, true)}</select></label>
         <label class="field"><span>发生时间</span><input class="text-input" name="occurredAt" type="datetime-local" value="${escapeHtml(localDateTimeValue(draft.occurredAt))}" required /></label>
+        <label class="field"><span>支付 / 收款渠道（可选）</span><select class="select-input" name="paymentChannel">${paymentChannelOptions(draft.paymentChannel)}</select></label>
         <label class="field field-span-2"><span>备注</span><input class="text-input" name="note" value="${escapeHtml(draft.note)}" maxlength="80" /></label>
       </div>
+      <p class="field-hint">微信、支付宝支付可能实际走银行卡。账户不明时可先核对重复记录，另记一笔需确认实际账户。</p>
+      ${renderStatementFields(draft, draft.sourceText)}
       ${renderProductEditor(draft.items || [], state.products, state.productCategories)}
     </section>`;
 }
@@ -2395,7 +2497,8 @@ function renderAgentDraft(message) {
   const countLabel = `${drafts.length} 笔`;
   const summary = drafts.map((draft) => `${escapeHtml(groupDateLabel(draft.occurredAt))} · ${escapeHtml(draft.note || getCategory(draft.categoryId).label)} · ${money(centsFromYuan(draft.amountYuan))}`).join('；');
   if (message.draftStatus === 'committed') {
-    return `<div class="agent-draft-card committed"><div class="agent-draft-result">${icon('ph-check-circle')}<div><strong>已写入账本 · ${countLabel}</strong><span>${summary}</span></div></div><button class="text-button" type="button" data-view="ledger">查看流水 ${icon('ph-caret-right')}</button></div>`;
+    const resultLabel = message.linkedCount ? `已完成核对 · 新增 ${drafts.length - message.linkedCount} 笔，关联 ${message.linkedCount} 份来源` : `已写入账本 · ${countLabel}`;
+    return `<div class="agent-draft-card committed"><div class="agent-draft-result">${icon('ph-check-circle')}<div><strong>${resultLabel}</strong><span>${summary}</span></div></div><button class="text-button" type="button" data-view="ledger">查看流水 ${icon('ph-caret-right')}</button></div>`;
   }
   if (message.draftStatus === 'dismissed') return `<div class="agent-draft-card dismissed">${icon('ph-x-circle')}<span>这 ${countLabel} 草稿已放弃，没有写入账本。</span></div>`;
   return `
@@ -2646,9 +2749,7 @@ async function confirmAgentDraft(form) {
       if (!['expense', 'income', 'transfer'].includes(type)) throw new Error('请为每笔流水选择有效类型。');
       if (!(amount > 0)) throw new Error('每笔金额都需要大于 0。');
       if (!occurredAt) throw new Error('请选择每笔流水的有效发生时间。');
-      if (!accountId) throw new Error('请为每笔流水选择账户。');
-      if (type === 'transfer' && (!toAccountId || accountId === toAccountId)) throw new Error('请选择不同的转入账户。');
-      return {
+      const transaction = {
         type,
         amount,
         categoryId: type === 'transfer' ? 'transfer' : String(read(entry, 'categoryId')),
@@ -2659,6 +2760,7 @@ async function confirmAgentDraft(form) {
         items: normalizeProductItems(readProductEditor(entry), { amount, type }),
         tags: ['Agent 记账'],
       };
+      return { ...transaction, ...readTransactionDetails(entry, { ...transaction, source: 'agent' }) };
     });
     const now = new Date().toISOString();
     const transactions = drafts.map((draft) => ({
@@ -2668,12 +2770,13 @@ async function confirmAgentDraft(form) {
       createdAt: now,
       updatedAt: now,
     }));
-    if (!confirmPossibleDuplicates(transactions)) {
+    const reconciliation = await reconcileTransactions(transactions);
+    if (!reconciliation) {
       delete form.dataset.submitting;
       if (submitButton) submitButton.disabled = false;
       return;
     }
-    const committedDrafts = transactions.map((transaction) => ({
+    const committedDrafts = reconciliation.resolved.map((transaction) => ({
       type: transaction.type,
       amountYuan: yuanFromCents(transaction.amount),
       categoryId: transaction.categoryId,
@@ -2683,11 +2786,13 @@ async function confirmAgentDraft(form) {
       note: transaction.note,
       tags: transaction.tags,
       items: transaction.items || [],
+      paymentChannel: transaction.paymentChannel,
+      statementEntries: transaction.statementEntries || [],
     }));
-    await persistTransactions(transactions, `Agent ${transactions.length} 笔草稿已确认入账。`);
-    await updateAgentMessage(form.dataset.messageId, transactions.length === 1
-      ? { draft: committedDrafts[0], drafts: committedDrafts, draftStatus: 'committed' }
-      : { drafts: committedDrafts, draftStatus: 'committed' });
+    const addedCount = reconciliation.transactions.filter((transaction) => transactions.some((candidate) => candidate.id === transaction.id)).length;
+    await persistTransactions(reconciliation.transactions, `已核对 ${transactions.length} 笔草稿，关联来源不会重复计入收支。`);
+    await updateAgentMessage(form.dataset.messageId, { ...(transactions.length === 1 ? { draft: committedDrafts[0] } : {}),
+      drafts: committedDrafts, draftStatus: 'committed', linkedCount: transactions.length - addedCount });
     render();
     requestAnimationFrame(scrollAgentToLatest);
   } catch (error) {
@@ -2903,7 +3008,7 @@ function openTransactionDialog(transaction = null, prefill = {}) {
   const categoryId = prefill.categoryId || transaction?.categoryId
     || state.categories.find((category) => category.id === defaultCategoryId && category.type === type)?.id
     || state.categories.find((category) => category.type === type)?.id || '';
-  const accountId = prefill.accountId || transaction?.accountId || activeAccounts()[0]?.id || '';
+  const accountId = prefill.accountId || transaction?.accountId || '';
   const occurredAt = prefill.occurredAt || transaction?.occurredAt || new Date();
   const note = prefill.note ?? transaction?.note ?? '';
   const tags = Array.isArray(transaction?.tags) ? transaction.tags.join('，') : '';
@@ -2922,12 +3027,15 @@ function openTransactionDialog(transaction = null, prefill = {}) {
       <div class="dialog-form-grid">
         <label class="field amount-field"><span>¥</span><b class="field-label">金额</b><input class="text-input" name="amount" type="number" min="0.01" step="0.01" value="${escapeHtml(amount)}" placeholder="0.00" required autofocus /></label>
         <label class="field"><span>分类</span><select class="select-input" name="categoryId" id="transaction-category">${categoryOptions(type, categoryId)}</select></label>
-        <label class="field"><span>账户</span><select class="select-input" name="accountId" required>${accountOptions(accountId)}</select></label>
-        <label class="field ${type === 'transfer' ? '' : 'hidden'}" id="to-account-field"><span>转入账户</span><select class="select-input" name="toAccountId">${accountOptions(transaction?.toAccountId || '')}</select></label>
+        <label class="field"><span>实际扣款 / 到账账户</span><select class="select-input" name="accountId">${accountOptions(accountId, true)}</select></label>
+        <label class="field ${type === 'transfer' ? '' : 'hidden'}" id="to-account-field"><span>本人转入账户</span><select class="select-input" name="toAccountId">${accountOptions(transaction?.toAccountId || '', true)}</select></label>
         <label class="field"><span>发生时间</span><input class="text-input" name="occurredAt" type="datetime-local" value="${escapeHtml(localDateTimeValue(occurredAt))}" required /></label>
         <label class="field"><span>标签（可选）</span><input class="text-input" name="tags" value="${escapeHtml(tags)}" placeholder="如：工作日、固定支出" /></label>
+        <label class="field"><span>支付 / 收款渠道（可选）</span><select class="select-input" name="paymentChannel">${paymentChannelOptions(transaction?.paymentChannel || prefill.paymentChannel)}</select></label>
         <label class="field field-span-2"><span>备注</span><textarea class="text-area" name="note" placeholder="这笔钱花在了哪里，或来自哪里">${escapeHtml(note)}</textarea></label>
       </div>
+      <p class="field-hint">账户决定余额，渠道表示付款或收款方式。账户不明时可先查重；新增流水需确认实际账户。</p>
+      ${renderStatementFields(transaction || {})}
       ${renderProductEditor(transaction?.items || prefill.items || [], state.products, state.productCategories)}
       <div class="dialog-actions"><button class="secondary-button" type="button" data-action="close-dialog">取消</button><button class="primary-button" type="submit">${transaction ? '保存修改' : '保存这一笔'}</button></div>
     </form>`);
@@ -3462,7 +3570,6 @@ document.addEventListener('submit', async (event) => {
       const occurredAt = parseLocalDateTime(data.get('occurredAt'));
       if (!(amount > 0)) throw new Error('金额需要大于 0。');
       if (!occurredAt) throw new Error('请选择有效的发生时间。');
-      if (type === 'transfer' && data.get('accountId') === data.get('toAccountId')) throw new Error('转出和转入账户不能相同。');
       const now = new Date().toISOString();
       const transaction = {
         ...(original || {}),
@@ -3480,8 +3587,10 @@ document.addEventListener('submit', async (event) => {
         createdAt: original?.createdAt || now,
         updatedAt: now,
       };
-      if (!original && !confirmPossibleDuplicates([transaction])) return;
-      await persistTransaction(transaction, original ? '流水修改已保存。' : '这笔流水已保存。');
+      Object.assign(transaction, readTransactionDetails(form, transaction, original));
+      const reconciliation = original ? { transactions: [transaction] } : await reconcileTransactions([transaction]);
+      if (!reconciliation) return;
+      await persistTransactions(reconciliation.transactions, original ? '流水修改已保存。' : '已保存核对结果，关联来源不会重复计入收支。');
       closeDialog();
       return;
     }

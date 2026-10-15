@@ -1,5 +1,6 @@
 import { normalizeProductItems } from '../src/product-prices.mjs';
 import { normalizePeriodicReviewPayload } from './periodic-review.mjs';
+import { normalizeTransactionDetails, candidateIndexForDraft } from '../src/transaction-reconciliation.mjs';
 const VALID_KINDS = new Set(['transaction_draft', 'transaction_update', 'answer', 'clarify', 'memory_suggestion', 'periodic_review']);
 const VALID_TYPES = new Set(['expense', 'income', 'transfer']);
 
@@ -50,7 +51,10 @@ function normalizeDraft(rawDraft) {
   const occurredAt = asText(draft.occurredAt);
   const note = asText(draft.note);
   const tags = Array.isArray(draft.tags) ? draft.tags.map(asText).filter(Boolean).slice(0, 8) : [];
-  return { type, amountYuan, category, account, toAccount, occurredAt, note, tags, items: normalizeProductItems(draft.items || [], { amount: cents(amountYuan), type }) };
+  return { type, amountYuan, category, account, toAccount, occurredAt, note, tags,
+    ...(asText(draft.candidateId) ? { candidateId: asText(draft.candidateId) } : {}),
+    ...normalizeTransactionDetails({ paymentChannel: draft.paymentChannel }),
+    items: normalizeProductItems(draft.items || [], { amount: cents(amountYuan), type }) };
 }
 
 function normalizeUpdate(rawUpdate, context = {}) {
@@ -133,16 +137,28 @@ export function normalizeAgentResponse(rawReply, context = {}) {
   const rawDrafts = Array.isArray(parsed.drafts) ? parsed.drafts : parsed.draft ? [parsed.draft] : [];
   if (!rawDrafts.length) throw new Error('模型没有返回记账草稿。');
   const drafts = rawDrafts.map(normalizeDraft);
+  const remaining = [...(context.candidates || [])];
+  for (const draft of drafts) {
+    const index = candidateIndexForDraft(draft, remaining);
+    if (index < 0) continue;
+    const candidate = remaining.splice(index, 1)[0];
+    if (Object.hasOwn(candidate, 'accountHint')) {
+      draft.account = candidate.accountHint;
+      draft.toAccount = candidate.toAccountHint || '';
+      draft.paymentChannel = candidate.paymentChannel || '';
+      draft.sourceText = candidate.sourceText || '';
+      draft.type = candidate.typeHint;
+    }
+  }
   const errors = [];
   drafts.forEach((draft, index) => {
     const label = `第 ${index + 1} 笔`;
     if (!VALID_TYPES.has(draft.type)) errors.push(`${label}类型无效。`);
     if (!(draft.amountYuan > 0)) errors.push(`${label}金额无效。`);
     if (!draft.category) errors.push(`${label}缺少分类。`);
-    if (!draft.account) errors.push(`${label}缺少账户。`);
     if (!draft.occurredAt || Number.isNaN(new Date(draft.occurredAt).getTime())) errors.push(`${label}缺少合法发生时间。`);
     if (!draft.note) errors.push(`${label}缺少备注。`);
-    if (draft.type === 'transfer' && !draft.toAccount) errors.push(`${label}缺少转入账户。`);
+    if (draft.type === 'transfer' && draft.account && draft.account === draft.toAccount) errors.push(`${label}转出和转入账户不能相同。`);
   });
   const expectedAmounts = Array.isArray(context.candidates) ? context.candidates.map((item) => item.amountYuan) : [];
   if (expectedAmounts.length && !sameAmountMultiset(expectedAmounts, drafts.map((draft) => draft.amountYuan))) {

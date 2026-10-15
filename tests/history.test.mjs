@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { buildTransactionHistoryIndex, searchTransactionHistory, findDuplicateTransactions, normalizeTransactionNote, parseHistoryQuery } from '../src/transaction-history.mjs';
-import { executeAgentTool } from '../agent/tools.mjs';
+import { executeAgentTool, extractTransactionCandidates, validateTransactionDrafts } from '../agent/tools.mjs';
 import { normalizeAgentResponse } from '../agent/schemas.mjs';
 import { createLedgerAgent } from '../agent/agent.mjs';
+import { parseTransactionRouting, statementEntry, associateTransaction, normalizeTransactionDetails, statementIdentity, maskStatementReferences, statementHints } from '../src/transaction-reconciliation.mjs';
+import { normalizeBackup } from '../src/product-backup.mjs';
 
 const categories = [{ id: 'food', label: '餐饮', type: 'expense' }, { id: 'salary', label: '工资', type: 'income' }];
 const accounts = [{ id: 'wechat', name: '微信' }, { id: 'salary-card', name: '工资卡' }];
@@ -26,7 +28,6 @@ test('finds older-than-30 synonym matches across complete history and labels rec
   assert.equal(result[0].matches[0].transaction.id, 'old');
   assert.equal(result[0].matches[0].kind, 'similar_history');
   assert.equal(findDuplicateTransactions(index, [entry({ id: 'candidate', type: 'income' })]).length, 0);
-  assert.equal(findDuplicateTransactions(index, [entry({ id: 'candidate', type: 'transfer' })]).length, 0);
   assert.equal(findDuplicateTransactions(index, [entry()]).length, 0);
   assert.equal(findDuplicateTransactions(buildTransactionHistoryIndex([entry({ deletedAt: '2026-10-14' })]), [entry({ id: 'candidate' })]).length, 0);
 });
@@ -40,7 +41,134 @@ test('amount index keeps cent-level tolerance boundaries and finds duplicates in
   assert.equal(batch[0].matches[0].kind, 'possible_duplicate');
   const unnamed = entry({ note: '' });
   assert.equal(findDuplicateTransactions(buildTransactionHistoryIndex([unnamed]), [{ ...unnamed, id: 'new' }]).length, 1);
-  assert.equal(findDuplicateTransactions(buildTransactionHistoryIndex([unnamed]), [{ ...unnamed, id: 'new', accountId: 'other' }]).length, 0);
+  assert.equal(findDuplicateTransactions(buildTransactionHistoryIndex([unnamed]), [{ ...unnamed, id: 'new', accountId: 'other' }]).length, 1);
+});
+
+test('date, amount and type find sparse records across accounts without requiring notes or channels', () => {
+  const old = entry({ occurredAt: '2026-10-15T12:00:00Z' });
+  const index = buildTransactionHistoryIndex([old]);
+  const sparse = entry({ id: 'new', note: '', accountId: '', categoryId: '', occurredAt: '2026-10-15T16:00:00Z' });
+  assert.equal(findDuplicateTransactions(index, [sparse])[0].matches[0].kind, 'possible_duplicate');
+  assert.equal(findDuplicateTransactions(index, [{ ...sparse, occurredAt: '2026-10-18T12:00:00Z' }]).length, 1);
+  assert.equal(findDuplicateTransactions(index, [{ ...sparse, occurredAt: '2026-10-19T12:00:00Z' }]).length, 0);
+  assert.equal(findDuplicateTransactions(index, [{ ...sparse, amount: 2801 }]).length, 0);
+  assert.equal(findDuplicateTransactions(index, [{ ...sparse, type: 'income' }]).length, 0);
+  const crossAccount = findDuplicateTransactions(index, [{ ...sparse, accountId: 'salary-card' }]);
+  assert.equal(crossAccount[0].matches[0].accountConflict, true);
+});
+
+test('source transaction IDs match all dates, stay scoped, and expose conflicting amounts', () => {
+  const old = entry({ note: '' });
+  old.statementEntries = [statementEntry(old, { source: '微信账单', accountId: 'wechat', externalId: 'WX-123' })];
+  const candidate = entry({ id: 'new', note: '', occurredAt: '2026-10-15T12:00:00Z' });
+  candidate.statementEntries = [statementEntry(candidate, { source: '微信流水', accountId: 'wechat', externalId: 'WX-123' })];
+  const index = buildTransactionHistoryIndex([old]);
+  assert.equal(findDuplicateTransactions(index, [candidate])[0].matches[0].sameStatement, true);
+  assert.equal(findDuplicateTransactions(index, [{ ...candidate, amount: 9999 }])[0].matches[0].difference, 7199);
+  for (const changes of [{ source: '支付宝账单' }, { accountId: 'another-wallet' }]) {
+    const other = { ...candidate, statementEntries: [{ ...candidate.statementEntries[0], ...changes }] };
+    assert.equal(findDuplicateTransactions(index, [other]).length, 0);
+  }
+  assert.equal(searchTransactionHistory(index, { keyword: 'WX-123' }).count, 1);
+});
+
+test('transfer legs can attach as evidence while transfers stay outside income and expense totals', () => {
+  const transfer = entry({ type: 'transfer', categoryId: 'transfer', amount: 20000, note: '银行卡向微信零钱充值', accountId: 'salary-card', toAccountId: 'wechat' });
+  const leg = entry({ id: 'incoming', type: 'income', amount: 20000, note: '充值到账' });
+  const index = buildTransactionHistoryIndex([transfer]);
+  assert.equal(findDuplicateTransactions(index, [leg])[0].matches[0].transferLeg, true);
+  assert.equal(findDuplicateTransactions(index, [{ ...leg, type: 'expense', note: '购物' }]).length, 0);
+  assert.equal(findDuplicateTransactions(index, [{ ...leg, note: '', accountId: '' }])[0].matches[0].transferLeg, true);
+  const attached = associateTransaction(transfer, leg);
+  assert.equal(attached.type, 'transfer');
+  assert.equal(attached.id, transfer.id);
+  assert.equal(attached.statementEntries.length, 2);
+  const result = searchTransactionHistory(buildTransactionHistoryIndex([attached]));
+  assert.equal(result.incomeAmount, 0); assert.equal(result.expenseAmount, 0); assert.equal(result.transferAmount, 20000);
+  assert.throws(() => associateTransaction(transfer, leg, true), /不能覆盖内部转账/);
+  assert.throws(() => associateTransaction(leg, transfer), /修正为内部转账/);
+  assert.equal(associateTransaction(leg, transfer, true).type, 'transfer');
+});
+
+test('linking preserves the original transaction and source descriptions; correction changes only confirmed account routing', () => {
+  const old = entry({ note: '银行卡流水里的午餐', items: [{ preserved: true }] });
+  const incoming = entry({ id: 'new', accountId: 'salary-card', paymentChannel: '微信', note: '微信账单里的午餐', updatedAt: '2026-10-15' });
+  const linked = associateTransaction(old, incoming);
+  assert.equal(linked.id, old.id); assert.equal(linked.accountId, 'wechat');
+  assert.equal(linked.paymentChannel, '微信');
+  assert.deepEqual(linked.items, old.items);
+  assert.deepEqual(linked.statementEntries.map((item) => item.note), [old.note, incoming.note]);
+  assert.equal(old.statementEntries, undefined);
+  const corrected = associateTransaction(old, incoming, true);
+  assert.equal(corrected.accountId, 'salary-card');
+  assert.equal(corrected.note, old.note); assert.equal(corrected.occurredAt, old.occurredAt);
+  assert.equal(corrected.statementEntries.find((item) => item.source === '修正前记录').accountId, 'wechat');
+  assert.throws(() => associateTransaction(old, { ...incoming, amount: 1 }), /金额不同/);
+  assert.throws(() => associateTransaction(old, { ...incoming, accountId: '' }, true), /确认实际账户/);
+  const identified = { ...incoming, statementEntries: [statementEntry(incoming, { source: '微信账单', externalId: 'WX-1' })] };
+  assert.equal(associateTransaction(associateTransaction(old, identified), identified).statementEntries.length, 2);
+});
+
+test('funding accounts differ from payment channels and owned transfers differ from merchant payments', () => {
+  const available = [...accounts, { id: 'alipay', name: '支付宝', type: 'payment' }];
+  assert.deepEqual(parseTransactionRouting('微信支付午餐30元，银行卡扣款', available), { type: 'expense', accountId: 'salary-card', toAccountId: '', paymentChannel: '微信' });
+  assert.equal(parseTransactionRouting('微信零钱支付午餐30元', available).accountId, 'wechat');
+  assert.equal(parseTransactionRouting('支付宝支付30元', available).accountId, '');
+  assert.equal(parseTransactionRouting('支出30元', available).accountId, '');
+  assert.equal(parseTransactionRouting('收到微信扣款通知，银行卡支出30元', available).type, 'expense');
+  for (const input of ['银行卡给微信零钱充值200元', '微信零钱充值200元，从银行卡扣款']) {
+    const routing = parseTransactionRouting(input, available);
+    assert.equal(routing.type, 'transfer'); assert.equal(routing.accountId, 'salary-card'); assert.equal(routing.toAccountId, 'wechat');
+  }
+  const withdrawal = parseTransactionRouting('微信零钱提现到银行卡200元', available);
+  assert.equal(withdrawal.type, 'transfer'); assert.equal(withdrawal.accountId, 'wechat'); assert.equal(withdrawal.toAccountId, 'salary-card');
+  for (const input of ['微信给商家转账30元，银行卡扣款', '银行卡充值话费50元', '微信给朋友转账30元', '微信给张三转账30元，银行卡扣款', '微信给张三充值200元，银行卡扣款']) assert.equal(parseTransactionRouting(input, available).type, 'expense');
+  const pendingTopup = parseTransactionRouting('微信零钱充值到账200元', available);
+  assert.equal(pendingTopup.type, 'transfer'); assert.equal(pendingTopup.accountId, ''); assert.equal(pendingTopup.toAccountId, 'wechat');
+  assert.equal(parseTransactionRouting('微信转账退回160元', available).type, 'income');
+  const twoBanks = [...available, { id: 'second-bank', name: '另一张卡', type: 'bank' }];
+  assert.equal(parseTransactionRouting('微信支付，银行卡扣款30元', twoBanks).accountId, '');
+});
+
+test('draft preprocessing masks order numbers, retains original evidence and leaves unknown funding accounts pending', () => {
+  const context = { today: '2026-10-15', availableAccounts: accounts, availableCategories: categories };
+  const input = '今天微信账单支出30元，交易单号202610150000001，银行卡扣款';
+  const candidates = extractTransactionCandidates(input, context);
+  assert.deepEqual(candidates.map((candidate) => candidate.amountYuan), [30]);
+  assert.equal(candidates[0].accountHint, '工资卡'); assert.equal(candidates[0].sourceText, input);
+  assert.ok(!maskStatementReferences(input).includes('202610150000001'));
+  const payload = { kind: 'transaction_draft', reply: '核对', drafts: [{ type: 'expense', amountYuan: 30, category: '餐饮', account: '微信', occurredAt: '2026-10-15', note: '午餐' }] };
+  const normalized = normalizeAgentResponse(payload, { candidates });
+  assert.equal(normalized.drafts[0].account, '工资卡');
+  const pending = normalizeAgentResponse(payload, { candidates: extractTransactionCandidates('今天微信支付30元', context) });
+  assert.equal(pending.drafts[0].account, ''); assert.equal(pending.drafts[0].paymentChannel, '微信');
+  assert.equal(statementHints('微信账单交易单号WX-1，另一笔交易单号WX-2').externalId, '');
+});
+
+test('same-amount model drafts bind to their source candidate IDs instead of response order', () => {
+  const context = { today: '2026-10-15', availableAccounts: accounts, availableCategories: categories };
+  const candidates = extractTransactionCandidates('10月14日，微信零钱午餐30元；10月15日，银行卡扣款30元', context);
+  const draft = { type: 'expense', amountYuan: 30, category: '餐饮', account: '', toAccount: '', occurredAt: '2026-10-15', note: '午餐' };
+  const payload = { kind: 'transaction_draft', reply: '核对', drafts: [{ ...draft, candidateId: candidates[1].candidateId }, { ...draft, candidateId: candidates[0].candidateId }] };
+  const normalized = normalizeAgentResponse(payload, { candidates });
+  assert.deepEqual(normalized.drafts.map((item) => item.account), ['工资卡', '微信']);
+  assert.deepEqual(normalized.drafts.map((item) => item.sourceText), [candidates[1].sourceText, candidates[0].sourceText]);
+  assert.throws(() => normalizeAgentResponse({ ...payload, drafts: [draft, draft] }, { candidates }), /candidateId/);
+  assert.equal(validateTransactionDrafts({ drafts: [draft, draft] }, { candidates, ledgerContext: context }).valid, false);
+});
+
+test('backup retains legacy shapes and validates new source fields, references and shared transaction IDs', () => {
+  const old = entry();
+  const backup = { version: 2, transactions: [old], accounts, categories };
+  assert.equal(Object.hasOwn(normalizeBackup(backup).transactions[0], 'statementEntries'), false);
+  const detailed = { ...old, paymentChannel: '微信', statementEntries: [statementEntry(old, { source: '微信账单', externalId: 'WX-001' })] };
+  const normalized = normalizeBackup({ ...backup, transactions: [detailed] }).transactions[0];
+  assert.equal(normalized.statementEntries[0].externalId, 'WX-001');
+  assert.throws(() => normalizeTransactionDetails({ paymentChannel: '无效渠道' }), /渠道/);
+  assert.throws(() => normalizeTransactionDetails({ statementEntries: [{ ...detailed.statementEntries[0], postedAt: 'not a date' }] }), /日期/);
+  assert.throws(() => normalizeBackup({ ...backup, transactions: [{ ...detailed, statementEntries: [{ ...detailed.statementEntries[0], accountId: 'missing' }] }] }), /来源账户/);
+  assert.throws(() => normalizeBackup({ ...backup, transactions: [detailed, { ...detailed, id: 'second' }] }), /交易单号/);
+  assert.notEqual(statementIdentity(detailed.statementEntries[0]), statementIdentity({ ...detailed.statementEntries[0], accountId: 'salary-card' }));
 });
 
 test('history query totals include every match while pages are bounded and edits/deletes change results', () => {

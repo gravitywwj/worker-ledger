@@ -29,6 +29,7 @@ export async function runBrowserAcceptance(page, base) {
   check((await read('products')).length===0,'v6 product store missing');
   await p.getByRole('button',{name:'记一笔',exact:true}).click();
   await p.getByRole('spinbutton',{name:'¥ 金额',exact:true}).fill('105');
+  await p.locator('#transaction-form [name="accountId"]').selectOption('alipay');
   await p.getByRole('textbox',{name:'发生时间',exact:true}).fill('2020-01-01T12:00');
   await p.getByRole('textbox',{name:'备注',exact:true}).fill('历史酒');
   await p.getByText('商品明细与单价（可选）',{exact:true}).click();
@@ -50,6 +51,7 @@ export async function runBrowserAcceptance(page, base) {
   const draft=p.locator('[data-agent-draft-form]');
   check(await draft.locator('[data-agent-draft-entry]').count()===1,'spec numbers became money');
   check(await draft.getByRole('spinbutton',{name:'包装数量',exact:true}).inputValue()==='2','quantity lost in draft');
+  await draft.locator('[name="accountId"]').selectOption('alipay');
   await draft.getByRole('button',{name:/确认.*入账/}).click();
   await p.getByText(/已写入账本/).waitFor();
   check((await read('transactions')).length===43,'draft not committed');
@@ -160,14 +162,17 @@ export async function runHistoryAcceptance(page, base) {
     await p.getByRole('button', { name: '记一笔', exact: true }).click();
     await p.getByRole('spinbutton', { name: '¥ 金额', exact: true }).fill('30');
     await p.getByRole('textbox', { name: '备注', exact: true }).fill('早饭');
-    let warning = '';
-    p.once('dialog', async dialog => { warning = dialog.message(); await dialog.dismiss(); });
+    await p.locator('#transaction-form [name="accountId"]').selectOption('wechat');
     await p.getByRole('button', { name: '保存这一笔', exact: true }).click();
+    const review = p.locator('.reconciliation-dialog');
+    await review.waitFor();
+    const warning = await review.innerText();
     check(warning.includes('2020-01-01') && warning.includes('历史相似'), 'save warning missed old synonym bill');
+    await review.getByRole('button', { name: '返回修改', exact: true }).click();
     check((await read()).length === 62, 'cancelled duplicate was saved');
     check(await p.getByRole('dialog').isVisible(), 'cancel discarded the entry form');
-    p.once('dialog', dialog => dialog.accept());
     await p.locator('#transaction-form').evaluate(form => { form.requestSubmit(); form.requestSubmit(); });
+    await review.getByRole('button', { name: '另记一笔', exact: true }).click();
     await p.getByRole('dialog').waitFor({ state: 'hidden' });
     check((await read()).length === 63, 'approved historical match or duplicate-submit guard failed');
     await p.getByRole('link', { name: '智能助手', exact: true }).click();
@@ -180,19 +185,19 @@ export async function runHistoryAcceptance(page, base) {
     await p.getByRole('textbox', { name: '备注', exact: true }).fill('旧账修正');
     await p.getByRole('button', { name: '保存修改', exact: true }).click();
     await p.getByRole('dialog').waitFor({ state: 'hidden' });
-    await ask('查询2020年1月早饭账单');
-    await p.getByText(/已查询完整本地历史，匹配 0 笔/).waitFor();
+    await ask('查询2020年1月旧账修正账单');
+    await p.getByRole('button', { name: '查看 2020-01-01 · 旧账修正 的原账单', exact: true }).waitFor();
     check(modelRequests === 0, 'query after edit consumed a model request');
     await ask('今天工资收入5000元，工资卡到账');
     const draft = p.locator('[data-agent-draft-form]').last();
     await draft.waitFor();
     check(await draft.locator('[name="type"]').inputValue() === 'income', 'salary fixture must exercise the income branch');
-    p.once('dialog', dialog => dialog.dismiss());
     await draft.getByRole('button', { name: /确认.*入账/ }).click();
+    await review.getByRole('button', { name: '返回修改', exact: true }).click();
     check((await read()).length === 63, 'cancelled salary draft was written');
     check(await draft.getByRole('button', { name: /确认.*入账/ }).isEnabled(), 'cancel left draft submission locked');
-    p.once('dialog', dialog => dialog.accept());
     await draft.getByRole('button', { name: /确认.*入账/ }).click();
+    await review.getByRole('button', { name: '另记一笔', exact: true }).click();
     await p.getByText(/已写入账本/).waitFor();
     check((await read()).length === 64, 'accepted salary synonym draft was not written');
     await p.evaluate(async () => { await navigator.serviceWorker.ready; });
@@ -203,6 +208,143 @@ export async function runHistoryAcceptance(page, base) {
     await p.getByText(/2020-08-01 · 收入/).last().waitFor();
     check(errors.length === 0, 'browser errors: ' + errors.join('; '));
     return 'PASS: full-history paging, old-bill synonym search, amount search, cancel/accept manual and Agent duplicate warnings, original bill navigation, cache refresh after edit, zero model calls for history queries, offline history module, zero page errors';
+  } finally {
+    await context.close();
+  }
+}
+
+export async function runReconciliationAcceptance(page, base) {
+  const context = await page.context().browser().newContext({ viewport: { width: 1280, height: 900 }, timezoneId: 'Asia/Hong_Kong' });
+  const p = await context.newPage();
+  const errors = [];
+  const check = (value, message) => { if (!value) throw new Error(message); };
+  p.on('pageerror', error => errors.push(error.message));
+  let modelRequests = 0;
+  await p.route('**/api/agent/chat', route => { modelRequests += 1; return route.abort(); });
+  const read = async () => p.evaluate(async () => new Promise((resolve, reject) => {
+    const request = indexedDB.open('worker-ledger');
+    request.onsuccess = () => {
+      const db = request.result, get = db.transaction('transactions').objectStore('transactions').getAll();
+      get.onsuccess = () => { db.close(); resolve(get.result); }; get.onerror = () => reject(get.error);
+    };
+    request.onerror = () => reject(request.error);
+  }));
+  const review = p.locator('.reconciliation-dialog');
+  const manual = async (amount, date, { accountId = '', note = '', channel = '' } = {}) => {
+    await p.getByRole('link', { name: '首页', exact: true }).click();
+    await p.getByRole('button', { name: '记一笔', exact: true }).click();
+    const form = p.locator('#transaction-form');
+    await form.locator('[name="amount"]').fill(String(amount));
+    await form.locator('[name="occurredAt"]').fill(date);
+    await form.locator('[name="accountId"]').selectOption(accountId);
+    await form.locator('[name="note"]').fill(note);
+    await form.locator('[name="paymentChannel"]').selectOption(channel);
+    return form;
+  };
+  const submit = form => form.getByRole('button', { name: '保存这一笔', exact: true }).click();
+  const ask = async text => {
+    await p.getByRole('link', { name: '智能助手', exact: true }).click();
+    await p.locator('#agent-input').fill(text);
+    await p.getByRole('button', { name: '发送消息', exact: true }).click();
+    return p.locator('[data-agent-draft-form]').last();
+  };
+  try {
+    await p.goto(base);
+    await p.getByRole('button', { name: '记一笔', exact: true }).waitFor();
+    await p.evaluate(async () => new Promise((resolve, reject) => {
+      const request = indexedDB.open('worker-ledger');
+      request.onsuccess = () => {
+        const db = request.result, tx = db.transaction('transactions', 'readwrite'), store = tx.objectStore('transactions');
+        store.clear();
+        const defaults = { type: 'expense', categoryId: 'food', tags: [], source: 'manual' };
+        store.put({ ...defaults, id: 'bank-expense', amount: 3000, accountId: 'salary-card', note: '', occurredAt: '2026-10-15T04:00:00Z' });
+        store.put({ ...defaults, id: 'wrong-wallet', amount: 4500, accountId: 'wechat', note: '咖啡', occurredAt: '2026-10-14T04:00:00Z' });
+        store.put({ ...defaults, id: 'owned-transfer', type: 'transfer', categoryId: 'transfer', amount: 20000, accountId: 'salary-card', toAccountId: 'wechat', note: '微信零钱充值', occurredAt: '2026-10-15T04:00:00Z' });
+        tx.oncomplete = () => { db.close(); resolve(); }; tx.onerror = () => reject(tx.error);
+      };
+      request.onerror = () => reject(request.error);
+    }));
+    await p.reload();
+    let form = await manual(30, '2026-10-15T12:00');
+    await submit(form);
+    await review.waitFor();
+    check((await review.innerText()).includes('实际账户待确认'), 'sparse entry did not reach duplicate review');
+    await p.screenshot({ path: 'output/playwright/reconciliation-desktop.png' });
+    await p.setViewportSize({ width: 375, height: 812 });
+    check(await review.evaluate(dialog => dialog.scrollWidth <= dialog.clientWidth + 1), 'reconciliation overflows mobile dialog');
+    await p.screenshot({ path: 'output/playwright/reconciliation-mobile.png' });
+    await p.setViewportSize({ width: 1280, height: 900 });
+    await review.getByRole('button', { name: '同一笔，补充来源', exact: true }).click();
+    await p.locator('#app-dialog').waitFor({ state: 'hidden' });
+    let rows = await read();
+    check(rows.length === 3 && rows.find(row => row.id === 'bank-expense').accountId === 'salary-card', 'linking sparse entry changed balance or added a row');
+    check(rows.find(row => row.id === 'bank-expense').statementEntries.length === 2, 'sparse source evidence was lost');
+
+    form = await manual(45, '2026-10-14T12:00', { accountId: 'salary-card', note: '咖啡', channel: '微信' });
+    await submit(form);
+    await review.waitFor();
+    check((await review.locator('[data-reconciliation-impact]').innerText()).includes('余额影响'), 'account correction lacks balance preview');
+    await review.getByRole('button', { name: '修正账户并关联', exact: true }).click();
+    await p.locator('#app-dialog').waitFor({ state: 'hidden' });
+    rows = await read();
+    check(rows.length === 3 && rows.find(row => row.id === 'wrong-wallet').accountId === 'salary-card', 'account correction duplicated the expense');
+    check(rows.find(row => row.id === 'wrong-wallet').paymentChannel === '微信', 'payment channel was lost');
+
+    await p.getByRole('link', { name: '智能助手', exact: true }).click();
+    let draft = await ask('10月15日，微信零钱充值到账200元');
+    await draft.waitFor();
+    check(await draft.locator('[name="type"]').inputValue() === 'transfer', 'wallet topup was mistaken for income or expense');
+    check(await draft.locator('[name="accountId"]').inputValue() === '', 'topup invented a source bank account');
+    await draft.getByRole('button', { name: /确认.*入账/ }).click();
+    await review.getByRole('button', { name: '同一笔，补充来源', exact: true }).click();
+    await p.getByText(/已完成核对 · 新增 0 笔/).waitFor();
+    rows = await read();
+    check(rows.length === 3 && rows.every(row => row.type !== 'income'), 'wallet topup double-counted income');
+
+    form = await manual(11, '2020-01-01T12:00', { accountId: 'salary-card', note: '历史消费' });
+    await form.locator('.statement-details > summary').click();
+    await form.locator('[name="statementSource"]').fill('微信账单');
+    await form.locator('[name="statementAccountId"]').selectOption('wechat');
+    await form.locator('[name="externalId"]').fill('WX-0007');
+    await submit(form);
+    await p.locator('#app-dialog').waitFor({ state: 'hidden' });
+    form = await manual(11, '2026-10-15T12:00');
+    await form.locator('.statement-details > summary').click();
+    await form.locator('[name="statementSource"]').fill('微信流水');
+    await form.locator('[name="statementAccountId"]').selectOption('wechat');
+    await form.locator('[name="externalId"]').fill('WX-0007');
+    await submit(form);
+    await review.waitFor();
+    check(await review.getByRole('button', { name: '另记一笔', exact: true }).isDisabled(), 'same source transaction ID allowed a second entry');
+    await review.getByRole('button', { name: '同一笔，补充来源', exact: true }).click();
+    await p.locator('#app-dialog').waitFor({ state: 'hidden' });
+    check((await read()).length === 4, 'cross-date ID reconciliation created a duplicate');
+
+    const before = JSON.stringify(await read());
+    draft = await ask('10月15日，微信零钱支出30元；10月14日，银行卡扣款45元');
+    await draft.waitFor();
+    check(await draft.locator('[data-agent-draft-entry]').count() === 2, 'batch fixture did not produce two drafts');
+    await draft.getByRole('button', { name: /确认.*入账/ }).click();
+    await review.getByRole('button', { name: '修正账户并关联', exact: true }).click();
+    await review.getByRole('button', { name: '返回修改', exact: true }).click();
+    check(JSON.stringify(await read()) === before, 'cancelling the second draft persisted a partial batch');
+    check(await draft.getByRole('button', { name: /确认.*入账/ }).isEnabled(), 'cancelled draft stayed locked');
+
+    form = await manual(99, '2026-10-15T12:00', { note: '新支出' });
+    await submit(form);
+    await p.getByText('请确认实际扣款或到账账户。', { exact: true }).waitFor();
+    check((await read()).length === 4, 'entry without actual account was saved');
+    await form.locator('[name="accountId"]').selectOption('salary-card');
+    await submit(form);
+    await p.locator('#app-dialog').waitFor({ state: 'hidden' });
+    check((await read()).length === 5, 'confirmed missing account could not be saved');
+    check(modelRequests === 0, 'local reconciliation consumed a model call');
+    await p.evaluate(async () => { await navigator.serviceWorker.ready; });
+    await context.setOffline(true);
+    await p.reload();
+    await p.getByRole('button', { name: '记一笔', exact: true }).waitFor();
+    check((await read()).length === 5 && errors.length === 0, 'offline reload or page errors: ' + errors.join('; '));
+    return 'PASS: sparse duplicate link, cross-account correction, transfer source attachment, scoped transaction IDs, batch cancel rollback, pending account guard, desktop/mobile layout, offline reload, zero model calls';
   } finally {
     await context.close();
   }

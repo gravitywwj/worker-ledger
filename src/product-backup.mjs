@@ -1,4 +1,5 @@
 import { normalizeProductItems, PRODUCT_UNITS, DEFAULT_PRODUCT_CATEGORIES } from './product-prices.mjs';
+import { normalizeTransactionDetails, statementIdentity } from './transaction-reconciliation.mjs';
 export function normalizeBackup(data) {
   if (!data || typeof data !== 'object') throw new Error('文件内容不是有效备份。');
   if (data.version !== undefined && ![1, 2, 3].includes(data.version)) throw new Error('不支持这个备份版本，请使用兼容版本导出。');
@@ -20,17 +21,25 @@ export function normalizeBackup(data) {
   for (const product of products) {
     if (typeof product.name !== 'string' || !product.name.trim() || !productCategories.some((item) => item.id === product.productCategoryId) || (product.aliases !== undefined && (!Array.isArray(product.aliases) || product.aliases.some((alias) => typeof alias !== 'string')))) throw new Error('商品目录或品类引用无效。');
   }
+  const statementOwners = new Map();
   const transactions = data.transactions.map((transaction) => {
     if (!Number.isSafeInteger(transaction.amount) || transaction.amount <= 0 || !['expense', 'income', 'transfer'].includes(transaction.type) || typeof transaction.occurredAt !== 'string' || Number.isNaN(Date.parse(transaction.occurredAt))) throw new Error('流水金额、类型或日期无效。');
     if (!data.accounts.some((item) => item.id === transaction.accountId) || (transaction.type === 'transfer' && (!data.accounts.some((item) => item.id === transaction.toAccountId) || transaction.accountId === transaction.toAccountId))) throw new Error('流水账户引用无效。');
     if (transaction.type !== 'transfer' && !data.categories.some((item) => item.id === transaction.categoryId)) throw new Error('流水分类引用无效。');
+    const details = normalizeTransactionDetails(transaction);
+    for (const entry of details.statementEntries) {
+      if (entry.accountId && !data.accounts.some((account) => account.id === entry.accountId)) throw new Error('流水来源账户引用无效。');
+      const key = statementIdentity(entry);
+      if (!transaction.deletedAt && key && statementOwners.has(key) && statementOwners.get(key) !== transaction.id) throw new Error('同一来源账户的交易单号关联到多笔流水。');
+      if (!transaction.deletedAt && key) statementOwners.set(key, transaction.id);
+    }
     const items = normalizeProductItems(transaction.items || [], { amount: transaction.amount, type: transaction.type });
     for (const item of items) {
       const product = products.find((p) => p.id === item.productId);
       const category = productCategories.find((c) => c.id === item.productCategoryId);
       if (!product || !category || product.productCategoryId !== category.id || PRODUCT_UNITS[item.unit].base !== category.baseUnit || PRODUCT_UNITS[item.unit].dimension !== category.dimension) throw new Error('商品明细引用或单位无效。');
     }
-    return { ...transaction, items };
+    return { ...transaction, ...(transaction.paymentChannel !== undefined || transaction.statementEntries !== undefined ? details : {}), items };
   });
   return { ...data, transactions, products, productCategories };
 }

@@ -8,6 +8,7 @@ import {
   resolveCategoryCandidates,
 } from './tools.mjs';
 import { agentResponseJson, normalizeAgentResponse } from './schemas.mjs';
+import { maskStatementReferences } from '../src/transaction-reconciliation.mjs';
 
 const SKILL_FILES = ['ledger-entry.md', 'ledger-query.md', 'draft-validation.md', 'transaction-correction.md', 'habit-analysis.md', 'memory-preferences.md', 'general-assistant.md', 'product-prices.md', 'periodic-review.md'];
 
@@ -55,7 +56,7 @@ export async function createLedgerAgent({ root, complete }) {
         .map((message) => ({ role: message.role, content: String(message.content || '').slice(0, 4000) }));
       const userText = String(history.at(-1)?.content || '');
       const productQuery = isProductQuery(userText);
-      const productEntry = productQuery ? null : parseProductEntry(userText);
+      const productEntry = productQuery ? null : parseProductEntry(maskStatementReferences(userText));
       if (productEntry?.error) return { reply: agentResponseJson({ kind: 'clarify', reply: productEntry.error }), candidateCount: 0, toolRounds: 0 };
       const candidates = extractTransactionCandidates(userText, {
         today: ledgerContext.today,
@@ -106,7 +107,7 @@ ${jsonText(modelContext)}
 ## 最终输出契约
 
 始终只返回一个合法 JSON 对象，不要 Markdown，不要输出思考过程。只能使用：
-{"kind":"transaction_draft","reply":"简短说明","drafts":[{"type":"expense|income|transfer","amountYuan":数字,"category":"可用分类名称","account":"可用账户名称","toAccount":"转入账户名称或空字符串","occurredAt":"ISO 时间","note":"备注","tags":["标签"]}]}
+{"kind":"transaction_draft","reply":"简短说明","drafts":[{"candidateId":"对应的预处理候选 ID","type":"expense|income|transfer","amountYuan":数字,"category":"可用分类名称","account":"实际扣款或到账账户，无法确认时空字符串","toAccount":"本人转入账户或空字符串","paymentChannel":"微信|支付宝|银行卡|现金|其他或空字符串","occurredAt":"ISO 时间","note":"备注","tags":["标签"]}]}
 或 {"kind":"transaction_update","reply":"等待用户确认修改","update":{"transactionId":"账本上下文中的流水 ID","changes":{"amountYuan":数字,"type":"expense|income|transfer","category":"可用分类名称","account":"可用账户名称","toAccount":"转入账户名称","occurredAt":"ISO 时间","note":"新备注"}}}
 或 {"kind":"answer","reply":"基于账本上下文的回答"}，或 {"kind":"clarify","reply":"只追问一个最关键的缺失信息"}，或 {"kind":"memory_suggestion","reply":"等待用户确认","memory":{"key":"规则键","value":"规则值","label":"规则说明"}}。
 或 {"kind":"periodic_review","headline":"一句话总结","highlights":[{"fact_id":"facts 中的 id","line":"使用 {{fact_id}} 占位符的事实描述"}],"closing":"中性结尾"}。回顾响应也可以省略 kind，但不能输出其他字段或 Markdown。

@@ -1,5 +1,6 @@
 import { maskProductMeasurements, normalizeProductItems } from '../src/product-prices.mjs';
 import { buildTransactionHistoryIndex, searchTransactionHistory } from '../src/transaction-history.mjs';
+import { parseTransactionRouting, maskStatementReferences, normalizeTransactionDetails, candidateIndexForDraft } from '../src/transaction-reconciliation.mjs';
 const CATEGORY_RULES = [
   { id: 'food', keywords: /早餐|午饭|午餐|晚饭|晚餐|夜宵|外卖|咖啡|奶茶|餐饮|吃饭/ },
   { id: 'commute', keywords: /公交卡|交通卡|地铁卡|地铁|公交|打车|出租|网约车|交通|通勤|加油|停车/ },
@@ -88,6 +89,8 @@ export const AGENT_TOOL_DEFINITIONS = [
               type: 'object',
               additionalProperties: false,
               properties: {
+                candidateId: { type: 'string', description: '脚本预处理候选 ID，多笔同额流水必须对应原候选。' },
+                paymentChannel: { type: 'string', enum: ['', '微信', '支付宝', '银行卡', '现金', '其他'] },
                 type: { type: 'string' },
                 amountYuan: { type: 'number' },
                 category: { type: 'string' },
@@ -286,14 +289,6 @@ function semanticText(value) {
     .trim();
 }
 
-function inferType(text) {
-  const value = String(text || '');
-  if (/退款|退回|退还|返还|返款|返现|报销到账/.test(value)) return 'income';
-  if (/转账|转到|转入|转出/.test(value)) return 'transfer';
-  if (/工资到账|薪资到账|工资收入|薪资收入|奖金到账|兼职收入|补贴到账|收到/.test(value)) return 'income';
-  return 'expense';
-}
-
 function categoryCandidates(text, type, availableCategories = []) {
   const value = String(text || '');
   const rules = type === 'income' ? INCOME_RULES : CATEGORY_RULES;
@@ -326,34 +321,41 @@ function expandWaterElectricity(body, amounts) {
 }
 
 export function extractTransactionCandidates(rawText, options = {}) {
-  const text = maskProductMeasurements(String(rawText || '').trim());
+  const text = String(rawText || '').trim();
   const fallbackDate = baseDate(options.today);
   const candidates = [];
   let currentDate = dateKey(fallbackDate);
+  let lastAccount = '';
   const groups = text.replace(/\r?\n/g, '；').split(/[；;。！？!?]/).map((raw) => raw.trim()).filter(Boolean);
   for (const raw of groups) {
     const dateInfo = readLeadingDate(raw, new Date(`${currentDate}T12:00:00`));
     currentDate = dateInfo.date;
-    const body = raw.slice(dateInfo.length).trim();
+    const body = maskStatementReferences(maskProductMeasurements(raw.slice(dateInfo.length).trim()));
     const amounts = readAmounts(body);
     if (!amounts.length) continue;
     const groupHint = semanticText(body.slice(0, amounts[0].index));
-    const groupType = inferType(body);
+    const groupRouting = parseTransactionRouting(body, options.availableAccounts || []);
+    if (groupRouting.accountId) lastAccount = groupRouting.accountId;
     const waterAmount = expandWaterElectricity(body, amounts);
     for (let index = 0; index < amounts.length; index += 1) {
       const amount = amounts[index];
       const clause = amountClause(body, amount, amounts, index);
       const context = semanticText(stripAmount(clause));
       const hint = context || groupHint || semanticText(body);
-      const type = inferType(hint || body) || groupType;
+      const routing = amounts.length === 1 ? groupRouting : parseTransactionRouting(clause, options.availableAccounts || []);
+      const type = routing.type === 'transfer' ? 'transfer' : parseTransactionRouting(hint || body, options.availableAccounts || []).type;
+      const nameOf = (id) => (options.availableAccounts || []).find((account) => (account.id || account.name) === id)?.name || '';
       const isWater = waterAmount && cents(waterAmount.amountYuan) === cents(amount.amountYuan);
       const base = {
         amountYuan: amount.amountYuan,
         date: currentDate,
-        sourceText: clause || body,
+        sourceText: raw.slice(0, 4000),
         typeHint: type,
         categoryCandidates: categoryCandidates(hint || body, type, options.availableCategories || []),
         accountCandidates: accountCandidates(body, options.availableAccounts || []),
+        accountHint: nameOf(routing.accountId || (!routing.paymentChannel ? lastAccount : '')),
+        toAccountHint: nameOf(routing.toAccountId),
+        paymentChannel: routing.paymentChannel,
         semanticHint: hint || '',
       };
       if (isWater) {
@@ -478,10 +480,16 @@ export function validateTransactionDrafts(args = {}, context = {}) {
     if (!['expense', 'income', 'transfer'].includes(type)) errors.push(`第 ${index + 1} 笔类型无效。`);
     if (!(number(draft.amountYuan) > 0)) errors.push(`第 ${index + 1} 笔金额必须大于 0。`);
     if (!availableCategory(draft.category, type, categories)) errors.push(`第 ${index + 1} 笔分类不在可用分类中。`);
-    if (!availableAccount(draft.account, accounts)) errors.push(`第 ${index + 1} 笔账户不在可用账户中。`);
+    if (draft.account && !availableAccount(draft.account, accounts)) errors.push(`第 ${index + 1} 笔账户不在可用账户中。`);
+    if (!draft.account) warnings.push(`第 ${index + 1} 笔实际账户待用户确认，不能直接入账。`);
+    try { normalizeTransactionDetails({ paymentChannel: draft.paymentChannel }); } catch (error) { errors.push(error.message); }
     if (Number.isNaN(new Date(draft.occurredAt || '').getTime())) errors.push(`第 ${index + 1} 笔缺少合法发生时间。`);
-    if (type === 'transfer' && !availableAccount(draft.toAccount, accounts)) errors.push(`第 ${index + 1} 笔转账缺少合法转入账户。`);
-    const candidateIndex = candidates.findIndex((candidate, candidatePosition) => !usedCandidates.has(candidatePosition) && cents(candidate.amountYuan) === cents(draft.amountYuan));
+    if (type === 'transfer' && draft.toAccount && !availableAccount(draft.toAccount, accounts)) errors.push(`第 ${index + 1} 笔转账的转入账户无效。`);
+    if (type === 'transfer' && draft.account && draft.account === draft.toAccount) errors.push(`第 ${index + 1} 笔转账的本人账户必须不同。`);
+    const remaining = candidates.map((candidate, position) => ({ candidate, position })).filter((item) => !usedCandidates.has(item.position));
+    let candidateIndex = -1;
+    try { candidateIndex = remaining[candidateIndexForDraft(draft, remaining.map((item) => item.candidate))]?.position ?? -1; }
+    catch (error) { errors.push(error.message); }
     if (candidateIndex >= 0) {
       usedCandidates.add(candidateIndex);
       const candidate = candidates[candidateIndex];
