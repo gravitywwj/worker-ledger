@@ -44,6 +44,14 @@ test('amount index keeps cent-level tolerance boundaries and finds duplicates in
   assert.equal(findDuplicateTransactions(buildTransactionHistoryIndex([unnamed]), [{ ...unnamed, id: 'new', accountId: 'other' }]).length, 1);
 });
 
+test('duplicate review caps same-day batch scans for 5000 imported rows', () => {
+  const batch = Array.from({ length: 5000 }, (_, index) => entry({ id: `import-${index}`, amount: 1234,
+    note: `row-${index}`, occurredAt: '2026-10-01T12:00:00Z', statementEntries: [] }));
+  const matches = findDuplicateTransactions(buildTransactionHistoryIndex([]), batch, 3);
+  assert.equal(matches.length, 4999);
+  assert.equal(matches.at(-1).matches.length, 3);
+});
+
 test('date, amount and type find sparse records across accounts without requiring notes or channels', () => {
   const old = entry({ occurredAt: '2026-10-15T12:00:00Z' });
   const index = buildTransactionHistoryIndex([old]);
@@ -180,6 +188,7 @@ test('history query totals include every match while pages are bounded and edits
   assert.equal(result.transactions.length, 20);
   assert.equal(result.hasMore, true);
   assert.equal(searchTransactionHistory(index, { keyword: '28元', limit: 50, offset: 50 }).transactions.length, 11);
+  assert.equal(searchTransactionHistory(index, { categoryId: 'all' }).count, index.entries.length);
   assert.equal(searchTransactionHistory(index, { startDate: '2026-01-01' }).count, 0);
   assert.equal(searchTransactionHistory(index, { keyword: '2020-01' }).count, 61);
   const updated = buildTransactionHistoryIndex(transactions.map((item, i) => i === 0 ? { ...item, note: '咖啡' } : { ...item, deletedAt: '2026-10-14' }), { categories, accounts });

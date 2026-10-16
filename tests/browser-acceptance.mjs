@@ -41,7 +41,7 @@ export async function runBrowserAcceptance(page, base) {
   await p.getByRole('button',{name:'保存这一笔',exact:true}).click();
   await p.getByRole('dialog').waitFor({state:'hidden'});
   check((await read('transactions')).length===42,'manual entry failed');
-  await p.getByRole('link',{name:'智能助手',exact:true}).click();
+  await p.locator('[data-view="agent"]:visible').click();
   const ask = async text => {await p.waitForFunction(() => !document.querySelector('#agent-input').disabled); await p.getByRole('textbox',{name:'发送给账本助手'}).fill(text);await p.getByRole('button',{name:'发送消息',exact:true}).click();};
   await ask('测试酒每瓶980ml，2瓶共142元，划算吗');
   await p.getByText(/本次 7.24 元/).waitFor();
@@ -65,9 +65,17 @@ export async function runBrowserAcceptance(page, base) {
   await p.getByText(/历史最低 5.00 元/).waitFor();
   await p.getByRole('link',{name:'流水',exact:true}).click();
   await p.locator('#ledger-scope-filter').selectOption('all');
+  await p.locator('#ledger-type-filter').selectOption('all');
+  await p.locator('#ledger-account-filter').selectOption('all');
+  await p.locator('#ledger-category-filter').selectOption('all');
+  await p.locator('#ledger-search').fill('');
+  await p.locator('#ledger-start-date').fill('');
+  await p.locator('#ledger-end-date').fill('');
   const latest=(await read('transactions')).find(t=>t.source==='agent');
+  const deleteButton=p.locator('[data-action="delete-transaction"][data-transaction-id="'+latest.id+'"]');
+  check(await deleteButton.count()===1,'agent transaction is not in the ledger page: '+latest.id);
   p.once('dialog',dialog=>dialog.accept());
-  await p.locator('[data-action="delete-transaction"][data-transaction-id="'+latest.id+'"]').click();
+  await deleteButton.click();
   await p.getByRole('link',{name:'智能助手',exact:true}).click();
   await ask('测试酒历史单价');
   await p.getByText(/最近实付 5.00 元/).waitFor();
@@ -76,7 +84,7 @@ export async function runBrowserAcceptance(page, base) {
   await p.evaluate(()=>{const original=URL.createObjectURL;URL.createObjectURL=blob=>{window.qaBackupBlob=blob;return original(blob);};});
   await p.getByRole('button',{name:'导出备份',exact:true}).click();
   const backup=await p.evaluate(async()=>JSON.parse(await window.qaBackupBlob.text()));
-  check(backup.version===3 && backup.transactions.length===42 && backup.products.length===1,'v3 export missing products');
+  check(backup.version===4 && backup.transactions.length===42 && backup.products.length===1 && Array.isArray(backup.recurringBills) && Array.isArray(backup.categoryBudgets) && Array.isArray(backup.shoppingList),'v4 export missing feature data');
   const importBackup=async data=>{p.once('dialog',dialog=>dialog.accept());await p.locator('#backup-file').setInputFiles({name:'backup.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(data))});};
   const old={version:2,transactions:backup.transactions.filter(t=>t.id==='legacy-0'),categories:backup.categories,accounts:backup.accounts};
   await importBackup(old);
@@ -86,7 +94,7 @@ export async function runBrowserAcceptance(page, base) {
   await p.waitForFunction(()=>document.querySelector('#toast-region').textContent.includes('备份已导入'));
   await p.reload();
   await p.getByRole('button',{name:'导出备份',exact:true}).waitFor();
-  check((await read('transactions')).length===42 && (await read('products')).length===1,'v3 restore/reload lost data');
+  check((await read('transactions')).length===42 && (await read('products')).length===1,'v4 restore/reload lost data');
   const bad={...backup,agentMemory:[{}]};
   await importBackup(bad);
   await p.getByText(/key path|回滚|保存失败|DataError/i).first().waitFor();
@@ -97,9 +105,229 @@ export async function runBrowserAcceptance(page, base) {
   await p.getByRole('button',{name:'导出备份',exact:true}).waitFor();
   check((await read('transactions')).length===42,'offline reload failed');
   await context.setOffline(false);
+  await p.evaluate(async()=>new Promise((resolve,reject)=>{const request=indexedDB.open('worker-ledger');request.onsuccess=()=>{const db=request.result;const tx=db.transaction(['accounts','profile_settings'],'readwrite');tx.objectStore('accounts').put({id:'bank',name:'储蓄卡',type:'bank',openingBalance:0,includeInAssets:true,archivedAt:null});tx.objectStore('profile_settings').put({key:'profile',monthlyBudget:10000});tx.oncomplete=()=>{db.close();resolve();};tx.onerror=()=>{db.close();reject(tx.error);};};request.onerror=()=>reject(request.error);}));
+  await p.reload();
+  await p.getByRole('button',{name:'导出备份',exact:true}).waitFor();
+  const dates=await p.evaluate(()=>{const pad=value=>String(value).padStart(2,'0');const key=date=>`${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}`;const today=new Date();const previous=new Date(today);previous.setDate(today.getDate()-1);return {today:key(today),previous:key(previous),day:String(today.getDate())};});
+  const csv=['交易时间,收/支,金额(元),商品说明,交易对方,当前状态,交易单号,支付方式',
+    `${dates.previous} 10:00:00,支出,12.30,"早餐,咖啡",便利店,支付成功,order-1,微信支付`,
+    `${dates.previous} 10:00:00,支出,12.30,"早餐,咖啡",便利店,支付成功,order-1,微信支付`,
+    `${dates.previous} 12:00:00,支出,23.40,午餐,食堂,支付成功,order-2,微信支付`,
+    `${dates.previous} 13:00:00,支出,30.00,取消商品,商店,交易关闭,closed-1,微信支付`].join('\r\n');
+  const openStatement=async(name,content)=>{
+    await p.locator('[data-view="ledger"]:visible').click();
+    await p.getByRole('button',{name:'导入账单',exact:true}).click();
+    await p.locator('#statement-file').setInputFiles({name,mimeType:'text/csv',buffer:Buffer.from(content)});
+    await p.locator('#statement-mapping-form').waitFor();
+    await p.locator('#statement-mapping-form [name="sourceAccountId"]').selectOption('alipay');
+    await p.locator('#statement-mapping-form [name="defaultAccountId"]').selectOption('bank');
+    await p.locator('#statement-mapping-form [name="defaultCategoryId"]').selectOption('daily');
+    await p.getByRole('button',{name:'生成分页核对表',exact:true}).click();
+    await p.locator('.import-review-list').waitFor();
+  };
+  let modelRequests=0;
+  p.on('request',request=>{if(request.url().includes('/api/agent/chat')) modelRequests+=1;});
+  const initialCount=(await read('transactions')).length;
+  await openStatement('wechat.csv',csv);
+  await p.locator('#import-bulk-account').selectOption('bank');
+  await p.getByRole('button',{name:'应用到全部行',exact:true}).click();
+  await p.locator('#import-bulk-category').selectOption('daily');
+  await p.getByRole('button',{name:'应用到支出行',exact:true}).click();
+  check(await p.locator('.import-review-row').count()===4,'CSV review rows missing');
+  await p.locator('[data-import-row="1"] .import-duplicate-details summary').click();
+  check(await p.locator('[data-import-row="1"]').getByText(/同一文件中的前一行/).count()===1,'in-file duplicate comparison was not expanded');
+  check(await p.getByRole('button',{name:'确认整批入账（2 笔）'}).isEnabled(),'valid rows were not ready to book');
+  await p.getByRole('button',{name:'确认整批入账（2 笔）'}).click();
+  await p.locator('.ledger-list').waitFor();
+  let transactions=await read('transactions');
+  const imported=transactions.filter(item=>item.statementEntries?.some(entry=>['order-1','order-2'].includes(entry.externalId)));
+  check(transactions.length===initialCount+2 && imported.length===2,'statement import added duplicate rows or lost valid rows');
+  check(imported.every(item=>item.accountId==='bank' && item.statementEntries.some(entry=>entry.accountId==='alipay')),'source and actual accounts were not kept separate');
+  const fuzzyTarget=imported.find(item=>item.statementEntries.some(entry=>entry.externalId==='order-2'));
+  const fuzzyCsv=['交易时间,收/支,金额(元),商品说明,交易对方,当前状态,交易单号,支付方式',`${dates.previous} 12:00:00,支出,23.40,午餐,食堂,支付成功,fuzzy-1,微信支付`].join('\r\n');
+  await openStatement('fuzzy-link.csv',fuzzyCsv);
+  const fuzzyRow=p.locator('.import-review-row').first();
+  check(await fuzzyRow.locator('.import-duplicate-details').count()===1,'fuzzy duplicate did not show its comparison');
+  await fuzzyRow.locator('[data-import-decision]').selectOption(`link:${fuzzyTarget.id}`);
+  await p.getByRole('button',{name:'确认整批入账（1 笔）'}).click();
+  await p.locator('.ledger-list').waitFor();
+  transactions=await read('transactions');
+  const linked=transactions.find(item=>item.id===fuzzyTarget.id);
+  check(transactions.length===initialCount+2 && linked.statementEntries.some(entry=>entry.externalId==='fuzzy-1'),'manual fuzzy duplicate link created a transaction or lost its source');
+  await openStatement('wechat-repeat.csv',csv);
+  check(await p.getByRole('button',{name:'确认整批入账（0 笔）'}).isDisabled(),'reimport did not skip source-ID duplicates');
+  check((await read('transactions')).length===initialCount+2,'repeat import changed the ledger');
+  await p.getByRole('button',{name:'返回流水',exact:true}).click();
+  const failedCsv=['交易时间,收/支,金额,商品,交易单号,当前状态',`${dates.today} 10:00:00,支出,33.00,回滚测试,rollback-1,支付成功`].join('\r\n');
+  await openStatement('rollback.csv',failedCsv);
+  await p.evaluate(()=>{const original=IDBObjectStore.prototype.put;window.__qaOriginalPut=original;IDBObjectStore.prototype.put=function(...args){if(this.name==='products'){IDBObjectStore.prototype.put=original;throw new DOMException('Forced atomic abort','DataError');}return original.apply(this,args);};});
+  await p.getByRole('button',{name:'确认整批入账（1 笔）'}).click();
+  await p.getByText('Forced atomic abort',{exact:true}).waitFor();
+  check((await read('transactions')).length===initialCount+2,'failed statement batch partially wrote transactions');
+  check(!(await read('transactions')).some(item=>item.statementEntries?.some(entry=>entry.externalId==='rollback-1')),'failed statement batch retained a source ID');
+  await p.evaluate(()=>{if(window.__qaOriginalPut)IDBObjectStore.prototype.put=window.__qaOriginalPut;});
+  await p.getByRole('button',{name:'返回流水',exact:true}).click();
+  const largeRows=Array.from({length:5000},(_,index)=>{const date=new Date(Date.UTC(2000,0,1+index*4)).toISOString().slice(0,10);return `${date} 12:00:00,支出,1.00,批量${index},,支付成功,batch-${index},微信支付`;});
+  await p.setViewportSize({width:390,height:844});
+  await openStatement('large.csv',['交易时间,收/支,金额,商品,交易对方,当前状态,交易单号,支付方式',...largeRows].join('\r\n'));
+  check(await p.getByRole('heading',{name:'第 1 / 100 页'}).count()===1 && await p.locator('.import-review-row').count()===50,'5000-row statement did not paginate');
+  await p.getByRole('button',{name:'下一页',exact:true}).click();
+  check(await p.getByRole('heading',{name:'第 2 / 100 页'}).count()===1 && await p.locator('[data-import-row="50"]').count()===1,'5000-row review could not advance pages');
+  check(await p.evaluate(()=>document.documentElement.scrollWidth<=document.documentElement.clientWidth+1),'statement review overflows mobile viewport');
+  await p.getByRole('button',{name:'返回流水',exact:true}).click();
+  check((await read('transactions')).length===initialCount+2 && modelRequests===0,'leaving review wrote data or invoked the model');
+
+  await p.setViewportSize({width:1280,height:900});
+  await p.locator('[data-view="ledger"]:visible').click();
+  const sourceTransaction=imported.find(item=>item.statementEntries.some(entry=>entry.externalId==='order-1'));
+  await p.locator(`[data-action="create-recurring-from-transaction"][data-transaction-id="${sourceTransaction.id}"]`).click();
+  await p.locator('#recurring-form [name="name"]').fill('周期导入测试');
+  await p.locator('#recurring-form [name="paymentDay"]').fill(dates.day);
+  await p.locator('#recurring-form [name="nextDueDate"]').fill(dates.today);
+  await p.getByRole('button',{name:'保存周期账单',exact:true}).click();
+  let bills=await read('recurring_bills');
+  const linkedBill=bills.find(item=>item.name==='周期导入测试');
+  check(!!linkedBill && linkedBill.sourceTransactionId===sourceTransaction.id,'periodic bill did not retain its source transaction');
+  const balanceFor=(rows,accountId)=>rows.filter(item=>!item.deletedAt).reduce((total,item)=>total+(item.accountId===accountId?(item.type==='income'?item.amount:item.type==='expense'?-item.amount:0):0)+(item.type==='transfer'&&item.toAccountId===accountId?item.amount:0),0);
+  let bankBalance=balanceFor(await read('transactions'),'bank');
+  await p.locator('[data-view="reports"]:visible').click();
+  await p.getByRole('button',{name:'周期账单',exact:true}).click();
+  await p.locator(`[data-action="link-recurring-payment"][data-bill-id="${linkedBill.id}"]`).click();
+  await p.locator('#recurring-link-form [name="transactionId"]').selectOption(sourceTransaction.id);
+  await p.getByRole('button',{name:'关联付款',exact:true}).click();
+  bills=await read('recurring_bills');
+  check((await read('transactions')).length===initialCount+2 && balanceFor(await read('transactions'),'bank')===bankBalance
+    && bills.find(item=>item.id===linkedBill.id).payments.some(payment=>payment.transactionId===sourceTransaction.id),'linking a recurring payment added another expense');
+
+  await p.getByRole('button',{name:'新增周期账单',exact:true}).click();
+  await p.locator('#recurring-form [name="name"]').fill('房租测试');
+  await p.locator('#recurring-form [name="amount"]').fill('2000');
+  await p.locator('#recurring-form [name="accountId"]').selectOption('bank');
+  await p.locator('#recurring-form [name="categoryId"]').selectOption('daily');
+  await p.locator('#recurring-form [name="paymentDay"]').fill(dates.day);
+  await p.locator('#recurring-form [name="nextDueDate"]').fill(dates.today);
+  await p.getByRole('button',{name:'保存周期账单',exact:true}).click();
+  bills=await read('recurring_bills');
+  const rentBill=bills.find(item=>item.name==='房租测试');
+  const duePanel=()=>p.locator('.content-panel').filter({has:p.getByRole('heading',{name:'待付款',exact:true})});
+  check(await duePanel().getByText('房租测试').count()===1,'due recurring bill was not listed');
+  await p.locator(`[data-action="pause-recurring"][data-bill-id="${rentBill.id}"]`).click();
+  await p.locator(`[data-action="resume-recurring"][data-bill-id="${rentBill.id}"]`).waitFor();
+  check(await duePanel().getByText('房租测试').count()===0,'paused recurring bill stayed in due list');
+  await p.locator(`[data-action="resume-recurring"][data-bill-id="${rentBill.id}"]`).click();
+  await p.locator(`[data-action="pause-recurring"][data-bill-id="${rentBill.id}"]`).waitFor();
+  check(await duePanel().getByText('房租测试').count()===1,'resumed recurring bill stayed out of due list');
+  bankBalance=balanceFor(await read('transactions'),'bank');
+  await p.locator(`[data-action="record-recurring-payment"][data-bill-id="${rentBill.id}"]`).click();
+  await p.locator('#transaction-form [name="amount"]').fill('2000');
+  await p.locator('#transaction-form [name="accountId"]').selectOption('bank');
+  await p.getByRole('button',{name:'保存这一笔',exact:true}).click();
+  const paidTransactions=await read('transactions');
+  bills=await read('recurring_bills');
+  check(paidTransactions.length===initialCount+3 && balanceFor(paidTransactions,'bank')===bankBalance-200000
+    && bills.find(item=>item.id===rentBill.id).payments.length===1,'confirmed recurring payment did not post exactly once');
+
+  const candidateIds=await p.evaluate(async()=>new Promise((resolve,reject)=>{const request=indexedDB.open('worker-ledger');request.onsuccess=()=>{const db=request.result;const tx=db.transaction('transactions','readwrite');const store=tx.objectStore('transactions');const today=new Date();today.setDate(1);const rows=Array.from({length:3},(_,index)=>{const date=new Date(today);date.setMonth(date.getMonth()-2+index);date.setDate(10);date.setHours(12,0,0,0);return {id:`candidate-test-${index}`,type:'expense',categoryId:'daily',accountId:'bank',amount:5000+index*50,occurredAt:date.toISOString(),note:'周期候选测试',tags:[],source:'manual'};});rows.forEach(row=>store.put(row));tx.oncomplete=()=>{db.close();resolve(rows.map(row=>row.id));};tx.onerror=()=>{db.close();reject(tx.error);};};request.onerror=()=>reject(request.error);}));
+  await p.reload();
+  await p.locator('[data-view="reports"]:visible').waitFor();
+  await p.locator('[data-view="reports"]:visible').click();
+  await p.getByRole('button',{name:'周期账单',exact:true}).click();
+  const candidateRow=p.locator('.feature-row').filter({hasText:'周期候选测试'});
+  const historyDetails=candidateRow.locator('details');
+  await historyDetails.locator('summary').click();
+  check(await historyDetails.locator('[data-action="view-history-source"]').count()===3,'recurring candidate did not expose its source transactions');
+  await historyDetails.locator('[data-action="view-history-source"]').first().click();
+  check(await p.locator('#transaction-form [name="note"]').inputValue()==='周期候选测试','recurring candidate source did not open its original transaction');
+  await p.locator('[data-action="close-dialog"]').first().click();
+  await p.evaluate(async ids=>new Promise((resolve,reject)=>{const request=indexedDB.open('worker-ledger');request.onsuccess=()=>{const db=request.result;const tx=db.transaction('transactions','readwrite');ids.forEach(id=>tx.objectStore('transactions').delete(id));tx.oncomplete=()=>{db.close();resolve();};tx.onerror=()=>reject(tx.error);};request.onerror=()=>reject(request.error);}),candidateIds);
+  await p.reload();
+  await p.locator('[data-view="reports"]:visible').waitFor();
+
+  await p.getByRole('button',{name:'分类预算',exact:true}).click();
+  const budgetMonth=await p.locator('#category-budget-form').getAttribute('data-month');
+  await p.locator('#category-budget-form [name="budget-daily"]').fill('20');
+  await p.locator('#category-budget-form [name="budget-food"]').fill('15000');
+  await p.getByRole('button',{name:'保存本月分类额度',exact:true}).click();
+  await p.getByText('本月分类额度已保存。',{exact:true}).waitFor();
+  check((await read('category_budgets')).length===2 && await p.getByText(/超过总预算/).count()===1
+    && await p.locator('[data-action="view-budget-category"][data-category-id="daily"]').getByText(/超支/).count()===1,'category limits or over-budget indicators missing');
+  const expectedDaily=paidTransactions.filter(item=>!item.deletedAt&&item.type==='expense'&&item.categoryId==='daily'
+    && (()=>{const date=new Date(item.occurredAt);return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}`===budgetMonth;})()).length;
+  await p.locator('[data-action="view-budget-category"][data-category-id="daily"]').click();
+  check(await p.locator('#ledger-category-filter').inputValue()==='daily'
+    && await p.locator('#ledger-start-date').inputValue()===`${budgetMonth}-01`
+    && await p.locator('.ledger-list .transaction-row').count()===expectedDaily,'budget drill-down did not match its expense rows');
+
+  await p.locator('[data-view="ledger"]:visible').click();
+  await p.locator('[data-action="ledger-section"][data-section="shopping"]').click();
+  await p.setViewportSize({width:390,height:844});
+  const product=(await read('products'))[0];
+  const transactionCountBeforeQuote=(await read('transactions')).length;
+  await p.getByRole('button',{name:'添加待购',exact:true}).first().click();
+  await p.locator('#shopping-item-form [name="productId"]').selectOption(product.id);
+  await p.locator('#shopping-item-form [name="quantity"]').fill('2');
+  await p.locator('#shopping-item-form [name="unitSize"]').fill('1000');
+  await p.locator('#shopping-item-form [name="unit"]').selectOption('ml');
+  await p.locator('#shopping-item-form [name="quoteAmount"]').fill('40');
+  await p.getByRole('button',{name:'保存待购',exact:true}).click();
+  check((await read('transactions')).length===transactionCountBeforeQuote && (await read('shopping_list')).length===1,'shopping quote changed spending or was not saved');
+  check(await p.evaluate(()=>document.documentElement.scrollWidth<=document.documentElement.clientWidth+1),'shopping list overflows mobile viewport');
+  await p.locator('[data-action="record-shopping-purchase"]').click();
+  await p.locator('#transaction-form [name="amount"]').fill('43.21');
+  await p.locator('#transaction-form [name="accountId"]').selectOption('bank');
+  await p.locator('#transaction-form [name="shopName"]').fill('超市A');
+  await p.locator('#transaction-form [name="note"]').fill('测试酒待购实际购买');
+  await p.getByRole('spinbutton',{name:'这些商品总价（元）',exact:true}).fill('43.21');
+  await p.getByRole('button',{name:'保存这一笔',exact:true}).click();
+  let purchases=await read('transactions');
+  const purchase=purchases.find(item=>item.shopName==='超市A');
+  check(purchases.length===transactionCountBeforeQuote+1 && purchase?.amount===4321 && (await read('shopping_list')).length===0,'purchase was not saved with actual shop and amount');
+  await p.getByRole('button',{name:'添加待购',exact:true}).first().click();
+  await p.locator('#shopping-item-form [name="productId"]').selectOption(product.id);
+  await p.locator('#shopping-item-form [name="quantity"]').fill('1');
+  await p.locator('#shopping-item-form [name="unitSize"]').fill('1000');
+  await p.locator('#shopping-item-form [name="unit"]').selectOption('ml');
+  await p.locator('#shopping-item-form [name="quoteAmount"]').fill('40');
+  await p.getByRole('button',{name:'保存待购',exact:true}).click();
+  await p.locator('#shopping-shop-filter').selectOption('超市A');
+  check(!/暂无已记录价格/.test(await p.locator('.shopping-price-grid').innerText()),'shop filter omitted the recorded purchase');
+
+  await p.locator('[data-view="agent"]:visible').click();
+  await p.getByRole('textbox',{name:'发送给账本助手'}).fill('本月为什么多花了钱');
+  await p.getByRole('button',{name:'发送消息',exact:true}).click();
+  await p.locator('.agent-facts-card').waitFor();
+  check(await p.locator('.agent-facts-card').getByText(/匹配/).count()===1
+    && await p.locator('[data-action="view-agent-fact"][data-category-id="daily"]').count()===1
+    && modelRequests===0,'assistant facts missing local totals, drill-down, or model-free calculation');
+  const factMessage=(await read('agent_messages')).findLast(item=>item.role==='assistant'&&item.spendingFacts);
+  check(factMessage?.spendingFacts.categories.find(item=>item.categoryId==='daily')?.transactionIds.includes(sourceTransaction.id),'assistant fact lost its source transaction IDs');
+  await p.locator('[data-action="view-agent-fact"][data-category-id="daily"]').click();
+  p.once('dialog',dialog=>dialog.accept());
+  await p.locator(`[data-action="delete-transaction"][data-transaction-id="${sourceTransaction.id}"]`).click();
+  await p.getByText('流水已删除。',{exact:true}).waitFor();
+  await p.locator('[data-view="agent"]:visible').click();
+  await p.getByText(/来源失效 1 笔/).waitFor();
+  check((await read('recurring_bills')).find(item=>item.id===linkedBill.id).payments.length===0,'deleted source remained attached to recurring payment');
+
+  await p.setViewportSize({width:1280,height:900});
+  await p.locator('[data-view="settings"]:visible').click();
+  await p.evaluate(()=>{const original=URL.createObjectURL;URL.createObjectURL=blob=>{window.qaFeatureBackupBlob=blob;return original(blob);};});
+  await p.getByRole('button',{name:'导出备份',exact:true}).click();
+  const featureBackup=await p.evaluate(async()=>JSON.parse(await window.qaFeatureBackupBlob.text()));
+  check(featureBackup.version===4&&featureBackup.recurringBills.length===2&&featureBackup.categoryBudgets.length===2&&featureBackup.shoppingList.length===1,'feature backup omitted new business data');
+  await importBackup(featureBackup);
+  await p.waitForFunction(()=>document.querySelector('#toast-region').textContent.includes('备份已导入'));
+  check((await read('recurring_bills')).length===2&&(await read('category_budgets')).length===2&&(await read('shopping_list')).length===1,'v4 feature restore lost references');
+  await p.evaluate(async()=>{await navigator.serviceWorker.ready;});
+  await context.setOffline(true);
+  await p.reload();
+  await p.getByRole('button',{name:'导出备份',exact:true}).waitFor();
+  check((await read('transactions')).length===purchases.length-1&&(await read('recurring_bills')).length===2
+    &&(await read('category_budgets')).length===2&&(await read('shopping_list')).length===1,'offline reload lost feature data');
+  await context.setOffline(false);
   check(errors.length===0,'browser errors: '+errors.join('; '));
   await context.close();
-  return 'PASS: v5→v6, 41 legacy records, beyond-30 history, manual entry, quote no-write, draft approval, catalog reuse, v3 export/import, v2 import, reload persistence, atomic import rollback, edit/delete price sync, offline reload, zero page errors';
+  return 'PASS: v5→v7 migration, v4 backup, import repeat-deduplication/manual fuzzy linking/atomic rollback/5000-row mobile paging, recurring source-history/link/draft/pause, monthly category budget drill-down, shopping quote/purchase/shop filter, assistant source invalidation, feature backup/restore/offline reload, zero model calls for import/facts, zero page errors';
 }
 
 export async function runHistoryAcceptance(page, base) {
@@ -154,7 +382,7 @@ export async function runHistoryAcceptance(page, base) {
     check(await p.locator('.ledger-list .transaction-row').count() === 12, 'history page two lost old records');
     await p.locator('#ledger-search').fill('早饭');
     await p.getByRole('heading', { name: '1 笔流水', exact: true }).waitFor();
-    check(await p.locator('[data-transaction-id="old-breakfast"]').count() === 2, 'history synonym query missed an older-than-30 bill');
+    check(await p.locator('.transaction-row').filter({ has: p.locator('[data-action="edit-transaction"][data-transaction-id="old-breakfast"]') }).count() === 1, 'history synonym query missed an older-than-30 bill');
     await p.locator('#ledger-search').fill('30元');
     await p.waitForFunction(() => document.querySelector('#ledger-search')?.value === '30元' && document.querySelector('.ledger-list .transaction-row')?.textContent.includes('早餐'));
     await p.locator('#ledger-search').fill('');

@@ -1,14 +1,19 @@
 /* 打工人小账本：本地优先的个人收支账本。 */
 
-import { DEFAULT_PRODUCT_CATEGORIES, normalizeProductItems, prepareProductTransactions, isProductQuery, parseProductQuote, compareProductPrices, formatPriceComparison, maskProductMeasurements, parseProductEntry } from './product-prices.mjs';
+import { DEFAULT_PRODUCT_CATEGORIES, PRODUCT_UNITS, normalizeProductItems, prepareProductTransactions, isProductQuery, parseProductQuote, compareProductPrices, formatPriceComparison, maskProductMeasurements, parseProductEntry, unitPrice } from './product-prices.mjs';
 import { normalizeBackup } from './product-backup.mjs';
 import { buildPeriodicReviewFacts, normalizePeriodicReviewPayload, periodicReviewPlaceholderIds } from '../agent/periodic-review.mjs';
 import { productRow, renderProductEditor, readProductEditor, updateProductPreviews, renderPriceSources } from './product-ui.mjs';
 import { buildTransactionHistoryIndex, searchTransactionHistory, findDuplicateTransactions, normalizeTransactionNote, parseHistoryQuery } from './transaction-history.mjs';
 import { PAYMENT_CHANNELS, normalizeTransactionDetails, statementEntry, statementIdentity, associateTransaction, parseTransactionRouting, statementHints, maskStatementReferences } from './transaction-reconciliation.mjs';
+import { decodeStatementFile, inspectStatementCsv, mapStatementRows, parseStatementCsv, statementFieldOptions } from './statement-import.mjs';
+import { dueRecurringBills, firstRecurringDate, normalizeRecurringBill, recordRecurringPayment, removeRecurringPayment, recurringBillCandidates } from './recurring-bills.mjs';
+import { categoryBudgetRows, normalizeCategoryBudgets, previousMonthBudgets } from './category-budgets.mjs';
+import { normalizeShoppingItem } from './shopping-list.mjs';
+import { buildSpendingChangeFacts } from './transaction-facts.mjs';
 
 const DB_NAME = 'worker-ledger';
-const DB_VERSION = 6;
+const DB_VERSION = 7;
 const STORES = {
   transactions: 'transactions',
   products: 'products',
@@ -18,6 +23,9 @@ const STORES = {
   accounts: 'accounts',
   agentMessages: 'agent_messages',
   agentMemory: 'agent_memory',
+  recurringBills: 'recurring_bills',
+  categoryBudgets: 'category_budgets',
+  shoppingList: 'shopping_list',
 };
 
 const DEFAULT_PROFILE = {
@@ -139,6 +147,9 @@ const state = {
   selectedMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
   profile: { ...DEFAULT_PROFILE, salaryEstimate: { ...DEFAULT_PROFILE.salaryEstimate } },
   transactions: [],
+  recurringBills: [],
+  categoryBudgets: [],
+  shoppingList: [],
   products: [],
   productCategories: [...DEFAULT_PRODUCT_CATEGORIES],
   categories: [...DEFAULT_CATEGORIES],
@@ -147,9 +158,17 @@ const state = {
   ledgerType: 'all',
   ledgerAccount: 'all',
   ledgerScope: 'month',
+  ledgerCategory: 'all',
+  ledgerStartDate: '',
+  ledgerEndDate: '',
+  ledgerSection: 'transactions',
+  shoppingShopName: '',
   ledgerPage: 0,
   reportPeriod: 'month',
+  reportSection: 'summary',
+  recurringCandidates: [],
   reportWeekDate: null,
+  statementImport: null,
   weatherIndex: 0,
   agentMessages: [],
   agentMemory: [],
@@ -706,6 +725,9 @@ function openDatabase() {
       if (!db.objectStoreNames.contains(STORES.settings)) db.createObjectStore(STORES.settings, { keyPath: 'key' });
       if (!db.objectStoreNames.contains(STORES.categories)) db.createObjectStore(STORES.categories, { keyPath: 'id' });
       if (!db.objectStoreNames.contains(STORES.accounts)) db.createObjectStore(STORES.accounts, { keyPath: 'id' });
+      for (const name of [STORES.recurringBills, STORES.categoryBudgets, STORES.shoppingList]) {
+        if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath: 'id' });
+      }
       const messageStore = db.objectStoreNames.contains(STORES.agentMessages)
         ? request.transaction.objectStore(STORES.agentMessages)
         : db.createObjectStore(STORES.agentMessages, { keyPath: 'id' });
@@ -807,7 +829,7 @@ async function loadData() {
     } else {
       if (!state.db) state.db = await openDatabase();
       await ensureInitialData();
-      const [profileRecord, transactions, categories, accounts, agentMessages, agentMemory, products, productCategories] = await Promise.all([
+      const [profileRecord, transactions, categories, accounts, agentMessages, agentMemory, products, productCategories, recurringBills, categoryBudgets, shoppingList] = await Promise.all([
         dbGet(STORES.settings, 'profile'),
         dbGetAll(STORES.transactions),
         dbGetAll(STORES.categories),
@@ -816,6 +838,9 @@ async function loadData() {
         dbGetAll(STORES.agentMemory),
         dbGetAll(STORES.products),
         dbGetAll(STORES.productCategories),
+        dbGetAll(STORES.recurringBills),
+        dbGetAll(STORES.categoryBudgets),
+        dbGetAll(STORES.shoppingList),
       ]);
       state.profile = {
         ...DEFAULT_PROFILE,
@@ -826,6 +851,9 @@ async function loadData() {
       state.transactions = sortTransactions(transactions);
       state.products = products;
       state.productCategories = productCategories;
+      state.recurringBills = recurringBills;
+      state.categoryBudgets = categoryBudgets;
+      state.shoppingList = shoppingList;
       state.categories = categories.length ? categories : [...DEFAULT_CATEGORIES];
       state.accounts = accounts.length ? accounts : [...DEFAULT_ACCOUNTS];
       state.agentMessages = agentMessages
@@ -866,7 +894,7 @@ async function persistProfile(patch, successMessage = '设置已保存。') {
 async function persistTransaction(transaction, successMessage = '这笔流水已保存。') {
   return persistTransactions([transaction], successMessage);
 }
-async function persistTransactions(transactions, successMessage = '这些流水已保存。') {
+async function persistTransactions(transactions, successMessage = '这些流水已保存。', options = {}) {
   if (!transactions.length) return;
   const replacing = new Set(transactions.map((item) => item.id));
   const statementOwners = new Map();
@@ -884,12 +912,43 @@ async function persistTransactions(transactions, successMessage = '这些流水�
       if (key) statementOwners.set(key, transaction.id);
     }
   }
-  const prepared = prepareProductTransactions(transactions, state.products, state.productCategories);
-  if (!state.demo) await dbWriteBundle({ [STORES.transactions]: prepared.transactions, [STORES.products]: prepared.products, [STORES.productCategories]: prepared.productCategories });
+  const prepared = prepareProductTransactions(transactions.map((transaction) => {
+    const original = state.transactions.find((item) => item.id === transaction.id);
+    const recurringBillId = transaction.type === 'expense' ? transaction.recurringBillId || original?.recurringBillId : '';
+    const next = { ...transaction };
+    if (recurringBillId) next.recurringBillId = recurringBillId;
+    else delete next.recurringBillId;
+    return next;
+  }), state.products, state.productCategories);
+  const recurringUpdates = new Map();
+  for (const transaction of prepared.transactions) {
+    const original = state.transactions.find((item) => item.id === transaction.id);
+    if (transaction.type !== 'expense') {
+      for (const bill of state.recurringBills) {
+        if (!(bill.payments || []).some((payment) => payment.transactionId === transaction.id)) continue;
+        const updated = removeRecurringPayment(recurringUpdates.get(bill.id) || bill, transaction.id);
+        recurringUpdates.set(bill.id, updated);
+      }
+    }
+    if (original?.recurringBillId && original.recurringBillId !== transaction.recurringBillId) {
+      const oldBill = recurringUpdates.get(original.recurringBillId) || state.recurringBills.find((item) => item.id === original.recurringBillId);
+      if (oldBill) recurringUpdates.set(oldBill.id, removeRecurringPayment(oldBill, transaction.id));
+    }
+    if (!transaction.recurringBillId) continue;
+    const bill = recurringUpdates.get(transaction.recurringBillId) || state.recurringBills.find((item) => item.id === transaction.recurringBillId);
+    if (!bill) throw new Error('关联的周期账单已不存在。');
+    if (!(bill.payments || []).some((payment) => payment.transactionId === transaction.id)) recurringUpdates.set(bill.id, recordRecurringPayment(bill, transaction));
+  }
+  const bundle = { [STORES.transactions]: prepared.transactions, [STORES.products]: prepared.products, [STORES.productCategories]: prepared.productCategories };
+  if (recurringUpdates.size) bundle[STORES.recurringBills] = [...recurringUpdates.values()];
+  if (options.shoppingItemId) bundle[STORES.shoppingList] = { delete: [options.shoppingItemId] };
+  if (!state.demo) await dbWriteBundle(bundle);
   const ids = new Set(prepared.transactions.map((item) => item.id));
   state.transactions = sortTransactions([...state.transactions.filter((item) => !ids.has(item.id)), ...prepared.transactions]);
   state.products = prepared.products;
   state.productCategories = prepared.productCategories;
+  if (options.shoppingItemId) state.shoppingList = state.shoppingList.filter((item) => item.id !== options.shoppingItemId);
+  if (recurringUpdates.size) state.recurringBills = state.recurringBills.map((item) => recurringUpdates.get(item.id) || item);
   const latestDate = prepared.transactions.reduce((latest, item) => {
     const date = new Date(item.occurredAt);
     return !latest || date > latest ? date : latest;
@@ -911,10 +970,14 @@ function dbWriteBundle(bundle, replaceAll = false) {
     tx.onerror = () => reject(tx.error || new Error('保存失败。'));
     tx.onabort = () => reject(tx.error || new Error('保存已回滚。'));
     try {
-      for (const [name, values] of Object.entries(bundle)) {
+      for (const [name, payload] of Object.entries(bundle)) {
         const store = tx.objectStore(name);
         if (replaceAll) store.clear();
-        values.forEach((value) => store.put(value));
+        if (Array.isArray(payload)) payload.forEach((value) => store.put(value));
+        else {
+          (payload.put || []).forEach((value) => store.put(value));
+          (payload.delete || []).forEach((key) => store.delete(key));
+        }
       }
     } catch (error) { tx.abort(); reject(error); }
   });
@@ -1098,6 +1161,7 @@ function transactionRow(item, options = {}) {
   const typeLabel = item.type === 'income' ? '收入' : item.type === 'expense' ? '支出' : '转账';
   const actions = options.actions
     ? `<div class="transaction-actions">
+        ${item.type === 'expense' ? `<button class="row-action" type="button" data-action="create-recurring-from-transaction" data-transaction-id="${escapeHtml(item.id)}" aria-label="设为周期账单 ${escapeHtml(item.note || category.label)}">${icon('ph-calendar-plus')}</button>` : ''}
         <button class="row-action" type="button" data-action="edit-transaction" data-transaction-id="${escapeHtml(item.id)}" aria-label="编辑 ${escapeHtml(item.note || category.label)}">${icon('ph-pencil-simple')}</button>
         <button class="row-action danger" type="button" data-action="delete-transaction" data-transaction-id="${escapeHtml(item.id)}" aria-label="删除 ${escapeHtml(item.note || category.label)}">${icon('ph-trash')}</button>
       </div>`
@@ -1108,7 +1172,7 @@ function transactionRow(item, options = {}) {
       <span class="transaction-type ${escapeHtml(item.type)}">${typeLabel}</span>
       <span class="transaction-title">${escapeHtml(category.label)}</span>
       <span class="transaction-account">${escapeHtml(accountName(item.accountId))}</span>
-      <span class="transaction-note">${escapeHtml(item.note || '未填写备注')}${item.paymentChannel ? `<small>渠道：${escapeHtml(item.paymentChannel)}</small>` : ''}${item.statementEntries?.length > 1 ? `<small>已关联 ${item.statementEntries.length} 份来源</small>` : ''}</span>
+      <span class="transaction-note">${escapeHtml(item.note || '未填写备注')}${item.shopName ? `<small>商店：${escapeHtml(item.shopName)}</small>` : ''}${item.paymentChannel ? `<small>渠道：${escapeHtml(item.paymentChannel)}</small>` : ''}${item.statementEntries?.length > 1 ? `<small>已关联 ${item.statementEntries.length} 份来源</small>` : ''}</span>
       <strong class="transaction-amount ${escapeHtml(item.type)}">${escapeHtml(signedMoney(item))}</strong>
       ${actions}
     </div>`;
@@ -1146,6 +1210,7 @@ function renderHome() {
   const budgetCents = centsFromYuan(state.profile.monthlyBudget);
   const budgetRate = budgetCents > 0 ? Math.min(100, (stats.expense / budgetCents) * 100) : 0;
   const weather = ledgerWeather(stats, budgetCents, state.weatherIndex);
+  const upcomingBills = dueRecurringBills(state.recurringBills).filter((bill) => bill.daysUntilDue <= 30);
   const accountRows = activeAccounts().slice(0, 4).map((account) => `
     <div class="account-row">
       <span class="account-icon">${icon(accountIcon(account))}</span>
@@ -1154,6 +1219,7 @@ function renderHome() {
     </div>`).join('');
   return `
     ${monthHeader()}
+    ${upcomingBills.length ? `<section class="recurring-reminder" aria-label="周期账单提醒"><strong>周期账单</strong><span>${upcomingBills.slice(0, 3).map((bill) => `${escapeHtml(bill.name)} ${bill.isDue ? '已到期' : `预计 ${bill.nextDueDate}`} · ${money(bill.amount)}`).join('；')}</span><button class="text-button" type="button" data-action="report-section" data-section="recurring">查看</button></section>` : ''}
     <section class="home-summary" aria-label="本月收支摘要">
       <div class="summary-panel summary-pair">
         <div class="summary-metric">
@@ -1227,8 +1293,9 @@ function renderHome() {
 
 function filteredLedgerTransactions() {
   const { start, end } = periodBounds('month');
-  const query = { keyword: state.searchTerm, type: state.ledgerType, accountId: state.ledgerAccount, limit: 50,
-    ...(state.ledgerScope === 'month' ? { startDate: dateKey(start), endDate: dateKey(end) } : {}) };
+  const query = { keyword: state.searchTerm, type: state.ledgerType, accountId: state.ledgerAccount, categoryId: state.ledgerCategory, limit: 50,
+    ...(state.ledgerStartDate || state.ledgerEndDate ? { startDate: state.ledgerStartDate || undefined, endDate: state.ledgerEndDate || undefined }
+      : state.ledgerScope === 'month' ? { startDate: dateKey(start), endDate: dateKey(end) } : {}) };
   let result = searchTransactionHistory(transactionHistoryIndex(), { ...query, offset: state.ledgerPage * 50 });
   const lastPage = Math.max(0, Math.ceil(result.count / 50) - 1);
   if (state.ledgerPage > lastPage) {
@@ -1239,9 +1306,12 @@ function filteredLedgerTransactions() {
 }
 
 function renderLedger() {
+  if (state.ledgerSection === 'shopping') return renderShoppingList();
+  if (state.ledgerSection === 'import') return renderStatementImport();
   const result = filteredLedgerTransactions();
   return `
-    ${pageHeader('流水', '查询当前月份或全部历史，支持关键词、同义词和金额，每笔流水可查看原账单。', `<button class="primary-button" type="button" data-action="open-transaction">${icon('ph-plus')}记一笔</button>`)}
+    ${pageHeader('流水', '查询当前月份或全部历史，支持关键词、同义词和金额，每笔流水可查看原账单。', `<div class="header-actions"><button class="secondary-button" type="button" data-action="open-statement-import">导入账单</button><button class="primary-button" type="button" data-action="open-transaction">${icon('ph-plus')}记一笔</button></div>`)}
+    <div class="period-switch ledger-sections"><button class="${state.ledgerSection === 'transactions' ? 'primary-button' : 'secondary-button'}" type="button" data-action="ledger-section" data-section="transactions" aria-pressed="${state.ledgerSection === 'transactions'}">流水</button><button class="secondary-button" type="button" data-action="ledger-section" data-section="shopping">商品与待购</button></div>
     <div class="toolbar">
       <div class="filter-row">
         <label class="search-input-wrap">
@@ -1251,7 +1321,9 @@ function renderLedger() {
         <label class="field compact-select"><span>范围</span><select class="select-input" id="ledger-scope-filter"><option value="month" ${state.ledgerScope === 'month' ? 'selected' : ''}>当前月份</option><option value="all" ${state.ledgerScope === 'all' ? 'selected' : ''}>全部历史</option></select></label>
         <label class="field compact-select"><span>类型</span><select class="select-input" id="ledger-type-filter"><option value="all">全部类型</option><option value="expense" ${state.ledgerType === 'expense' ? 'selected' : ''}>支出</option><option value="income" ${state.ledgerType === 'income' ? 'selected' : ''}>收入</option><option value="transfer" ${state.ledgerType === 'transfer' ? 'selected' : ''}>转账</option></select></label>
         <label class="field compact-select"><span>账户</span><select class="select-input" id="ledger-account-filter"><option value="all">全部账户</option>${accountOptions(state.ledgerAccount)}</select></label>
+        <label class="field compact-select"><span>分类</span><select class="select-input" id="ledger-category-filter"><option value="all">全部分类</option>${state.categories.filter((item) => item.type === 'expense' || item.type === 'income').map((item) => `<option value="${escapeHtml(item.id)}" ${state.ledgerCategory === item.id ? 'selected' : ''}>${escapeHtml(item.label)}</option>`).join('')}</select></label>
       </div>
+      <div class="filter-row"><label class="field compact-select"><span>开始日期</span><input class="text-input" type="date" id="ledger-start-date" value="${escapeHtml(state.ledgerStartDate)}" /></label><label class="field compact-select"><span>结束日期</span><input class="text-input" type="date" id="ledger-end-date" value="${escapeHtml(state.ledgerEndDate)}" /></label></div>
       <div class="month-control ${state.ledgerScope === 'all' ? 'hidden' : ''}">
         <button class="icon-button" type="button" data-action="previous-month" aria-label="上个月">${icon('ph-caret-left')}</button>
         <strong>${escapeHtml(monthLabel())}</strong>
@@ -1265,6 +1337,210 @@ function renderLedger() {
     </section>`;
 }
 
+function statementAccountOptions(selected = '', allowEmpty = true) {
+  return `${allowEmpty ? '<option value="">请选择账户</option>' : ''}${activeAccounts().map((account) => `<option value="${escapeHtml(account.id)}" ${selected === account.id ? 'selected' : ''}>${escapeHtml(account.name)}</option>`).join('')}`;
+}
+
+function statementCategoryOptions(type, selected = '') {
+  return state.categories.filter((category) => category.type === type).map((category) => `<option value="${escapeHtml(category.id)}" ${selected === category.id ? 'selected' : ''}>${escapeHtml(category.label)}</option>`).join('');
+}
+
+const statementDynamicErrors = new Set(['实际扣款或到账账户待确认', '分类需确认', '转账需确认转出和转入账户', '交易状态待确认']);
+
+function statementImportFixedErrors(row) {
+  return row.errors.filter((error) => !statementDynamicErrors.has(error));
+}
+
+function statementImportLinkErrors(row) {
+  const errors = statementImportFixedErrors(row);
+  if (!Number.isSafeInteger(row.transaction.amount) || row.transaction.amount <= 0) errors.push('金额无效或超过两位小数');
+  if (!Number.isFinite(Date.parse(row.transaction.occurredAt))) errors.push('交易日期无效');
+  return [...new Set(errors)];
+}
+
+function statementImportDecisionErrors(row) {
+  return String(row.decision).startsWith('link:') ? statementImportLinkErrors(row) : statementImportRowErrors(row);
+}
+
+function statementImportRowErrors(row) {
+  if (row.skipReason || row.decision === 'skip') return [];
+  const transaction = row.transaction;
+  const errors = statementImportFixedErrors(row);
+  if (!Number.isSafeInteger(transaction.amount) || transaction.amount <= 0) errors.push('金额无效或超过两位小数');
+  if (!Number.isFinite(Date.parse(transaction.occurredAt))) errors.push('交易日期无效');
+  if (!transaction.accountId || !state.accounts.some((account) => account.id === transaction.accountId)) errors.push('实际扣款或到账账户待确认');
+  if (transaction.type === 'transfer' && (!transaction.toAccountId || transaction.toAccountId === transaction.accountId)) errors.push('转账需确认两个不同的本人账户');
+  if (transaction.type !== 'transfer' && !state.categories.some((category) => category.id === transaction.categoryId && category.type === transaction.type)) errors.push('分类需确认');
+  if (row.errors.includes('交易状态待确认') && !['import', 'skip'].includes(row.decision) && !String(row.decision).startsWith('link:')) errors.push('交易状态待确认');
+  return [...new Set(errors)];
+}
+
+function statementDuplicateDetails(row) {
+  if (!row.duplicates.length) return '';
+  return `<details class="import-duplicate-details"><summary>展开对比 ${row.duplicates.length} 条匹配记录</summary>${row.duplicates.map((match) => {
+    const old = match.transaction;
+    return `<div class="import-duplicate-match"><strong>${escapeHtml(dateKey(old.occurredAt))} · ${escapeHtml(old.type === 'income' ? '收入' : old.type === 'transfer' ? '转账' : '支出')} ${money(old.amount)}</strong><span>${escapeHtml(getCategory(old.categoryId).label)} · ${escapeHtml(accountName(old.accountId))} · ${escapeHtml(old.note || '无备注')}</span><small>${escapeHtml(match.reason || '')}${match.draftMatch ? ' · 同一文件中的前一行' : ''}</small></div>`;
+  }).join('')}</details>`;
+}
+
+function statementImportRow(row, index) {
+  const transaction = row.transaction;
+  const errors = statementImportDecisionErrors(row);
+  const exact = row.duplicates.some((match) => match.sameStatement && match.difference === 0);
+  const conflict = row.duplicates.some((match) => match.sameStatement && match.difference !== 0);
+  const status = row.decision === 'skip' || row.skipReason ? '已跳过' : errors.length ? '待补充' : row.duplicates.length ? '疑似重复' : '可入账';
+  const accountSelect = statementAccountOptions(transaction.accountId);
+  const categorySelect = statementCategoryOptions(transaction.type === 'income' ? 'income' : 'expense', transaction.categoryId);
+  const matchOptions = row.duplicates.filter((match) => !match.draftMatch && !match.sameStatement && match.difference === 0
+      && match.transaction.type === transaction.type)
+    .map((match) => `<option value="link:${escapeHtml(match.transaction.id)}">关联 ${escapeHtml(dateKey(match.transaction.occurredAt))} · ${escapeHtml(match.transaction.note || getCategory(match.transaction.categoryId).label)}</option>`).join('');
+  const decisionOptions = row.skipReason
+    ? '<option value="skip" selected>已跳过</option>'
+    : exact ? '<option value="skip" selected>跳过（交易单号已存在）</option>'
+      : conflict ? '<option value="pending" selected>单号金额冲突，先跳过</option><option value="skip">跳过</option>'
+        : `<option value="pending" ${row.decision === 'pending' ? 'selected' : ''}>选择处理方式</option><option value="import" ${row.decision === 'import' ? 'selected' : ''}>导入为新流水</option>${matchOptions}<option value="skip" ${row.decision === 'skip' ? 'selected' : ''}>跳过</option>`;
+  return `<article class="import-review-row ${errors.length ? 'needs-review' : ''}" data-import-row="${index}">
+    <div class="import-row-summary"><strong>第 ${row.line} 行 · ${escapeHtml(status)}</strong><strong>${transaction.amount ? money(transaction.amount) : escapeHtml(row.raw.amount || '金额无效')}</strong></div>
+    <div class="import-row-source"><span>${escapeHtml(transaction.occurredAt ? dateKey(transaction.occurredAt) : row.raw.date || '日期无效')}</span><span>${escapeHtml(transaction.note || '无备注')}</span><small>交易单号：${escapeHtml(row.raw.externalId || '未提供')} · ${escapeHtml(row.raw.status || '未提供状态')}</small></div>
+    <div class="import-row-fields">
+      <label class="field"><span>类型</span><select class="select-input" data-import-field="type" data-row-index="${index}"><option value="expense" ${transaction.type === 'expense' ? 'selected' : ''}>支出</option><option value="income" ${transaction.type === 'income' ? 'selected' : ''}>收入</option><option value="transfer" ${transaction.type === 'transfer' ? 'selected' : ''}>转账</option></select></label>
+      <label class="field"><span>实际账户</span><select class="select-input" data-import-field="accountId" data-row-index="${index}">${accountSelect}</select></label>
+      ${transaction.type === 'transfer' ? `<label class="field"><span>本人转入账户</span><select class="select-input" data-import-field="toAccountId" data-row-index="${index}">${statementAccountOptions(transaction.toAccountId)}</select></label>` : `<label class="field"><span>分类</span><select class="select-input" data-import-field="categoryId" data-row-index="${index}">${categorySelect}</select></label>`}
+      <label class="field"><span>备注</span><input class="text-input" data-import-field="note" data-row-index="${index}" value="${escapeHtml(transaction.note)}" maxlength="4000" /></label>
+      <label class="field"><span>处理</span><select class="select-input" data-import-decision data-row-index="${index}" ${row.skipReason || exact ? 'disabled' : ''}>${decisionOptions}</select></label>
+    </div>
+    ${row.skipReason ? `<p class="field-hint">${escapeHtml(row.skipReason)}</p>` : errors.length ? `<p class="notice-text">${errors.map(escapeHtml).join('；')}</p>` : ''}
+    ${statementDuplicateDetails(row)}
+  </article>`;
+}
+
+function renderStatementImport() {
+  const current = state.statementImport;
+  const actions = `<div class="header-actions"><button class="secondary-button" type="button" data-action="ledger-section" data-section="transactions">返回流水</button></div>`;
+  if (!current) return `${pageHeader('导入账单', '选择本地 CSV 文件。数据只在本机解析，确认整批后才写入。', `<div class="header-actions"><button class="secondary-button" type="button" data-action="ledger-section" data-section="transactions">返回流水</button><button class="primary-button" type="button" data-action="select-statement-file">选择 CSV 文件</button></div>`)}<section class="content-panel import-upload"><p class="field-hint">支持 UTF-8 与 GB18030 编码；微信、支付宝常见表头会自动识别，银行卡可手动映射。</p></section>`;
+  if (!current.rows) {
+    const fields = [['date', '交易日期'], ['direction', '收支方向'], ['amount', '金额'], ['note', '备注或商品'], ['counterparty', '交易对方'], ['paymentMethod', '支付方式'], ['status', '交易状态'], ['externalId', '交易单号']];
+    const mapFields = fields.map(([key, label]) => `<label class="field"><span>${label}${['date', 'amount'].includes(key) ? '（必填）' : ''}</span><select class="select-input" name="map-${key}" ${['date', 'amount'].includes(key) ? 'required' : ''}>${statementFieldOptions(current.statement.headers, current.mapping[key])}</select></label>`).join('');
+    return `${pageHeader('账单字段映射', `${escapeHtml(current.name)} · ${current.statement.rows.length} 行数据 · ${current.source}`, actions)}<section class="content-panel"><form id="statement-mapping-form" data-field-span="2"><div class="form-grid">${mapFields}
+      <label class="field"><span>账单来源</span><input class="text-input" name="source" maxlength="80" value="${escapeHtml(current.source)}" required /></label>
+      <label class="field"><span>来源账户</span><select class="select-input" name="sourceAccountId" required><option value="">选择这份账单所属账户</option>${statementAccountOptions(current.sourceAccountId, false)}</select></label>
+      <label class="field"><span>实际扣款 / 到账账户</span><select class="select-input" name="defaultAccountId"><option value="">逐行确认</option>${statementAccountOptions(current.defaultAccountId, false)}</select></label>
+      <label class="field"><span>支出默认分类</span><select class="select-input" name="defaultCategoryId">${statementCategoryOptions('expense', current.defaultCategoryId)}</select></label>
+      </div><p class="field-hint">来源账户记录账单从哪里导出；实际账户决定余额变化。两者分别确认。交易单号用于跨日期查重。</p><div class="form-actions"><button class="secondary-button" type="button" data-action="select-statement-file">更换文件</button><button class="primary-button" type="submit">生成分页核对表</button></div></form></section>`;
+  }
+  const rows = current.rows;
+  const counts = { ready: 0, duplicate: 0, missing: 0, skipped: 0 };
+  for (const row of rows) {
+    if (row.skipReason || row.decision === 'skip') counts.skipped += 1;
+    else if (statementImportDecisionErrors(row).length) counts.missing += 1;
+    else if (row.duplicates.length) counts.duplicate += 1;
+    else counts.ready += 1;
+  }
+  const start = current.page * 50;
+  const pageRows = rows.slice(start, start + 50);
+  const unresolved = rows.some((row) => row.decision === 'pending'
+    || ((row.decision === 'import' || String(row.decision).startsWith('link:')) && statementImportDecisionErrors(row).length));
+  const importCount = rows.filter((row) => row.decision === 'import' || String(row.decision).startsWith('link:')).length;
+  return `${pageHeader('核对账单', `${escapeHtml(current.source)} · ${rows.length} 行 · 只核对本地数据，不调用模型。`, actions)}
+    <div class="import-counts"><span>可入账 <strong>${counts.ready}</strong></span><span>疑似重复 <strong>${counts.duplicate}</strong></span><span>待补充 <strong>${counts.missing}</strong></span><span>已跳过 <strong>${counts.skipped}</strong></span></div>
+    <section class="content-panel"><div class="import-bulk-row"><label class="field"><span>批量设置实际账户</span><select id="import-bulk-account" class="select-input"><option value="">选择账户</option>${statementAccountOptions('', false)}</select></label><button class="secondary-button" type="button" data-action="apply-import-account">应用到全部行</button><label class="field"><span>批量设置分类</span><select id="import-bulk-category" class="select-input"><option value="">选择分类</option>${state.categories.filter((item) => item.type === 'expense').map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.label)}</option>`).join('')}</select></label><button class="secondary-button" type="button" data-action="apply-import-category">应用到支出行</button></div>
+      <div class="panel-heading"><h2>第 ${current.page + 1} / ${Math.max(1, Math.ceil(rows.length / 50))} 页</h2><span class="panel-note">每页 50 行 · ${rows.length} 行均在本机完成解析和查重</span></div><div class="import-review-list">${pageRows.map((row, index) => statementImportRow(row, start + index)).join('')}</div>
+      <div class="form-actions import-page-actions"><button class="secondary-button" type="button" data-action="import-previous-page" ${current.page === 0 ? 'disabled' : ''}>上一页</button><button class="secondary-button" type="button" data-action="import-next-page" ${start + 50 >= rows.length ? 'disabled' : ''}>下一页</button><button class="secondary-button" type="button" data-action="back-to-statement-mapping">返回字段映射</button><button class="primary-button" type="button" data-action="commit-statement-import" ${unresolved || !importCount ? 'disabled' : ''}>确认整批入账（${importCount} 笔）</button></div>
+    </section>`;
+}
+
+function buildStatementImportReview(data) {
+  const current = state.statementImport;
+  if (!current) throw new Error('请先选择账单文件。');
+  const mapping = Object.fromEntries(Object.keys(current.mapping).map((key) => [key, Number(data.get(`map-${key}`) ?? current.mapping[key])]));
+  if (mapping.date < 0 || mapping.amount < 0 || mapping.date === mapping.amount) throw new Error('交易日期和金额需要映射到不同的列。');
+  const source = String(data.get('source') || '').trim();
+  const sourceAccountId = String(data.get('sourceAccountId') || '');
+  if (!source || !state.accounts.some((account) => account.id === sourceAccountId)) throw new Error('请选择有效的账单来源账户。');
+  const statement = { ...current.statement, source };
+  const rows = mapStatementRows(statement, mapping, {
+    sourceAccountId,
+    defaultAccountId: String(data.get('defaultAccountId') || ''),
+    defaultCategoryId: String(data.get('defaultCategoryId') || ''),
+    incomeCategoryId: state.categories.find((item) => item.id === 'reimburse' && item.type === 'income')?.id || state.categories.find((item) => item.type === 'income')?.id || '',
+    categories: state.categories,
+  });
+  const matches = findDuplicateTransactions(transactionHistoryIndex(), rows.map((row) => row.transaction), 3);
+  const duplicates = new Map(matches.map((item) => [item.candidate.id, item.matches]));
+  for (const row of rows) {
+    row.duplicates = duplicates.get(row.transaction.id) || [];
+    const exactDuplicate = row.duplicates.some((match) => match.sameStatement && match.difference === 0);
+    row.decision = row.skipReason || exactDuplicate ? 'skip' : row.duplicates.length || row.errors.length ? 'pending' : 'import';
+  }
+  Object.assign(current, { mapping, source, sourceAccountId, defaultAccountId: String(data.get('defaultAccountId') || ''),
+    defaultCategoryId: String(data.get('defaultCategoryId') || ''), rows, page: 0 });
+}
+
+function applyStatementImportBulk(field, value) {
+  const current = state.statementImport;
+  if (!current?.rows || !value) return;
+  for (const row of current.rows) {
+    if (row.skipReason || row.decision === 'skip') continue;
+    if (field === 'accountId') row.transaction.accountId = value;
+    if (field === 'categoryId' && row.transaction.type === 'expense') row.transaction.categoryId = value;
+    const errors = statementImportRowErrors(row);
+    if (!errors.length && !row.duplicates.length && row.decision === 'pending') row.decision = 'import';
+  }
+}
+
+function renderShoppingList() {
+  const shops = [...new Set(state.transactions.map((item) => String(item.shopName || '').trim()).filter(Boolean))].sort();
+  const rows = state.shoppingList.map((item) => {
+    const comparison = compareProductPrices(state, { productId: item.productId,
+      shopName: state.shoppingShopName === '__unset__' ? '' : state.shoppingShopName,
+      shopUnspecified: state.shoppingShopName === '__unset__' });
+    const group = comparison.groups?.[0];
+    const quote = item.quoteAmount ? unitPrice({ ...item, paidAmount: item.quoteAmount }) : null;
+    const recent = group?.latest ? `${group.latest.displayPrice.toFixed(2)} 元/${group.latest.displayUnit}` : '暂无已记录价格';
+    const lowest = group?.lowest ? `${group.lowest.displayPrice.toFixed(2)} 元/${group.lowest.displayUnit}` : '暂无已记录最低价';
+    return `<article class="shopping-item"><div class="shopping-item-heading"><div><strong>${escapeHtml([item.brand, item.nameSnapshot, item.variant].filter(Boolean).join(' · '))}</strong><small>${item.quantity} 件 · ${item.unitSize} ${escapeHtml(item.unit)} / 件</small></div><div class="button-row"><button class="secondary-button" type="button" data-action="edit-shopping-item" data-item-id="${escapeHtml(item.id)}">编辑报价</button><button class="text-button" type="button" data-action="remove-shopping-item" data-item-id="${escapeHtml(item.id)}">移除</button></div></div><div class="shopping-price-grid"><span>最近单价<strong>${escapeHtml(recent)}</strong></span><span>历史最低<strong>${escapeHtml(lowest)}</strong></span><span>本次报价<strong>${quote ? `${quote.displayPrice.toFixed(2)} 元/${quote.displayUnit}` : '未填写'}</strong></span></div>${state.shoppingShopName ? `<p class="panel-note">商店筛选：${escapeHtml(state.shoppingShopName)}</p>` : ''}${group ? renderPriceSources(comparison) : '<p class="panel-note">没有可比历史；不同容量可按统一单位比较，重量与容量不会混算。</p>'}<button class="primary-button" type="button" data-action="record-shopping-purchase" data-item-id="${escapeHtml(item.id)}">记录购买</button></article>`;
+  }).join('');
+  const filter = `<label class="field compact-select"><span>商店筛选</span><select class="select-input" id="shopping-shop-filter"><option value="">全部商店</option><option value="__unset__" ${state.shoppingShopName === '__unset__' ? 'selected' : ''}>未填写商店</option>${shops.map((shop) => `<option value="${escapeHtml(shop)}" ${state.shoppingShopName === shop ? 'selected' : ''}>${escapeHtml(shop)}</option>`).join('')}</select></label>`;
+  return `${pageHeader('商品与待购', '报价和待购不会计入支出；购买时填写实际支付金额后进入原有审核流程。', `<button class="primary-button" type="button" data-action="open-shopping-item">${icon('ph-plus')}添加待购</button>`)}<div class="period-switch ledger-sections"><button class="secondary-button" type="button" data-action="ledger-section" data-section="transactions">流水</button><button class="primary-button" type="button" data-action="ledger-section" data-section="shopping" aria-pressed="true">商品与待购</button></div><div class="toolbar">${filter}</div><section class="shopping-list">${rows || `<div class="empty-state"><h3>待购清单为空</h3><p>选择商品目录中的商品，输入规格、数量和报价后查看完整历史价格。</p><button class="primary-button" type="button" data-action="open-shopping-item">添加待购</button></div>`}</section>`;
+}
+
+function openShoppingDialog(item = null) {
+  const product = state.products.find((entry) => entry.id === item?.productId);
+  const firstHistory = product && state.transactions.flatMap((entry) => entry.items || []).find((entry) => entry.productId === product.id);
+  const products = state.products.map((entry) => `<option value="${escapeHtml(entry.id)}" ${entry.id === item?.productId ? 'selected' : ''}>${escapeHtml([entry.brand, entry.name, entry.variant].filter(Boolean).join(' · '))}</option>`).join('');
+  openDialog(`<form class="dialog-content" id="shopping-item-form" data-item-id="${escapeHtml(item?.id || '')}"><div class="dialog-header"><div><h2 id="dialog-title">${item ? '编辑待购' : '添加待购'}</h2><p>报价只用于购买前比较，不会写入账本。</p></div><button class="icon-button dialog-close" type="button" data-action="close-dialog" aria-label="关闭">${icon('ph-x')}</button></div><div class="dialog-form-grid">
+    <label class="field field-span-2"><span>已有商品</span><select class="select-input" name="productId" required><option value="">选择商品</option>${products}</select></label>
+    <label class="field"><span>每件规格</span><input class="text-input" name="unitSize" type="number" min="0.001" step="any" value="${escapeHtml(item?.unitSize ?? firstHistory?.unitSize ?? '')}" required /></label>
+    <label class="field"><span>单位</span><select class="select-input" name="unit">${Object.keys(PRODUCT_UNITS).map((unit) => `<option value="${escapeHtml(unit)}" ${unit === (item?.unit || firstHistory?.unit) ? 'selected' : ''}>${escapeHtml(unit)}</option>`).join('')}</select></label>
+    <label class="field"><span>数量</span><input class="text-input" name="quantity" type="number" min="1" step="1" value="${item?.quantity || 1}" required /></label>
+    <label class="field"><span>报价（元，可选）</span><input class="text-input" name="quoteAmount" type="number" min="0.01" step="0.01" value="${item?.quoteAmount ? yuanFromCents(item.quoteAmount) : ''}" /></label>
+    </div><div class="dialog-actions"><button class="secondary-button" type="button" data-action="close-dialog">取消</button><button class="primary-button" type="submit">保存待购</button></div></form>`);
+}
+
+function openRecurringDialog(bill = null, prefill = {}) {
+  const cadence = bill?.cadence || prefill.cadence || 'monthly';
+  const sourceDate = prefill.transaction?.occurredAt ? new Date(prefill.transaction.occurredAt) : new Date();
+  const paymentDay = bill?.paymentDay || prefill.paymentDay || sourceDate.getDate();
+  const paymentMonth = bill?.paymentMonth || prefill.paymentMonth || sourceDate.getMonth() + 1;
+  const nextDueDate = bill?.nextDueDate || firstRecurringDate({ cadence, paymentDay, paymentMonth, today: new Date() });
+  openDialog(`<form class="dialog-content" id="recurring-form" data-bill-id="${escapeHtml(bill?.id || '')}" data-source-transaction-id="${escapeHtml(prefill.transaction?.id || bill?.sourceTransactionId || '')}"><div class="dialog-header"><div><h2 id="dialog-title">${bill ? '编辑周期账单' : '新增周期账单'}</h2><p>预计金额只做付款提醒，实际流水需要单独确认。</p></div><button class="icon-button dialog-close" type="button" data-action="close-dialog" aria-label="关闭">${icon('ph-x')}</button></div><div class="dialog-form-grid">
+    <label class="field field-span-2"><span>项目名称</span><input class="text-input" name="name" value="${escapeHtml(bill?.name || prefill.name || prefill.transaction?.note || '')}" maxlength="80" required /></label>
+    <label class="field"><span>预计金额</span><input class="text-input" name="amount" type="number" min="0.01" step="0.01" value="${bill ? yuanFromCents(bill.amount) : prefill.amount ?? (prefill.transaction ? yuanFromCents(prefill.transaction.amount) : '')}" required /></label>
+    <label class="field"><span>付款账户</span><select class="select-input" name="accountId" required><option value="">选择账户</option>${statementAccountOptions(bill?.accountId || prefill.transaction?.accountId || '', false)}</select></label>
+    <label class="field"><span>支出分类</span><select class="select-input" name="categoryId">${statementCategoryOptions('expense', bill?.categoryId || prefill.categoryId || prefill.transaction?.categoryId || state.categories.find((item) => item.id === 'daily')?.id || '')}</select></label>
+    <label class="field"><span>周期</span><select class="select-input" name="cadence"><option value="monthly" ${cadence === 'monthly' ? 'selected' : ''}>月付</option><option value="yearly" ${cadence === 'yearly' ? 'selected' : ''}>年付</option></select></label>
+    <label class="field"><span>付款日</span><input class="text-input" name="paymentDay" type="number" min="1" max="31" step="1" value="${paymentDay}" required /></label>
+    <label class="field"><span>付款月份（年付）</span><input class="text-input" name="paymentMonth" type="number" min="1" max="12" step="1" value="${paymentMonth}" /></label>
+    <label class="field"><span>下次预计日期</span><input class="text-input" name="nextDueDate" type="date" value="${escapeHtml(nextDueDate)}" required /></label>
+    </div>${prefill.transaction ? `<p class="field-hint">来源流水：${escapeHtml(dateKey(prefill.transaction.occurredAt))} · ${escapeHtml(prefill.transaction.note || '无备注')}</p>` : ''}<div class="dialog-actions"><button class="secondary-button" type="button" data-action="close-dialog">取消</button><button class="primary-button" type="submit">保存周期账单</button></div></form>`);
+}
+
+function openRecurringPaymentLink(bill) {
+  const candidates = state.transactions.filter((transaction) => transaction.type === 'expense' && !transaction.deletedAt
+    && !transaction.recurringBillId && !state.recurringBills.some((item) => (item.payments || []).some((payment) => payment.transactionId === transaction.id)));
+  openDialog(`<form class="dialog-content" id="recurring-link-form" data-bill-id="${escapeHtml(bill.id)}"><div class="dialog-header"><div><h2 id="dialog-title">关联实际付款</h2><p>选择已入账流水，不会再次增加支出。</p></div><button class="icon-button dialog-close" type="button" data-action="close-dialog" aria-label="关闭">${icon('ph-x')}</button></div><label class="field"><span>支出流水</span><select class="select-input" name="transactionId" required><option value="">选择流水</option>${candidates.map((transaction) => `<option value="${escapeHtml(transaction.id)}">${escapeHtml(dateKey(transaction.occurredAt))} · ${escapeHtml(transaction.note || getCategory(transaction.categoryId).label)} · ${money(transaction.amount)} · ${escapeHtml(accountName(transaction.accountId))}</option>`).join('')}</select></label><p class="field-hint">关联后仅更新预计日期，不改变账户余额。</p><div class="dialog-actions"><button class="secondary-button" type="button" data-action="close-dialog">取消</button><button class="primary-button" type="submit" ${candidates.length ? '' : 'disabled'}>关联付款</button></div></form>`);
+}
+
 function reportCategoryData(transactions) {
   const grouped = new Map();
   transactions.filter((item) => item.type === 'expense').forEach((item) => {
@@ -1276,7 +1552,50 @@ function reportCategoryData(transactions) {
   return [...grouped.values()].sort((a, b) => b.amount - a.amount);
 }
 
+function reportSectionTabs() {
+  return `<div class="period-switch report-sections"><button class="${state.reportSection === 'summary' ? 'primary-button' : 'secondary-button'}" type="button" data-action="report-section" data-section="summary" aria-pressed="${state.reportSection === 'summary'}">收支报表</button><button class="${state.reportSection === 'recurring' ? 'primary-button' : 'secondary-button'}" type="button" data-action="report-section" data-section="recurring" aria-pressed="${state.reportSection === 'recurring'}">周期账单</button><button class="${state.reportSection === 'budget' ? 'primary-button' : 'secondary-button'}" type="button" data-action="report-section" data-section="budget" aria-pressed="${state.reportSection === 'budget'}">分类预算</button></div>`;
+}
+
+function renderRecurringBills() {
+  const today = new Date();
+  const due = dueRecurringBills(state.recurringBills, today);
+  const soon = due.filter((bill) => bill.daysUntilDue <= 30);
+  const candidates = recurringBillCandidates(state.transactions, state.categories);
+  state.recurringCandidates = candidates;
+  const bills = [...state.recurringBills].sort((a, b) => a.nextDueDate.localeCompare(b.nextDueDate));
+  const rows = bills.map((bill) => `
+    <article class="feature-row">
+      <div><strong>${escapeHtml(bill.name)}</strong><small>${bill.cadence === 'monthly' ? '月付' : '年付'} · ${bill.cadence === 'yearly' ? `${bill.paymentMonth} 月 ` : ''}${bill.paymentDay} 日 · ${escapeHtml(accountName(bill.accountId))} · ${bill.status === 'active' ? '进行中' : bill.status === 'paused' ? '已暂停' : '已结束'}</small></div>
+      <div><strong>${money(bill.amount)}</strong><small>下次预计 ${escapeHtml(bill.nextDueDate)}</small></div>
+      <div class="button-row">${bill.status === 'active' ? `<button class="secondary-button" type="button" data-action="pause-recurring" data-bill-id="${escapeHtml(bill.id)}">暂停</button>` : bill.status === 'paused' ? `<button class="secondary-button" type="button" data-action="resume-recurring" data-bill-id="${escapeHtml(bill.id)}">恢复</button>` : ''}${bill.status !== 'ended' ? `<button class="secondary-button" type="button" data-action="end-recurring" data-bill-id="${escapeHtml(bill.id)}">结束</button><button class="secondary-button" type="button" data-action="link-recurring-payment" data-bill-id="${escapeHtml(bill.id)}">关联流水</button><button class="primary-button" type="button" data-action="record-recurring-payment" data-bill-id="${escapeHtml(bill.id)}">记录付款</button>` : ''}</div>
+    </article>`).join('');
+  const candidateRows = candidates.map((candidate, index) => {
+    const history = candidate.transactionIds.map((id) => state.transactions.find((item) => item.id === id)).filter(Boolean);
+    return `<article class="feature-row"><div><strong>${escapeHtml(candidate.name || candidate.category)}</strong><small>${candidate.count} 笔相近金额记录 · ${candidate.cadence === 'monthly' ? '月付候选' : '年付候选'}</small><details><summary>查看对应历史流水（${history.length}）</summary>${history.map((item) => `<button class="text-button" type="button" data-action="view-history-source" data-transaction-id="${escapeHtml(item.id)}">${escapeHtml(dateKey(item.occurredAt))} · ${money(item.amount)} · ${escapeHtml(item.note || '无备注')}</button>`).join('')}</details></div><div><strong>约 ${money(candidate.amount)}</strong><small>仍需确认周期</small></div><button class="secondary-button" type="button" data-action="create-recurring-candidate" data-candidate-index="${index}">设为周期账单</button></article>`;
+  }).join('');
+  return `${pageHeader('周期账单', '预计付款独立展示；确认实际扣款后才计入收支。', `<button class="primary-button" type="button" data-action="open-recurring">${icon('ph-plus')}新增周期账单</button>`)}${reportSectionTabs()}
+    ${soon.length ? `<section class="content-panel"><div class="panel-heading"><h2>待付款</h2><span class="panel-note">打开应用时按本地日期计算 · 不影响账户余额</span></div><div class="feature-list">${soon.map((bill) => `<div class="account-row"><span class="account-icon">${icon('ph-calendar-check')}</span><span class="account-main"><strong>${escapeHtml(bill.name)} · ${money(bill.amount)}</strong><small>${bill.isDue ? `已到付款日 ${bill.nextDueDate}` : `预计 ${bill.nextDueDate}`}</small></span></div>`).join('')}</div></section>` : ''}
+    <section class="content-panel"><div class="panel-heading"><h2>已设置项目</h2><span class="panel-note">${bills.length} 项</span></div><div class="feature-list">${rows || '<p class="panel-note">还没有周期账单。</p>'}</div></section>
+    <section class="content-panel"><div class="panel-heading"><h2>重复支出候选</h2><span class="panel-note">按跨周期日期和相近金额筛选，需手动确认</span></div><div class="feature-list">${candidateRows || '<p class="panel-note">当前没有满足条件的候选。</p>'}</div></section>`;
+}
+
+function renderCategoryBudgets() {
+  const month = monthKey(state.selectedMonth);
+  const summary = categoryBudgetRows({ month, budgets: state.categoryBudgets, transactions: state.transactions, categories: state.categories });
+  const rows = state.categories.filter((category) => category.type === 'expense').map((category) => {
+    const row = summary.rows.find((item) => item.category.id === category.id) || { limit: 0, used: 0, remaining: 0, over: 0 };
+    const detail = row.over ? `超支 ${money(row.over)}` : `剩余 ${money(row.remaining)}`;
+    return `<div class="budget-category-row"><button type="button" class="text-button" data-action="view-budget-category" data-category-id="${escapeHtml(category.id)}" ${row.used ? '' : 'disabled'}>${escapeHtml(category.label)}<small>已用 ${money(row.used)} · ${detail}</small></button><label class="field"><span>分类额度</span><input class="text-input" name="budget-${escapeHtml(category.id)}" type="number" min="0" step="0.01" value="${row.limit ? yuanFromCents(row.limit) : ''}" placeholder="未设置" /></label></div>`;
+  }).join('');
+  const totalBudget = centsFromYuan(state.profile.monthlyBudget);
+  return `${pageHeader('分类预算', '按月保存分类额度，实际支出由流水实时计算。', '')}${reportSectionTabs()}
+    <div class="toolbar"><div class="month-control"><button class="icon-button" type="button" data-action="previous-month" aria-label="上个月">${icon('ph-caret-left')}</button><strong>${escapeHtml(monthLabel())}</strong><button class="icon-button" type="button" data-action="next-month" aria-label="下个月">${icon('ph-caret-right')}</button></div><button class="secondary-button" type="button" data-action="copy-last-month-budgets">复制上月设置</button></div>
+    <section class="content-panel"><div class="panel-heading"><h2>${escapeHtml(month)} 分类额度</h2><span class="panel-note">额度 ${money(summary.totalLimit)} · 已用 ${money(summary.totalUsed)}</span></div>${totalBudget && summary.totalLimit > totalBudget ? `<p class="notice-text">分类额度合计 ${money(summary.totalLimit)}，超过总预算 ${money(totalBudget)}。</p>` : ''}<form id="category-budget-form" data-month="${escapeHtml(month)}"><div class="budget-category-list">${rows}</div><div class="form-actions"><button class="primary-button" type="submit">保存本月分类额度</button></div></form></section>`;
+}
+
 function renderReports() {
+  if (state.reportSection === 'recurring') return renderRecurringBills();
+  if (state.reportSection === 'budget') return renderCategoryBudgets();
   const { start, end } = periodBounds(state.reportPeriod);
   const stats = statsForRange(start, end);
   stats.balance = stats.income - stats.expense;
@@ -1290,6 +1609,7 @@ function renderReports() {
     </div>`).join('');
   return `
     ${pageHeader('报表', '周报看近期变化，月报看完整收支和分类结构。', `<button class="secondary-button" type="button" data-view="ledger">${icon('ph-list-bullets')}查看流水</button>`)}
+    ${reportSectionTabs()}
     <div class="toolbar">
       <div class="period-switch">
         <button class="${state.reportPeriod === 'week' ? 'primary-button' : 'secondary-button'}" type="button" data-action="report-period" data-period="week" aria-pressed="${state.reportPeriod === 'week'}">每周</button>
@@ -1712,6 +2032,20 @@ function localSpendingHabitAnalysis() {
   const largest = [...transactions].sort((a, b) => b.amount - a.amount).slice(0, 3);
   return { count: transactions.length, total, categories, repeated, largest };
 }
+function isSpendingReasonQuestion(text) {
+  return /为什么|原因|多花|增加|变多|增多|上涨|高了|差额/.test(String(text || '')) && /支出|消费|花费|花了|开销/.test(String(text || ''));
+}
+function currentSpendingChangeFacts() {
+  return buildSpendingChangeFacts({ month: monthKey(state.selectedMonth), transactions: state.transactions, categories: state.categories });
+}
+function spendingChangeReply(facts) {
+  if (!facts.currentCount && !facts.previousCount) return '这两个周期都没有支出流水，暂时无法比较。';
+  if (!facts.previousCount) return `本期记录 ${facts.currentCount} 笔支出，合计 ${money(facts.currentAmount)}；上期没有可比流水，暂时不能判断支出是否增加。`;
+  if (!facts.difference) return `本期支出 ${money(facts.currentAmount)}，与上期持平。匹配 ${facts.currentCount} 笔本期支出和 ${facts.previousCount} 笔上期支出。`;
+  const direction = facts.difference > 0 ? '增加' : '减少';
+  const drivers = facts.categories.filter((item) => facts.difference > 0 ? item.difference > 0 : item.difference < 0).slice(0, 3).map((item) => `${item.category} ${money(Math.abs(item.difference))}`).join('、');
+  return `本期支出 ${money(facts.currentAmount)}，上期 ${money(facts.previousAmount)}，合计${direction} ${money(Math.abs(facts.difference))}。${drivers ? `${facts.difference > 0 ? '增额' : '减额'}主要来自 ${drivers}。` : '各分类变化抵消后形成了本期差额。'}数字按完整周期流水计算，不推断个人动机。`;
+}
 function isAgentCorrectionRequest(text) {
   return /修改|改错|记错|更正|纠正|改成|改为|改到|换成|换到|调整为|改回|日期错|金额错|类型错|收支错|类目错|分类错|账户错|备注错/.test(String(text || ''));
 }
@@ -1989,6 +2323,10 @@ function localAgentResponse(text) {
       + (lines.length ? `\n${lines.join('\n')}` : '') + (historyQuery.hasMore ? '\n当前显示前 20 笔，流水页可查询全部匹配。' : '');
     return { kind: 'answer', reply, historyQuery };
   }
+  if (isSpendingReasonQuestion(text)) {
+    const spendingFacts = currentSpendingChangeFacts();
+    return { kind: 'answer', reply: spendingChangeReply(spendingFacts), spendingFacts };
+  }
   const answer = localAgentAnswer(text);
   if (answer) return answer;
   const transactionIntent = /记|花|买|付|消费|购物|日用|支出|收入|工资|薪资|到账|奖金|报销|退款|转账|充值|会员|订阅|GPT|OpenAI|外卖|早餐|午饭|午餐|晚餐|地铁|公交|打车|房租|盒马|超市|买菜|家政|洗衣液|垃圾桶|枕头|锅|刀具|锅铲|水电|燃气|天然气|话费/.test(text);
@@ -2199,21 +2537,32 @@ function ledgerContextForAgent(query = '') {
   const categories = reportCategoryData(stats.transactions).map(({ category, amount }) => ({ id: category.id, label: category.label, amountYuan: yuanFromCents(amount) }));
   const periodicReview = isPeriodicReviewRequest(query) ? periodicReviewData(query) : null;
   const historyQuery = isAgentCorrectionRequest(query) ? null : ledgerHistoryQuery(query);
+  const spendingFacts = isSpendingReasonQuestion(query) ? currentSpendingChangeFacts() : null;
   const recentTransactions = isAgentCorrectionRequest(query)
     ? findAgentCorrectionTargets(query, correctionChangeIndex(query)).candidates
-    : historyQuery ? [] : sortTransactions(state.transactions).slice(0, 30);
+    : historyQuery || spendingFacts ? [] : sortTransactions(state.transactions).slice(0, 30);
+  const relatedTransactions = spendingFacts ? state.transactions.filter((item) => spendingFacts.transactionIds.includes(item.id))
+    .sort((a, b) => b.amount - a.amount).slice(0, 12).map(agentHistorySnapshot) : [];
   return {
     ...(historyQuery ? { historyQuery } : {}),
+    ...(spendingFacts ? { spendingChangeFacts: { fact_id: spendingFacts.fact_id, month: spendingFacts.month, previousMonth: spendingFacts.previousMonth,
+      currentPeriod: spendingFacts.currentPeriod, previousPeriod: spendingFacts.previousPeriod,
+      currentAmountYuan: yuanFromCents(spendingFacts.currentAmount), previousAmountYuan: yuanFromCents(spendingFacts.previousAmount),
+      differenceYuan: yuanFromCents(spendingFacts.difference), currentCount: spendingFacts.currentCount, previousCount: spendingFacts.previousCount,
+      categories: spendingFacts.categories.slice(0, 5).map(({ transactionIds, ...fact }) => ({ ...fact,
+        currentAmountYuan: yuanFromCents(fact.currentAmount), previousAmountYuan: yuanFromCents(fact.previousAmount), differenceYuan: yuanFromCents(fact.difference) })) },
+      analysisTransactions: relatedTransactions } : {}),
     productContext: isProductQuery(query) ? compareProductPrices(state, { query, quote: parseProductQuote(query) }) : undefined,
-    selectedMonth: monthKey(state.selectedMonth),
-    today: dateKey(new Date()),
     currency: 'CNY',
+    ...(!spendingFacts ? { selectedMonth: monthKey(state.selectedMonth), today: dateKey(new Date()) } : {}),
     ...(periodicReview ? { periodicReviewFacts: periodicReview.facts, periodicReviewMeta: { coverageMonths: periodicReview.coverageMonths, annual: periodicReview.annual, year: periodicReview.year } } : {}),
-    currentMonth: { incomeYuan: yuanFromCents(stats.income), expenseYuan: yuanFromCents(stats.expense), balanceYuan: yuanFromCents(stats.balance), count: stats.transactions.length },
-    previousMonth: { incomeYuan: yuanFromCents(previous.income), expenseYuan: yuanFromCents(previous.expense), balanceYuan: yuanFromCents(previous.balance), count: previous.transactions.length },
-    categories,
-    availableCategories: state.categories.map((item) => ({ label: item.label, type: item.type })),
-    availableAccounts: activeAccounts().map((item) => ({ name: item.name, type: item.type })),
+    ...(!spendingFacts ? {
+      currentMonth: { incomeYuan: yuanFromCents(stats.income), expenseYuan: yuanFromCents(stats.expense), balanceYuan: yuanFromCents(stats.balance), count: stats.transactions.length },
+      previousMonth: { incomeYuan: yuanFromCents(previous.income), expenseYuan: yuanFromCents(previous.expense), balanceYuan: yuanFromCents(previous.balance), count: previous.transactions.length },
+      categories,
+      availableCategories: state.categories.map((item) => ({ label: item.label, type: item.type })),
+      availableAccounts: activeAccounts().map((item) => ({ name: item.name, type: item.type })),
+    } : {}),
     recentTransactions: recentTransactions.map(agentHistorySnapshot),
   };
 }
@@ -2325,7 +2674,8 @@ function agentDraftsFromResult(result) {
 
 function agentMessageDataFromResult(result) {
   const data = { ...agentDraftDataFromResult(result), ...(result?.comparison ? { comparison: result.comparison } : {}),
-    ...(result?.historyQuery ? { historyQuery: result.historyQuery } : {}) };
+    ...(result?.historyQuery ? { historyQuery: result.historyQuery } : {}),
+    ...(result?.spendingFacts ? { spendingFacts: result.spendingFacts } : {}) };
   if (result?.kind === 'transaction_update' && result.editSuggestion) return { ...data, editSuggestion: result.editSuggestion, editStatus: 'pending' };
   if (result?.kind === 'memory_suggestion' && result.memory) return { ...data, memorySuggestion: result.memory, memoryStatus: 'pending' };
   if (result?.kind === 'periodic_review') return { ...data, periodicReview: { headline: result.headline, highlights: result.highlights, closing: result.closing, facts: result.facts || [] } };
@@ -2342,6 +2692,11 @@ function agentDraftDataFromResult(result) {
 
 function reconcileRemoteAgentResult(remoteResult, localResult, localDrafts) {
   if (localResult?.comparison) return localResult;
+  if (localResult?.spendingFacts) {
+    const explanation = String(remoteResult?.reply || '').trim();
+    const includesNumbers = /[\d¥￥%]|[零〇一二三四五六七八九十百千万亿]+\s*(?:元|笔|次|%)/.test(explanation);
+    return { ...localResult, ...(explanation && !includesNumbers ? { reply: `${localResult.reply}\n${explanation}` } : {}) };
+  }
   if (localResult?.kind === 'transaction_update') return localResult;
   if (localResult?.kind !== 'transaction_draft') return remoteResult || localResult;
   const remoteDrafts = agentDraftsFromResult(remoteResult);
@@ -2420,7 +2775,7 @@ async function sendAgentMessage(text, integrationDraftId = '') {
   const localDrafts = agentDraftsFromResult(localResult);
   const remoteTimeoutMs = localDrafts.length > 1 ? REMOTE_AGENT_MULTI_TIMEOUT_MS : REMOTE_AGENT_SINGLE_TIMEOUT_MS;
   const remoteEnabled = hasRemoteAgentConfig() && !localResult?.historyQuery;
-  const requestMessages = state.agentMessages.slice(-12).map((message) => ({ role: message.role, content: message.content }));
+  const requestMessages = localResult?.spendingFacts ? [{ role: 'user', content }] : state.agentMessages.slice(-12).map((message) => ({ role: message.role, content: message.content }));
   const immediateResult = localResult || {
     kind: 'answer',
     reply: remoteEnabled ? '我已收到这条内容，先为你保留在当前对话中，模型将在后台继续分析。' : '目前我可以直接帮你记账和查询本月收支。配置模型后，还能理解更灵活的表达。',
@@ -2621,6 +2976,18 @@ function renderHistorySources(historyQuery) {
   return `<div class="price-sources">${historyQuery.transactions.map((item) => `<button class="text-button" type="button" data-action="view-history-source" data-transaction-id="${escapeHtml(item.id)}">查看 ${escapeHtml(item.date)} · ${escapeHtml(String(item.note || item.category).slice(0, 24))} 的原账单</button>`).join('')}</div>`;
 }
 
+function renderSpendingFacts(facts) {
+  if (!facts) return '';
+  const changed = facts.categories.filter((item) => item.difference !== 0).sort((a, b) => Math.abs(b.difference) - Math.abs(a.difference));
+  const visible = changed.slice(0, 5);
+  const rows = visible.map((fact) => {
+    const liveIds = fact.transactionIds.filter((id) => state.transactions.some((transaction) => transaction.id === id && !transaction.deletedAt));
+    const invalidCount = fact.transactionIds.length - liveIds.length;
+    return `<div class="agent-fact-row"><div><strong>${escapeHtml(fact.category)}</strong><small>本期 ${money(fact.currentAmount)} · 上期 ${money(fact.previousAmount)} · ${fact.difference > 0 ? '增加' : '减少'} ${money(Math.abs(fact.difference))}（${Math.abs(fact.contributionPercent).toFixed(1)}%）</small></div><div class="button-row">${invalidCount ? `<small class="invalid-source">来源失效 ${invalidCount} 笔</small>` : ''}<button class="text-button" type="button" data-action="view-agent-fact" data-category-id="${escapeHtml(fact.categoryId)}" data-start-date="${escapeHtml(facts.previousPeriod.start)}" data-end-date="${escapeHtml(facts.currentPeriod.end)}" ${liveIds.length ? '' : 'disabled'}>查看相关流水</button></div></div>`;
+  }).join('');
+  return `<section class="agent-draft-card agent-facts-card"><div class="panel-heading"><h3>支出变化事实</h3><span class="panel-note">${escapeHtml(facts.previousPeriod.start)} 至 ${escapeHtml(facts.currentPeriod.end)}</span></div><p>匹配 ${facts.currentCount + facts.previousCount} 笔：本期 ${facts.currentCount} 笔、${money(facts.currentAmount)}；上期 ${facts.previousCount} 笔、${money(facts.previousAmount)}。差额 ${facts.difference > 0 ? '+' : facts.difference < 0 ? '−' : ''}${money(Math.abs(facts.difference))}。</p><div class="agent-fact-list">${rows || '<p class="panel-note">没有分类差额。</p>'}</div>${changed.length > 5 ? `<small class="panel-note">按差额展示前 5 类；总额计算包含全部分类。</small>` : ''}</section>`;
+}
+
 function renderAgentMessage(message) {
   const assistant = message.role === 'assistant';
   return `
@@ -2630,6 +2997,7 @@ function renderAgentMessage(message) {
         <div class="agent-bubble">${escapeHtml(message.content).replaceAll('\\n', '<br>')}</div>
         ${renderPriceSources(message.comparison)}
         ${renderHistorySources(message.historyQuery)}
+        ${assistant ? renderSpendingFacts(message.spendingFacts) : ''}
         ${assistant ? renderAgentDraft(message) : ''}
         ${assistant ? renderAgentEditSuggestion(message) : ''}
         ${assistant ? renderAgentMemorySuggestion(message) : ''}
@@ -3013,7 +3381,7 @@ function openTransactionDialog(transaction = null, prefill = {}) {
   const note = prefill.note ?? transaction?.note ?? '';
   const tags = Array.isArray(transaction?.tags) ? transaction.tags.join('，') : '';
   openDialog(`
-    <form class="dialog-content" id="transaction-form" data-transaction-id="${escapeHtml(transaction?.id || '')}">
+    <form class="dialog-content" id="transaction-form" data-transaction-id="${escapeHtml(transaction?.id || '')}" data-recurring-bill-id="${escapeHtml(prefill.recurringBillId || '')}" data-shopping-item-id="${escapeHtml(prefill.shoppingItemId || '')}">
       <div class="dialog-header">
         <div><h2 id="dialog-title">${transaction ? '编辑流水' : '记一笔'}</h2><p>按实际到账或实际支付金额记录，保存后立即更新月度汇总。</p></div>
         <button class="icon-button dialog-close" type="button" data-action="close-dialog" aria-label="关闭">${icon('ph-x')}</button>
@@ -3032,6 +3400,7 @@ function openTransactionDialog(transaction = null, prefill = {}) {
         <label class="field"><span>发生时间</span><input class="text-input" name="occurredAt" type="datetime-local" value="${escapeHtml(localDateTimeValue(occurredAt))}" required /></label>
         <label class="field"><span>标签（可选）</span><input class="text-input" name="tags" value="${escapeHtml(tags)}" placeholder="如：工作日、固定支出" /></label>
         <label class="field"><span>支付 / 收款渠道（可选）</span><select class="select-input" name="paymentChannel">${paymentChannelOptions(transaction?.paymentChannel || prefill.paymentChannel)}</select></label>
+        <label class="field"><span>商店（可选）</span><input class="text-input" name="shopName" maxlength="80" value="${escapeHtml(transaction?.shopName || prefill.shopName || '')}" placeholder="如：线上商城、社区超市" /></label>
         <label class="field field-span-2"><span>备注</span><textarea class="text-area" name="note" placeholder="这笔钱花在了哪里，或来自哪里">${escapeHtml(note)}</textarea></label>
       </div>
       <p class="field-hint">账户决定余额，渠道表示付款或收款方式。账户不明时可先查重；新增流水需确认实际账户。</p>
@@ -3234,8 +3603,17 @@ async function removeTransaction(transactionId) {
   const transaction = state.transactions.find((item) => item.id === transactionId);
   if (!transaction) return;
   if (!window.confirm(`确定删除“${transaction.note || getCategory(transaction.categoryId).label}”这笔流水吗？`)) return;
-  if (!state.demo) await dbDelete(STORES.transactions, transactionId);
+  const recurringBills = state.recurringBills.map((bill) => {
+    const withoutPayment = removeRecurringPayment(bill, transactionId);
+    return bill.sourceTransactionId === transactionId ? { ...withoutPayment, sourceTransactionId: '' } : withoutPayment;
+  });
+  const changedBills = recurringBills.filter((bill, index) => bill !== state.recurringBills[index]);
+  if (!state.demo) await dbWriteBundle({
+    [STORES.transactions]: { delete: [transactionId] },
+    ...(changedBills.length ? { [STORES.recurringBills]: changedBills } : {}),
+  });
   state.transactions = state.transactions.filter((item) => item.id !== transactionId);
+  state.recurringBills = recurringBills;
   render();
   toast('流水已删除。');
   void syncIntegrationSummary();
@@ -3244,9 +3622,12 @@ async function removeTransaction(transactionId) {
 async function exportData() {
   const payload = {
     app: '打工人小账本',
-    version: 3,
+    version: 4,
     products: state.products,
     productCategories: state.productCategories,
+    recurringBills: state.recurringBills,
+    categoryBudgets: state.categoryBudgets,
+    shoppingList: state.shoppingList,
     exportedAt: new Date().toISOString(),
     profile: state.profile,
     categories: state.categories,
@@ -3270,17 +3651,22 @@ async function importData(file) {
   if (!state.demo) await dbWriteBundle({
     [STORES.transactions]: data.transactions, [STORES.products]: data.products, [STORES.productCategories]: data.productCategories,
     [STORES.categories]: data.categories, [STORES.accounts]: data.accounts, [STORES.agentMessages]: [],
+    [STORES.recurringBills]: data.recurringBills, [STORES.categoryBudgets]: data.categoryBudgets, [STORES.shoppingList]: data.shoppingList,
     [STORES.agentMemory]: Array.isArray(data.agentMemory) ? data.agentMemory : [],
     [STORES.settings]: [{ ...DEFAULT_PROFILE, ...(data.profile || {}), key: 'profile' }],
   }, true);
   state.products = data.products;
   state.productCategories = data.productCategories;
+  state.recurringBills = data.recurringBills;
+  state.categoryBudgets = data.categoryBudgets;
+  state.shoppingList = data.shoppingList;
   state.profile = { ...DEFAULT_PROFILE, ...(data.profile || {}), salaryEstimate: { ...DEFAULT_PROFILE.salaryEstimate, ...(data.profile?.salaryEstimate || {}) } };
   state.transactions = sortTransactions(data.transactions);
   state.categories = data.categories;
   state.accounts = data.accounts;
   state.agentMessages = [];
   state.agentMemory = Array.isArray(data.agentMemory) ? data.agentMemory : [];
+  transactionHistoryCache = null;
   render();
   toast('备份已导入。');
   void syncIntegrationSummary();
@@ -3290,6 +3676,7 @@ async function resetData() {
   if (!window.confirm('确定清空当前设备中的全部账本数据吗？此操作不能撤销。')) return;
   if (!state.demo) await dbWriteBundle({
     [STORES.transactions]: [], [STORES.products]: [], [STORES.productCategories]: DEFAULT_PRODUCT_CATEGORIES,
+    [STORES.recurringBills]: [], [STORES.categoryBudgets]: [], [STORES.shoppingList]: [],
     [STORES.categories]: DEFAULT_CATEGORIES, [STORES.accounts]: DEFAULT_ACCOUNTS, [STORES.agentMessages]: [], [STORES.agentMemory]: [],
     [STORES.settings]: [{ key: 'profile', ...DEFAULT_PROFILE }],
   }, true);
@@ -3297,6 +3684,10 @@ async function resetData() {
   state.productCategories = DEFAULT_PRODUCT_CATEGORIES.map((item) => ({ ...item }));
   state.profile = { ...DEFAULT_PROFILE, salaryEstimate: { ...DEFAULT_PROFILE.salaryEstimate } };
   state.transactions = [];
+  state.recurringBills = [];
+  state.categoryBudgets = [];
+  state.shoppingList = [];
+  transactionHistoryCache = null;
   state.agentMessages = [];
   state.categories = [...DEFAULT_CATEGORIES];
   state.accounts = [...DEFAULT_ACCOUNTS];
@@ -3349,6 +3740,128 @@ document.addEventListener('click', async (event) => {
   }
   try {
     if (action === 'retry-load') { await loadData(); return; }
+    if (action === 'open-statement-import') { state.statementImport = null; state.ledgerSection = 'import'; navigate('ledger'); return; }
+    if (action === 'select-statement-file') { document.querySelector('#statement-file')?.click(); return; }
+    if (action === 'ledger-section') { state.ledgerSection = actionTarget.dataset.section === 'shopping' ? 'shopping' : 'transactions'; navigate('ledger'); return; }
+    if (action === 'import-previous-page') { state.statementImport.page = Math.max(0, state.statementImport.page - 1); render(); return; }
+    if (action === 'import-next-page') { state.statementImport.page += 1; render(); return; }
+    if (action === 'back-to-statement-mapping') { state.statementImport.rows = null; state.statementImport.page = 0; render(); return; }
+    if (action === 'apply-import-account') { applyStatementImportBulk('accountId', document.querySelector('#import-bulk-account')?.value); render(); return; }
+    if (action === 'apply-import-category') { applyStatementImportBulk('categoryId', document.querySelector('#import-bulk-category')?.value); render(); return; }
+    if (action === 'commit-statement-import') {
+      const current = state.statementImport;
+      const updates = new Map();
+      const incoming = [];
+      for (const row of current.rows) {
+        if (row.decision === 'skip') continue;
+        if (row.decision === 'pending') throw new Error(`第 ${row.line} 行尚未选择处理方式。`);
+        if (row.decision === 'import') {
+          const errors = statementImportRowErrors(row);
+          if (errors.length) throw new Error(`第 ${row.line} 行：${errors.join('；')}。`);
+          incoming.push(row.transaction);
+        } else if (String(row.decision).startsWith('link:')) {
+          const errors = statementImportLinkErrors(row);
+          if (errors.length) throw new Error(`第 ${row.line} 行：${errors.join('；')}。`);
+          const transactionId = row.decision.slice(5);
+          const existing = updates.get(transactionId) || state.transactions.find((item) => item.id === transactionId);
+          if (!existing) throw new Error('待关联的原流水已不存在，请重新核对。');
+          updates.set(transactionId, associateTransaction(existing, row.transaction));
+        }
+      }
+      const batch = [...updates.values(), ...incoming];
+      if (!batch.length) throw new Error('没有选择可入账或可关联的流水。');
+      await persistTransactions(batch, `账单核对完成 · 新增 ${incoming.length} 笔，关联 ${updates.size} 笔。`);
+      state.statementImport = null;
+      state.ledgerSection = 'transactions';
+      render();
+      return;
+    }
+    if (action === 'view-agent-fact') {
+      state.ledgerSection = 'transactions'; state.ledgerScope = 'all'; state.ledgerCategory = actionTarget.dataset.categoryId;
+      state.ledgerStartDate = actionTarget.dataset.startDate; state.ledgerEndDate = actionTarget.dataset.endDate;
+      state.searchTerm = ''; state.ledgerType = 'all'; state.ledgerAccount = 'all'; state.ledgerPage = 0;
+      navigate('ledger');
+      return;
+    }
+    if (action === 'open-shopping-item') { openShoppingDialog(); return; }
+    if (action === 'edit-shopping-item') { openShoppingDialog(state.shoppingList.find((item) => item.id === actionTarget.dataset.itemId)); return; }
+    if (action === 'remove-shopping-item') {
+      const itemId = actionTarget.dataset.itemId;
+      if (!state.demo) await dbDelete(STORES.shoppingList, itemId);
+      state.shoppingList = state.shoppingList.filter((item) => item.id !== itemId);
+      render();
+      return;
+    }
+    if (action === 'record-shopping-purchase') {
+      const item = state.shoppingList.find((entry) => entry.id === actionTarget.dataset.itemId);
+      if (!item) throw new Error('待购商品已不存在。');
+      const product = state.products.find((entry) => entry.id === item.productId);
+      const categoryName = state.productCategories.find((entry) => entry.id === item.productCategoryId)?.name || '';
+      openTransactionDialog(null, { type: 'expense', note: item.nameSnapshot, shoppingItemId: item.id,
+        items: [{ id: '', productId: item.productId, productCategoryId: item.productCategoryId, nameSnapshot: item.nameSnapshot,
+          categoryName, brand: product?.brand || item.brand, variant: product?.variant || item.variant,
+          quantity: item.quantity, unitSize: item.unitSize, unit: item.unit, paidAmount: '', priceBasis: 'actual' }] });
+      return;
+    }
+    if (action === 'open-recurring') { openRecurringDialog(); return; }
+    if (action === 'create-recurring-from-transaction') {
+      const transaction = state.transactions.find((item) => item.id === actionTarget.dataset.transactionId && item.type === 'expense' && !item.deletedAt);
+      if (!transaction) throw new Error('只能从有效支出流水创建周期账单。');
+      openRecurringDialog(null, { transaction, cadence: 'monthly' });
+      return;
+    }
+    if (action === 'create-recurring-candidate') {
+      const candidate = state.recurringCandidates[Number(actionTarget.dataset.candidateIndex)];
+      if (!candidate) throw new Error('周期账单候选已失效，请重新打开页面。');
+      openRecurringDialog(null, candidate);
+      return;
+    }
+    if (['pause-recurring', 'resume-recurring', 'end-recurring'].includes(action)) {
+      const bill = state.recurringBills.find((item) => item.id === actionTarget.dataset.billId);
+      if (!bill) throw new Error('周期账单已不存在。');
+      const status = action === 'pause-recurring' ? 'paused' : action === 'resume-recurring' ? 'active' : 'ended';
+      const next = normalizeRecurringBill({ ...bill, status, updatedAt: new Date().toISOString() });
+      if (!state.demo) await dbPut(STORES.recurringBills, next);
+      state.recurringBills = state.recurringBills.map((item) => item.id === next.id ? next : item);
+      render();
+      return;
+    }
+    if (action === 'link-recurring-payment') {
+      const bill = state.recurringBills.find((item) => item.id === actionTarget.dataset.billId);
+      if (!bill) throw new Error('周期账单已不存在。');
+      openRecurringPaymentLink(bill);
+      return;
+    }
+    if (action === 'record-recurring-payment') {
+      const bill = state.recurringBills.find((item) => item.id === actionTarget.dataset.billId);
+      if (!bill) throw new Error('周期账单已不存在。');
+      openTransactionDialog(null, { type: 'expense', note: bill.name, accountId: bill.accountId, categoryId: bill.categoryId || 'food', recurringBillId: bill.id });
+      return;
+    }
+    if (action === 'report-section') {
+      state.reportSection = ['summary', 'recurring', 'budget'].includes(actionTarget.dataset.section) ? actionTarget.dataset.section : 'summary';
+      if (state.activeView !== 'reports') navigate('reports'); else render();
+      return;
+    }
+    if (action === 'copy-last-month-budgets') {
+      const month = monthKey(state.selectedMonth);
+      const copied = previousMonthBudgets(state.categoryBudgets, month);
+      if (!copied.length) { toast('上月没有分类预算可复制。'); return; }
+      const current = state.categoryBudgets.filter((item) => item.month !== month);
+      const next = normalizeCategoryBudgets([...current, ...copied], state.categories);
+      if (!state.demo) await dbWriteBundle({ [STORES.categoryBudgets]: { put: copied, delete: state.categoryBudgets.filter((item) => item.month === month).map((item) => item.id) } });
+      state.categoryBudgets = next;
+      render();
+      return;
+    }
+    if (action === 'view-budget-category') {
+      state.ledgerScope = 'all'; state.ledgerCategory = actionTarget.dataset.categoryId;
+      state.ledgerStartDate = `${monthKey(state.selectedMonth)}-01`;
+      const year = state.selectedMonth.getFullYear(), month = state.selectedMonth.getMonth() + 1;
+      state.ledgerEndDate = `${monthKey(state.selectedMonth)}-${String(new Date(year, month, 0).getDate()).padStart(2, '0')}`;
+      state.ledgerSection = 'transactions'; state.searchTerm = ''; state.ledgerType = 'all'; state.ledgerAccount = 'all'; state.ledgerPage = 0;
+      navigate('ledger'); return;
+    }
     if (action === 'open-transaction') { openTransactionDialog(); return; }
     if (action === 'close-dialog') { closeDialog(); return; }
     if (action === 'set-transaction-type') { updateTransactionType(actionTarget.dataset.type); return; }
@@ -3470,6 +3983,19 @@ document.addEventListener('click', async (event) => {
 });
 
 document.addEventListener('change', async (event) => {
+  if (event.target.id === 'statement-file') {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    try {
+      const statement = inspectStatementCsv(parseStatementCsv(decodeStatementFile(await file.arrayBuffer())));
+      state.statementImport = { name: file.name, statement, mapping: statement.mapping, source: statement.source,
+        sourceAccountId: '', defaultAccountId: '', defaultCategoryId: state.categories.find((item) => item.id === 'daily' && item.type === 'expense')?.id || '', rows: null, page: 0 };
+      state.ledgerSection = 'import';
+      navigate('ledger');
+    } catch (error) { toast(error instanceof Error ? error.message : '账单文件无法读取。', 'error'); }
+    return;
+  }
   if (event.target.id === 'agent-screenshot-input') {
     const file = event.target.files?.[0];
     event.target.value = '';
@@ -3486,6 +4012,31 @@ document.addEventListener('change', async (event) => {
   if (event.target.id === 'ledger-type-filter') { state.ledgerType = event.target.value; state.ledgerPage = 0; render(); }
   if (event.target.id === 'ledger-account-filter') { state.ledgerAccount = event.target.value; state.ledgerPage = 0; render(); }
   if (event.target.id === 'ledger-scope-filter') { state.ledgerScope = event.target.value; state.ledgerPage = 0; render(); }
+  if (event.target.id === 'ledger-category-filter') { state.ledgerCategory = event.target.value; state.ledgerPage = 0; render(); }
+  if (event.target.id === 'ledger-start-date' || event.target.id === 'ledger-end-date') {
+    const start = event.target.id === 'ledger-start-date' ? event.target.value : state.ledgerStartDate;
+    const end = event.target.id === 'ledger-end-date' ? event.target.value : state.ledgerEndDate;
+    if (start && end && start > end) { toast('开始日期不能晚于结束日期。', 'error'); return; }
+    state.ledgerStartDate = start; state.ledgerEndDate = end; state.ledgerPage = 0; render();
+  }
+  if (event.target.id === 'shopping-shop-filter') { state.shoppingShopName = event.target.value; render(); }
+  const importRow = event.target.closest('[data-row-index]');
+  if (importRow && state.statementImport?.rows) {
+    const row = state.statementImport.rows[Number(importRow.dataset.rowIndex)];
+    if (row) {
+      if (event.target.hasAttribute('data-import-decision')) row.decision = event.target.value;
+      else if (event.target.hasAttribute('data-import-field')) {
+        const field = event.target.dataset.importField;
+        row.transaction[field] = event.target.value;
+        if (field === 'type') {
+          row.transaction.categoryId = event.target.value === 'income' ? state.categories.find((item) => item.id === 'reimburse' && item.type === 'income')?.id || '' : event.target.value === 'transfer' ? 'transfer' : state.categories.find((item) => item.id === 'daily' && item.type === 'expense')?.id || '';
+          row.transaction.toAccountId = '';
+        }
+      }
+      render();
+      return;
+    }
+  }
   const changedDraftForm = event.target.closest('[data-agent-draft-form]');
   if (changedDraftForm) state.agentDraftEditLocks.add(changedDraftForm.dataset.messageId);
   if (event.target.classList.contains('agent-draft-type')) {
@@ -3504,6 +4055,11 @@ document.addEventListener('change', async (event) => {
 });
 
 document.addEventListener('input', (event) => {
+  const importField = event.target.closest('[data-import-field]');
+  if (importField && importField.dataset.importField === 'note' && state.statementImport?.rows) {
+    const row = state.statementImport.rows[Number(importField.dataset.rowIndex)];
+    if (row) row.transaction.note = event.target.value;
+  }
   if (event.target.closest('[data-product-editor]')) updateProductPreviews(event.target.closest('[data-product-editor]'));
   const editedDraftForm = event.target.closest('[data-agent-draft-form]');
   if (editedDraftForm) state.agentDraftEditLocks.add(editedDraftForm.dataset.messageId);
@@ -3563,6 +4119,68 @@ document.addEventListener('submit', async (event) => {
       await testAgentConnection(config);
       return;
     }
+    if (form.id === 'statement-mapping-form') {
+      buildStatementImportReview(data);
+      render();
+      return;
+    }
+    if (form.id === 'category-budget-form') {
+      const month = form.dataset.month;
+      const old = state.categoryBudgets.filter((item) => item.month === month);
+      const nextMonthRows = [];
+      for (const category of state.categories.filter((item) => item.type === 'expense')) {
+        const raw = String(data.get(`budget-${category.id}`) || '').trim();
+        if (!raw) continue;
+        const amount = centsFromYuan(raw);
+        if (amount < 0 || !Number.isSafeInteger(amount)) throw new Error(`${category.label}的预算金额无效。`);
+        if (amount) nextMonthRows.push({ id: `${month}:${category.id}`, month, categoryId: category.id, amount });
+      }
+      const normalized = normalizeCategoryBudgets([...state.categoryBudgets.filter((item) => item.month !== month), ...nextMonthRows], state.categories);
+      if (!state.demo) await dbWriteBundle({ [STORES.categoryBudgets]: { put: nextMonthRows, delete: old.map((item) => item.id) } });
+      state.categoryBudgets = normalized;
+      render();
+      toast('本月分类额度已保存。');
+      return;
+    }
+    if (form.id === 'recurring-form') {
+      const existing = state.recurringBills.find((item) => item.id === form.dataset.billId);
+      const cadence = String(data.get('cadence'));
+      const paymentDay = Number(data.get('paymentDay'));
+      const paymentMonth = Number(data.get('paymentMonth'));
+      const amount = centsFromYuan(data.get('amount'));
+      const bill = normalizeRecurringBill({ ...(existing || {}), id: existing?.id || id(), name: String(data.get('name') || ''), amount,
+        accountId: String(data.get('accountId') || ''), categoryId: String(data.get('categoryId') || ''), cadence, paymentDay,
+        ...(cadence === 'yearly' ? { paymentMonth } : {}), nextDueDate: String(data.get('nextDueDate') || ''),
+        status: existing?.status || 'active', payments: existing?.payments || [], sourceTransactionId: form.dataset.sourceTransactionId || existing?.sourceTransactionId || '',
+        updatedAt: new Date().toISOString(), createdAt: existing?.createdAt || new Date().toISOString() });
+      if (!state.accounts.some((account) => account.id === bill.accountId)) throw new Error('请确认周期账单账户。');
+      if (bill.categoryId && !state.categories.some((category) => category.id === bill.categoryId && category.type === 'expense')) throw new Error('请确认周期账单分类。');
+      if (!state.demo) await dbPut(STORES.recurringBills, bill);
+      state.recurringBills = [...state.recurringBills.filter((item) => item.id !== bill.id), bill];
+      closeDialog(); render(); toast('周期账单已保存。');
+      return;
+    }
+    if (form.id === 'recurring-link-form') {
+      const bill = state.recurringBills.find((item) => item.id === form.dataset.billId);
+      const transaction = state.transactions.find((item) => item.id === String(data.get('transactionId')));
+      if (!bill || !transaction) throw new Error('周期账单或流水已不存在。');
+      const next = recordRecurringPayment(bill, transaction);
+      if (!state.demo) await dbPut(STORES.recurringBills, next);
+      state.recurringBills = state.recurringBills.map((item) => item.id === next.id ? next : item);
+      closeDialog(); render(); toast('已关联流水，账户余额未变化。');
+      return;
+    }
+    if (form.id === 'shopping-item-form') {
+      const original = state.shoppingList.find((item) => item.id === form.dataset.itemId);
+      const quote = String(data.get('quoteAmount') || '').trim();
+      const item = normalizeShoppingItem({ ...(original || {}), id: original?.id || id(), productId: String(data.get('productId') || ''),
+        quantity: Number(data.get('quantity')), unitSize: Number(data.get('unitSize')), unit: String(data.get('unit')),
+        quoteAmount: quote ? centsFromYuan(quote) : 0, createdAt: original?.createdAt || new Date().toISOString() }, state.products, state.productCategories);
+      if (!state.demo) await dbPut(STORES.shoppingList, item);
+      state.shoppingList = [...state.shoppingList.filter((entry) => entry.id !== item.id), item];
+      closeDialog(); render(); toast('待购商品已保存。');
+      return;
+    }
     if (form.id === 'transaction-form') {
       const original = state.transactions.find((item) => item.id === form.dataset.transactionId);
       const type = String(data.get('type'));
@@ -3580,17 +4198,22 @@ document.addEventListener('submit', async (event) => {
         accountId: String(data.get('accountId')),
         toAccountId: type === 'transfer' ? String(data.get('toAccountId')) : '',
         note: String(data.get('note') || '').trim(),
+        shopName: String(data.get('shopName') || '').trim(),
         tags: String(data.get('tags') || '').split(/[，,]/).map((tag) => tag.trim()).filter(Boolean).slice(0, 8),
         occurredAt,
         items: normalizeProductItems(readProductEditor(form), { amount, type }),
         source: original?.source || 'manual',
         createdAt: original?.createdAt || now,
         updatedAt: now,
+        ...(form.dataset.recurringBillId ? { recurringBillId: form.dataset.recurringBillId } : {}),
       };
       Object.assign(transaction, readTransactionDetails(form, transaction, original));
       const reconciliation = original ? { transactions: [transaction] } : await reconcileTransactions([transaction]);
       if (!reconciliation) return;
-      await persistTransactions(reconciliation.transactions, original ? '流水修改已保存。' : '已保存核对结果，关联来源不会重复计入收支。');
+      const transactionsToSave = form.dataset.recurringBillId
+        ? reconciliation.transactions.map((item) => ({ ...item, recurringBillId: form.dataset.recurringBillId }))
+        : reconciliation.transactions;
+      await persistTransactions(transactionsToSave, original ? '流水修改已保存。' : '已保存核对结果，关联来源不会重复计入收支。', { shoppingItemId: form.dataset.shoppingItemId || '' });
       closeDialog();
       return;
     }

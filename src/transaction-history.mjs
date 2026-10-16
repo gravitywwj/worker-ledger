@@ -85,7 +85,7 @@ export function searchTransactionHistory(index, query = {}) {
   const matches = index.entries.filter(({ transaction, date, amount, searchText }) => {
     if (query.type && query.type !== 'all' && transaction.type !== query.type) return false;
     if (query.accountId && query.accountId !== 'all' && transaction.accountId !== query.accountId && transaction.toAccountId !== query.accountId) return false;
-    if (query.categoryId && transaction.categoryId !== query.categoryId) return false;
+    if (query.categoryId && query.categoryId !== 'all' && transaction.categoryId !== query.categoryId) return false;
     return (!query.startDate || date >= query.startDate) && (!query.endDate || date <= query.endDate)
       && amount >= minAmount && amount <= maxAmount && terms.every((term) => searchText.includes(term));
   });
@@ -155,7 +155,8 @@ function lowerAmountBound(entries, amount) {
 
 export function findDuplicateTransactions(index, transactions, limit = 3) {
   const results = [];
-  const earlierDrafts = [];
+  const earlierByDay = new Map();
+  const earlierByStatement = new Map();
   for (const transaction of transactions) {
     const candidate = historyEntry(transaction, new Map(), new Map());
     if (!candidate || !['expense', 'income', 'transfer'].includes(transaction.type)) continue;
@@ -163,26 +164,49 @@ export function findDuplicateTransactions(index, transactions, limit = 3) {
     const maximum = Math.ceil(Math.max(candidate.amount + 100, candidate.amount / 0.95)) + 1;
     const matches = [];
     const checked = new Set();
-    const check = (entry) => {
+    const check = (entry, draftMatch = false) => {
       if (checked.has(entry)) return;
       checked.add(entry);
       const match = duplicateMatch(candidate, entry);
-      if (match) matches.push(match);
+      if (match) matches.push(draftMatch ? { ...match, draftMatch: true } : match);
     };
-    for (const key of candidate.identities) for (const entry of index.byStatement.get(key) || []) check(entry);
-    const types = transaction.type === 'transfer' ? ['transfer', 'expense', 'income'] : [transaction.type, 'transfer'];
-    for (const type of types) {
-      const entries = index.byType.get(type) || [];
-      for (let i = lowerAmountBound(entries, minimum); i < entries.length && entries[i].amount <= maximum; i++) check(entries[i]);
+    for (const key of candidate.identities) {
+      for (const entry of index.byStatement.get(key) || []) { check(entry); if (matches.length >= limit) break; }
+      for (const entry of earlierByStatement.get(key) || []) { check(entry, true); if (matches.length >= limit) break; }
     }
-    for (const draft of earlierDrafts) {
-      const match = duplicateMatch(candidate, draft);
-      if (match) matches.push({ ...match, draftMatch: true });
+    const hasStatementMatch = matches.some((match) => match.sameStatement);
+    if (!hasStatementMatch) {
+      const types = transaction.type === 'transfer' ? ['transfer', 'expense', 'income'] : [transaction.type, 'transfer'];
+      for (const type of types) {
+        const entries = index.byType.get(type) || [];
+        for (let i = lowerAmountBound(entries, minimum); i < entries.length && entries[i].amount <= maximum && matches.length < limit; i++) check(entries[i]);
+      }
+      for (const day of candidate.days) for (let offset = -3; offset <= 3 && matches.length < limit; offset += 1) {
+        const byType = earlierByDay.get(day + offset);
+        if (!byType) continue;
+        for (const type of types) {
+          const entries = byType.get(type) || [];
+          for (let i = lowerAmountBound(entries, minimum); i < entries.length && entries[i].amount <= maximum && matches.length < limit; i++) check(entries[i], true);
+        }
+      }
     }
     matches.sort((a, b) => Number(!!b.sameStatement) - Number(!!a.sameStatement) || Number(b.kind === 'possible_duplicate') - Number(a.kind === 'possible_duplicate')
       || b.similarity - a.similarity || a.difference - b.difference || a.elapsed - b.elapsed);
     if (matches.length) results.push({ candidate: transaction, count: matches.length, matches: matches.slice(0, limit) });
-    earlierDrafts.push(candidate);
+    const entry = candidate;
+    for (const key of entry.identities) {
+      if (!earlierByStatement.has(key)) earlierByStatement.set(key, []);
+      earlierByStatement.get(key).push(entry);
+    }
+    for (const day of new Set(entry.days)) {
+      if (!earlierByDay.has(day)) earlierByDay.set(day, new Map());
+      const byType = earlierByDay.get(day);
+      if (!byType.has(transaction.type)) byType.set(transaction.type, []);
+      const entries = byType.get(transaction.type);
+      let low = 0, high = entries.length;
+      while (low < high) { const middle = (low + high) >>> 1; if (entries[middle].amount <= entry.amount) low = middle + 1; else high = middle; }
+      entries.splice(low, 0, entry);
+    }
   }
   return results;
 }

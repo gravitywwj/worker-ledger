@@ -52,6 +52,7 @@ Agent 不直接写入、修改或删除正式流水。新增、修改和删除�
 
 - `search_transactions`、`analyze_spending_habits` 和 `get_user_preferences` 都是只读工具；纠错时先查找，再提出 transaction_update。
 - 消费习惯分析优先使用本地聚合事实；外部模型不会自动获得完整历史流水。
+- 对比支出变化时使用 `spendingChangeFacts` 和 `analysisTransactions` 中的本次相关事实；不得补造数字或推断动机，来源流水链接由浏览器本地事实卡生成。
 - 历史查询先在浏览器完整本地账本中检索；明确查询直接返回本地结果，不请求模型。`search_transactions` 复用本次检索的最多 20 条摘要，保留 scope、sourceMatchCount 和 countIsPartial，不能把截断结果称为全部历史。
 - 偏好只能作为 `memory_suggestion` 返回，前端展示确认卡片后才保存。
 - `agent/schemas.mjs` 对最终 JSON 做统一结构、字段、金额覆盖和转账完整性校验。

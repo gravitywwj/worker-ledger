@@ -1,10 +1,14 @@
 import { normalizeProductItems, PRODUCT_UNITS, DEFAULT_PRODUCT_CATEGORIES } from './product-prices.mjs';
 import { normalizeTransactionDetails, statementIdentity } from './transaction-reconciliation.mjs';
+import { normalizeRecurringBill } from './recurring-bills.mjs';
+import { normalizeCategoryBudgets } from './category-budgets.mjs';
+import { normalizeShoppingItem } from './shopping-list.mjs';
 export function normalizeBackup(data) {
   if (!data || typeof data !== 'object') throw new Error('文件内容不是有效备份。');
-  if (data.version !== undefined && ![1, 2, 3].includes(data.version)) throw new Error('不支持这个备份版本，请使用兼容版本导出。');
+  if (data.version !== undefined && ![1, 2, 3, 4].includes(data.version)) throw new Error('不支持这个备份版本，请使用兼容版本导出。');
   const arrays = ['transactions', 'categories', 'accounts'];
-  if (data.version === 3) arrays.push('products', 'productCategories');
+  if (data.version >= 3) arrays.push('products', 'productCategories');
+  if (data.version === 4) arrays.push('recurringBills', 'categoryBudgets', 'shoppingList');
   for (const key of arrays) {
     if (!Array.isArray(data[key])) throw new Error('备份缺少 ' + key + ' 数据。');
     const ids = new Set();
@@ -13,8 +17,8 @@ export function normalizeBackup(data) {
       ids.add(item.id);
     }
   }
-  const products = data.version === 3 ? data.products : [];
-  const productCategories = data.version === 3 ? data.productCategories : DEFAULT_PRODUCT_CATEGORIES.map((item) => ({ ...item }));
+  const products = data.version >= 3 ? data.products : [];
+  const productCategories = data.version >= 3 ? data.productCategories : DEFAULT_PRODUCT_CATEGORIES.map((item) => ({ ...item }));
   for (const category of productCategories) {
     if (typeof category.name !== 'string' || !category.name.trim() || !Object.values(PRODUCT_UNITS).some((unit) => unit.base === category.baseUnit && unit.dimension === category.dimension)) throw new Error('商品品类格式无效。');
   }
@@ -39,7 +43,32 @@ export function normalizeBackup(data) {
       const category = productCategories.find((c) => c.id === item.productCategoryId);
       if (!product || !category || product.productCategoryId !== category.id || PRODUCT_UNITS[item.unit].base !== category.baseUnit || PRODUCT_UNITS[item.unit].dimension !== category.dimension) throw new Error('商品明细引用或单位无效。');
     }
+    if (transaction.shopName !== undefined && (typeof transaction.shopName !== 'string' || transaction.shopName.length > 80)) throw new Error('商店名称无效。');
     return { ...transaction, ...(transaction.paymentChannel !== undefined || transaction.statementEntries !== undefined ? details : {}), items };
   });
-  return { ...data, transactions, products, productCategories };
+  const recurringBills = data.version === 4 ? data.recurringBills.map((raw) => {
+    const bill = normalizeRecurringBill(raw);
+    if (!data.accounts.some((account) => account.id === bill.accountId)
+      || (bill.categoryId && !data.categories.some((category) => category.id === bill.categoryId && category.type === 'expense'))
+      || (bill.sourceTransactionId && !transactions.some((transaction) => transaction.id === bill.sourceTransactionId))
+      || bill.payments.some((payment) => !transactions.some((transaction) => transaction.id === payment.transactionId && transaction.type === 'expense'))) throw new Error('周期账单的账户、分类或流水引用无效。');
+    return bill;
+  }) : [];
+  const categoryBudgets = data.version === 4 ? normalizeCategoryBudgets(data.categoryBudgets, data.categories) : [];
+  const shoppingList = data.version === 4 ? data.shoppingList.map((raw) => {
+    const item = normalizeShoppingItem(raw, products, productCategories);
+    const product = products.find((entry) => entry.id === item.productId);
+    const category = productCategories.find((entry) => entry.id === item.productCategoryId);
+    if (!category || category.id !== product.productCategoryId || PRODUCT_UNITS[item.unit].base !== category.baseUnit || PRODUCT_UNITS[item.unit].dimension !== category.dimension) throw new Error('待购商品的商品品类或单位引用无效。');
+    return item;
+  }) : [];
+  const collections = { ...data, transactions, products, productCategories, recurringBills, categoryBudgets, shoppingList };
+  for (const key of ['recurringBills', 'categoryBudgets', 'shoppingList']) {
+    const ids = new Set();
+    for (const item of collections[key]) {
+      if (!item.id || ids.has(item.id)) throw new Error(key + ' 包含无效或重复 ID。');
+      ids.add(item.id);
+    }
+  }
+  return collections;
 }

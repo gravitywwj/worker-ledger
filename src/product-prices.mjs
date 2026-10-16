@@ -118,7 +118,7 @@ export function parseProductQuote(input) {
   return { quantity: totalSpecified ? 1 : countValue || 1, unitSize: Number(size[1]), unit: canonicalUnit(size[2]), paidAmount: Math.round(Number(amounts[0][1].replaceAll(',', '')) * 100), priceBasis: 'actual' };
 }
 
-export function compareProductPrices({ transactions = [], products = [], productCategories = [] }, { query = '', productId = '', categoryId = '', quote = null } = {}) {
+export function compareProductPrices({ transactions = [], products = [], productCategories = [] }, { query = '', productId = '', categoryId = '', quote = null, shopName = '', shopUnspecified = false } = {}) {
   const key = productKey(query);
   let matches = products.filter((product) => productId ? product.id === productId : [product.name, ...(product.aliases || [])].some((name) => name && key.includes(productKey(name))));
   if (!productId && matches.length > 1) {
@@ -144,8 +144,10 @@ export function compareProductPrices({ transactions = [], products = [], product
   }
   const matchedCount = matches.length;
   const groups = matches.slice(0, 20).map((product) => {
-    const records = transactions.filter((entry) => entry.type === 'expense').flatMap((transaction) => (transaction.items || [])
-      .filter((item) => item.productId === product.id).map((item) => ({ ...item, transactionId: transaction.id, occurredAt: transaction.occurredAt, ...unitPrice(item) })))
+    const shopKey = productKey(shopName);
+    const matchesShop = (transaction) => !shopKey && !shopUnspecified ? true : shopUnspecified ? !String(transaction.shopName || '').trim() : productKey(transaction.shopName) === shopKey;
+    const records = transactions.filter((entry) => entry.type === 'expense' && matchesShop(entry)).flatMap((transaction) => (transaction.items || [])
+      .filter((item) => item.productId === product.id).map((item) => ({ ...item, transactionId: transaction.id, occurredAt: transaction.occurredAt, shopName: transaction.shopName || '', ...unitPrice(item) })))
       .sort((a, b) => new Date(b.occurredAt) - new Date(a.occurredAt) || a.id.localeCompare(b.id));
     const actual = records.filter((item) => item.priceBasis === 'actual');
     const latest = actual[0] || null;
