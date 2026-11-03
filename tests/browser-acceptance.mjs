@@ -1,3 +1,187 @@
+export async function runPlanningAcceptance(page, base) {
+  const context = page.context();
+  const p = page;
+  p.setDefaultTimeout(10000);
+  await p.setViewportSize({ width: 1280, height: 900 });
+  const errors = [];
+  let modelRequests = 0;
+  p.on('pageerror', error => errors.push(error.message));
+  p.on('request', request => { if (request.url().includes('/api/agent/chat')) modelRequests += 1; });
+  const check = (value, message) => { if (!value) throw new Error(message); };
+  const read = store => p.evaluate(store => new Promise((resolve, reject) => {
+    const request = indexedDB.open('worker-ledger');
+    request.onsuccess = () => {
+      const db = request.result;
+      const query = db.transaction(store).objectStore(store).getAll();
+      query.onsuccess = () => { db.close(); resolve(query.result); };
+      query.onerror = () => { db.close(); reject(query.error); };
+    };
+    request.onerror = () => reject(request.error);
+  }), store);
+  const profile = async () => (await read('profile_settings')).find(item => item.key === 'profile');
+  const openPlanning = async () => {
+    await p.locator('[data-view="reports"]:visible').click();
+    await p.getByRole('button', { name: '资金规划', exact: true }).click();
+    await p.getByRole('heading', { name: '资金规划', exact: true }).waitFor();
+  };
+  const savePlan = async () => {
+    await p.locator('#financial-plan-form').getByRole('button', { name: '保存规划', exact: true }).click();
+    await p.waitForFunction(() => document.querySelector('#toast-region').textContent.includes('资金规划已保存'));
+  };
+  const fillPlan = async (name, value) => p.locator(`#financial-plan-form [name="${name}"]`).fill(value);
+  const addGoal = async (name, allocated) => {
+    await p.getByRole('button', { name: '添加目标', exact: true }).click();
+    await p.locator('#planning-goal-form [name="name"]').fill(name);
+    await p.locator('#planning-goal-form [name="targetAmount"]').fill('6000');
+    await p.locator('#planning-goal-form [name="allocatedAmount"]').fill(allocated);
+    await p.locator('#planning-goal-form [name="monthlyContribution"]').fill('1000');
+    await p.locator('#planning-goal-form').getByRole('button', { name: '保存目标', exact: true }).click();
+  };
+  try {
+    await p.goto(base);
+    await p.locator('#app-view .summary-panel').first().waitFor();
+    const lastMonth = await p.evaluate(async () => {
+      const now = new Date();
+      const date = new Date(now.getFullYear(), now.getMonth() - 1, 15, 12);
+      const month = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+      await new Promise((resolve, reject) => {
+        const request = indexedDB.open('worker-ledger');
+        request.onsuccess = () => {
+          const db = request.result;
+          const tx = db.transaction(['transactions', 'profile_settings'], 'readwrite');
+          tx.objectStore('profile_settings').put({ key: 'profile', monthlyBudget: 9000 });
+          for (const item of [
+            { id: 'salary-1', categoryId: 'salary', amount: 600000 },
+            { id: 'salary-2', categoryId: 'salary', amount: 100000 },
+            { id: 'refund', categoryId: 'reimburse', amount: 500000 },
+          ]) tx.objectStore('transactions').put({ ...item, type: 'income', accountId: 'salary-card', note: item.id, occurredAt: date.toISOString() });
+          tx.oncomplete = () => { db.close(); resolve(); };
+          tx.onerror = () => { db.close(); reject(tx.error); };
+        };
+        request.onerror = () => reject(request.error);
+      });
+      return month;
+    });
+    await p.reload();
+    await openPlanning();
+    check(await p.locator('#financial-plan-form [name="monthlyIncome"]').inputValue() === '', 'missing income became a fabricated salary');
+    await p.getByRole('button', { name: `预填 ${lastMonth} 工资 ¥7,000`, exact: true }).click();
+    check(await p.locator('#financial-plan-form [name="monthlyIncome"]').inputValue() === '7000', 'salary prefill counted refunds or used a different amount');
+    check((await profile()).financialPlan === undefined, 'salary prefill persisted without saving');
+    await fillPlan('monthlyIncome', '10000');
+    await fillPlan('availableCash', '10000');
+    await savePlan();
+    check((await profile()).financialPlan.monthlyIncome === 1000000, 'confirmed income was not stored in cents');
+    check((await profile()).monthlyBudget === 9000, 'planning overwrote the existing ledger budget');
+
+    await fillPlan('monthlyIncome', '11000');
+    await p.evaluate(() => {
+      const original = IDBObjectStore.prototype.put;
+      IDBObjectStore.prototype.put = function (...args) {
+        if (this.name === 'profile_settings') { IDBObjectStore.prototype.put = original; throw new DOMException('Planning write failed', 'DataError'); }
+        return original.apply(this, args);
+      };
+    });
+    await p.locator('#financial-plan-form').getByRole('button', { name: '保存规划', exact: true }).click();
+    await p.getByText('Planning write failed', { exact: true }).waitFor();
+    check((await profile()).financialPlan.monthlyIncome === 1000000, 'a failed planning write changed stored income');
+    await fillPlan('monthlyIncome', '10000');
+    await savePlan();
+
+    await addGoal('电脑', '1000');
+    await p.locator('#planning-goal-form').waitFor({ state: 'detached' });
+    check((await p.locator('[data-planning-value="dailySpending"]').textContent()).includes('4,000'), 'purchase funding was not deducted from the spending share');
+    check((await p.locator('.planning-goal').innerText()).includes('仅展示购买影响'), 'missing buffer floor produced an approval');
+    await addGoal('手机', '5000');
+    await p.locator('#planning-goal-form').waitFor({ state: 'detached' });
+    check((await p.locator('.planning-goal').first().innerText()).includes('当前购买资金不足'), 'other goals did not protect their reserved cash');
+    check((await p.locator('[data-planning-value="unallocated"]').textContent()).includes('4,000'), 'goals did not share the confirmed cash pool');
+    await addGoal('第三个目标', '5000');
+    await p.waitForFunction(() => document.querySelector('#toast-region').textContent.includes('预留合计超过已确认现金'));
+    check((await profile()).financialPlan.goals.length === 2, 'overallocated goal was saved');
+    await p.locator('#planning-goal-form').getByRole('button', { name: '取消', exact: true }).click();
+
+    await fillPlan('availableCash', '5000');
+    await savePlan();
+    check((await p.locator('#financial-planning-goals').innerText()).includes('现金预留冲突'), 'a cash decrease silently kept goals funded');
+    await fillPlan('spendingPercent', '60');
+    await p.locator('#financial-plan-form').getByRole('button', { name: '保存规划', exact: true }).click();
+    await p.waitForFunction(() => document.querySelector('#toast-region').textContent.includes('合计为 100%'));
+    check((await profile()).financialPlan.spendingPercent === 50, 'invalid percentages changed stored settings');
+    await fillPlan('spendingPercent', '50');
+    await fillPlan('availableCash', '10000');
+    await p.locator('.planning-assumptions summary').click();
+    await fillPlan('monthlyLivingExpense', '2000');
+    await fillPlan('reserveMonths', '3');
+    await savePlan();
+    await p.locator('.planning-goal').filter({ has: p.getByRole('heading', { name: '手机', exact: true }) }).getByRole('button', { name: '移除目标', exact: true }).click();
+    await p.waitForFunction(() => document.querySelectorAll('.planning-goal').length === 1);
+    check((await p.locator('.planning-goal').innerText()).includes('购后低于缓冲底线'), 'explicit floor was not checked');
+    await p.locator('.planning-assumptions summary').click();
+    await fillPlan('reserveMonths', '1');
+    await savePlan();
+    check((await p.locator('.planning-goal').innerText()).includes('当前现金符合已设条件'), 'a purchase satisfying the configured conditions was rejected');
+
+    const maliciousName = '<img src=x onerror="window.planningXss=true">电脑';
+    await p.locator('.planning-goal').getByRole('button', { name: '编辑目标', exact: true }).click();
+    await p.locator('#planning-goal-form [name="name"]').fill(maliciousName);
+    await p.locator('#planning-goal-form [name="monthlyContribution"]').fill('0');
+    const yesterday = await p.evaluate(() => { const date = new Date(); date.setDate(date.getDate() - 1); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`; });
+    await p.locator('#planning-goal-form [name="deadline"]').fill(yesterday);
+    await p.locator('#planning-goal-form').getByRole('button', { name: '保存目标', exact: true }).click();
+    await p.locator('#planning-goal-form').waitFor({ state: 'detached' });
+    check((await p.locator('.planning-goal').innerText()).includes('目标期限已过'), 'overdue target was presented as achievable on time');
+    check(await p.locator('.planning-goal img').count() === 0 && !await p.evaluate(() => window.planningXss), 'goal names were interpreted as markup');
+    await p.locator('.planning-goal').getByRole('button', { name: '编辑目标', exact: true }).click();
+    await p.locator('#planning-goal-form [name="name"]').fill('电脑');
+    await p.locator('#planning-goal-form [name="monthlyContribution"]').fill('1000');
+    const future = await p.evaluate(() => { const now = new Date(); const date = new Date(now.getFullYear(), now.getMonth() + 3, 0); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`; });
+    await p.locator('#planning-goal-form [name="deadline"]').fill(future);
+    await p.locator('#planning-goal-form').getByRole('button', { name: '保存目标', exact: true }).click();
+    await p.locator('#planning-goal-form').waitFor({ state: 'detached' });
+    check((await read('transactions')).length === 3, 'planning or goal changes created transactions');
+    const savedPlan = (await profile()).financialPlan;
+    await p.reload();
+    await openPlanning();
+    check(JSON.stringify((await profile()).financialPlan) === JSON.stringify(savedPlan), 'reload changed the planning snapshot');
+    await p.screenshot({ path: 'output/playwright/planning-desktop.png', fullPage: true });
+    await p.setViewportSize({ width: 375, height: 812 });
+    await p.screenshot({ path: 'output/playwright/planning-mobile.png', fullPage: true });
+    const overflow = await p.evaluate(() => [...document.querySelectorAll('#app-view *')].filter(element => element.getBoundingClientRect().right > document.documentElement.clientWidth + 1).slice(0, 6).map(element => `${element.tagName}.${element.className}`));
+    check(await p.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1), 'planning overflows the mobile viewport: ' + overflow.join(', '));
+
+    await p.setViewportSize({ width: 1280, height: 900 });
+    await p.evaluate(() => { const original = URL.createObjectURL; URL.createObjectURL = blob => { window.planningBackupBlob = blob; return original(blob); }; });
+    await p.locator('[data-view="settings"]:visible').click();
+    await p.getByRole('button', { name: '导出备份', exact: true }).click();
+    const backup = await p.evaluate(async () => JSON.parse(await window.planningBackupBlob.text()));
+    check(backup.version === 4 && backup.profile.financialPlan.goals.length === 1, 'backup omitted planning');
+    const importBackup = async (data, confirm = true) => {
+      if (confirm) p.once('dialog', dialog => dialog.accept());
+      await p.locator('#backup-file').setInputFiles({ name: 'planning-backup.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(data)) });
+    };
+    await importBackup({ ...backup, profile: { ...backup.profile, financialPlan: { ...savedPlan, availableCash: -1 } } }, false);
+    await p.waitForFunction(() => document.querySelector('#toast-region').textContent.includes('可动用现金需要是有效'));
+    check(JSON.stringify((await profile()).financialPlan) === JSON.stringify(savedPlan), 'invalid backup partially replaced planning');
+    await importBackup({ version: 2, transactions: [], accounts: backup.accounts, categories: backup.categories });
+    await p.waitForFunction(() => document.querySelector('#toast-region').textContent.includes('备份已导入'));
+    check((await profile()).financialPlan === undefined, 'legacy backup fabricated planning data');
+    await importBackup(backup);
+    await p.waitForFunction(() => document.querySelector('#toast-region').textContent.includes('备份已导入'));
+    check(JSON.stringify((await profile()).financialPlan) === JSON.stringify(savedPlan), 'planning did not round-trip through backup');
+    await p.evaluate(() => navigator.serviceWorker.ready);
+    await context.setOffline(true);
+    await p.reload({ waitUntil: 'domcontentloaded' });
+    await openPlanning();
+    check((await profile()).financialPlan.goals.length === 1, 'offline reload lost goals');
+    check(modelRequests === 0, 'planning invoked an external model');
+    check(errors.length === 0, 'planning page errors: ' + errors.join('; '));
+    return 'PASS: planning salary confirmation, 20/30/50 allocation, shared cash and monthly goal budgets, write failure, missing/fixed buffer, invalid ratios, escaped goal names, deadlines, no ledger writes/model calls, backup validation/legacy restore/offline reload, desktop/mobile layout';
+  } finally {
+    await context.close();
+  }
+}
+
 export async function runBrowserAcceptance(page, base) {
   const context = await page.context().browser().newContext({ viewport: { width: 1280, height: 900 } });
   const p = await context.newPage();

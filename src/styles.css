@@ -949,6 +949,7 @@ html[data-qa="true"] .mobile-nav { display: none; }
 
 .header-actions { display: flex; align-items: center; gap: 8px; }
 .ledger-sections, .report-sections { margin: 0 0 16px; }
+.report-sections { flex-wrap: wrap; max-width: 100%; }
 .import-counts { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 14px; }
 .import-counts > span { padding: 9px 13px; border: 1px solid var(--line); border-radius: var(--radius-md); color: var(--ink-soft); background: var(--surface); }
 .import-counts strong { margin-left: 6px; color: var(--ink); font-variant-numeric: tabular-nums; }
@@ -974,6 +975,36 @@ html[data-qa="true"] .mobile-nav { display: none; }
 .budget-category-row .text-button { text-align: left; }
 .budget-category-row .text-button small { display: block; color: var(--ink-muted); font-size: 12px; }
 .notice-text { margin: 0 0 12px; padding: 10px 12px; border-radius: var(--radius-sm); color: var(--warning); background: #fff7e8; }
+
+.planning-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+.planning-inputs .field small { color: var(--ink-soft); font-size: 12px; line-height: 1.6; }
+.planning-salary-reference { justify-self: start; text-align: left; }
+.planning-percentages { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 22px 0; padding: 0; border: 0; min-width: 0; }
+.planning-percentages legend { margin-bottom: 12px; padding: 0; font-size: 13px; font-weight: 650; }
+.planning-percentages .field, .planning-layout .text-input { min-width: 0; }
+.planning-assumptions { padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.planning-assumptions summary { cursor: pointer; font-weight: 650; }
+.planning-assumptions[open] summary { margin-bottom: 16px; }
+.planning-note { margin: 12px 0 0; color: var(--ink-soft); font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
+.planning-rows { margin: 0; }
+.planning-rows > div { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 11px 0; border-bottom: 1px solid var(--line); }
+.planning-rows > div:last-child { border-bottom: 0; }
+.planning-rows dt { color: var(--ink-soft); font-size: 13px; }
+.planning-rows dd { margin: 0; text-align: right; font-weight: 650; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.planning-rows .planning-total dt, .planning-rows .planning-total dd { color: var(--ink); font-weight: 750; }
+.planning-goals-section .settings-title-row { flex-wrap: wrap; }
+.planning-goal { padding: 20px 0; border-bottom: 1px solid var(--line); }
+.planning-goal:last-child { padding-bottom: 0; border-bottom: 0; }
+.planning-goal-heading { display: flex; flex-wrap: wrap; align-items: start; justify-content: space-between; gap: 10px; }
+.planning-goal-heading h3 { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+.planning-goal-heading p { margin: 5px 0 0; color: var(--ink-soft); font-size: 12px; }
+.planning-goal-amount { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin: 16px 0 10px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.planning-goal progress { display: block; width: 100%; height: 8px; accent-color: var(--primary); }
+.planning-goal-details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+.planning-goal-details dt { color: var(--ink-soft); font-size: 12px; }
+.planning-goal-details dd { margin: 4px 0 0; font-size: 13px; font-weight: 650; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.planning-empty { padding: 22px 0; }
+@media (max-width: 1000px) { .planning-layout { grid-template-columns: 1fr; } }
 .shopping-item { display: grid; gap: 12px; }
 .shopping-price-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .shopping-price-grid > span { display: grid; gap: 4px; padding: 10px; border-radius: var(--radius-sm); color: var(--ink-muted); background: var(--surface-subtle); font-size: 12px; }

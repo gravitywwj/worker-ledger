@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runBrowserAcceptance, runHistoryAcceptance, runReconciliationAcceptance } from './browser-acceptance.mjs';
+import { runBrowserAcceptance, runHistoryAcceptance, runReconciliationAcceptance, runPlanningAcceptance } from './browser-acceptance.mjs';
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const probe = createServer();
 probe.listen(0, '127.0.0.1');
@@ -29,6 +29,7 @@ try {
   const channel = process.env.PLAYWRIGHT_CHANNEL || (process.platform === 'win32' ? 'msedge' : undefined);
   browser = await chromium.launch({ headless: true, ...(channel ? { channel } : {}) });
   await mkdir('output/playwright', { recursive: true });
+  console.log(await runPlanningAcceptance(await browser.newPage(), base));
   console.log(await runBrowserAcceptance(await browser.newPage(), base));
   console.log(await runHistoryAcceptance(await browser.newPage(), base));
   console.log(await runReconciliationAcceptance(await browser.newPage(), base));

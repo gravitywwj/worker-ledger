@@ -3,6 +3,7 @@ import { normalizeTransactionDetails, statementIdentity } from './transaction-re
 import { normalizeRecurringBill } from './recurring-bills.mjs';
 import { normalizeCategoryBudgets } from './category-budgets.mjs';
 import { normalizeShoppingItem } from './shopping-list.mjs';
+import { normalizeFinancialPlan } from './financial-planning.mjs';
 export function normalizeBackup(data) {
   if (!data || typeof data !== 'object') throw new Error('文件内容不是有效备份。');
   if (data.version !== undefined && ![1, 2, 3, 4].includes(data.version)) throw new Error('不支持这个备份版本，请使用兼容版本导出。');
@@ -63,6 +64,9 @@ export function normalizeBackup(data) {
     return item;
   }) : [];
   const collections = { ...data, transactions, products, productCategories, recurringBills, categoryBudgets, shoppingList };
+  if (data.profile?.financialPlan !== undefined) {
+    collections.profile = { ...data.profile, financialPlan: normalizeFinancialPlan(data.profile.financialPlan) };
+  }
   for (const key of ['recurringBills', 'categoryBudgets', 'shoppingList']) {
     const ids = new Set();
     for (const item of collections[key]) {

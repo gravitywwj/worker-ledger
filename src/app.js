@@ -11,6 +11,7 @@ import { dueRecurringBills, firstRecurringDate, normalizeRecurringBill, recordRe
 import { categoryBudgetRows, normalizeCategoryBudgets, previousMonthBudgets } from './category-budgets.mjs';
 import { normalizeShoppingItem } from './shopping-list.mjs';
 import { buildSpendingChangeFacts } from './transaction-facts.mjs';
+import { normalizeFinancialPlan, buildFinancialPlanFacts, latestSalaryReference } from './financial-planning.mjs';
 
 const DB_NAME = 'worker-ledger';
 const DB_VERSION = 7;
@@ -166,6 +167,7 @@ const state = {
   ledgerPage: 0,
   reportPeriod: 'month',
   reportSection: 'summary',
+  financialPlanSaving: false,
   recurringCandidates: [],
   reportWeekDate: null,
   statementImport: null,
@@ -1553,7 +1555,8 @@ function reportCategoryData(transactions) {
 }
 
 function reportSectionTabs() {
-  return `<div class="period-switch report-sections"><button class="${state.reportSection === 'summary' ? 'primary-button' : 'secondary-button'}" type="button" data-action="report-section" data-section="summary" aria-pressed="${state.reportSection === 'summary'}">收支报表</button><button class="${state.reportSection === 'recurring' ? 'primary-button' : 'secondary-button'}" type="button" data-action="report-section" data-section="recurring" aria-pressed="${state.reportSection === 'recurring'}">周期账单</button><button class="${state.reportSection === 'budget' ? 'primary-button' : 'secondary-button'}" type="button" data-action="report-section" data-section="budget" aria-pressed="${state.reportSection === 'budget'}">分类预算</button></div>`;
+  return `<div class="period-switch report-sections">${[['summary', '收支报表'], ['recurring', '周期账单'], ['budget', '分类预算'], ['planning', '资金规划']]
+    .map(([section, label]) => `<button class="${state.reportSection === section ? 'primary-button' : 'secondary-button'}" type="button" data-action="report-section" data-section="${section}" aria-pressed="${state.reportSection === section}">${label}</button>`).join('')}</div>`;
 }
 
 function renderRecurringBills() {
@@ -1593,7 +1596,175 @@ function renderCategoryBudgets() {
     <section class="content-panel"><div class="panel-heading"><h2>${escapeHtml(month)} 分类额度</h2><span class="panel-note">额度 ${money(summary.totalLimit)} · 已用 ${money(summary.totalUsed)}</span></div>${totalBudget && summary.totalLimit > totalBudget ? `<p class="notice-text">分类额度合计 ${money(summary.totalLimit)}，超过总预算 ${money(totalBudget)}。</p>` : ''}<form id="category-budget-form" data-month="${escapeHtml(month)}"><div class="budget-category-list">${rows}</div><div class="form-actions"><button class="primary-button" type="submit">保存本月分类额度</button></div></form></section>`;
 }
 
+function currentFinancialPlan() {
+  return normalizeFinancialPlan(state.profile.financialPlan);
+}
+
+function planningMoney(amount) {
+  return amount === null ? '未设置' : money(amount);
+}
+
+function planningAmountInput(value, nullable = false) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return nullable ? null : 0;
+  if (!/^\d+(?:\.\d{1,2})?$/.test(raw)) throw new Error('规划金额仅支持非负数字和最多两位小数。');
+  return centsFromYuan(raw);
+}
+
+function readFinancialPlanForm(form) {
+  const data = new FormData(form);
+  return normalizeFinancialPlan({
+    ...currentFinancialPlan(),
+    monthlyIncome: planningAmountInput(data.get('monthlyIncome'), true),
+    availableCash: planningAmountInput(data.get('availableCash'), true),
+    monthlyLivingExpense: planningAmountInput(data.get('monthlyLivingExpense'), true),
+    investmentPercent: Number(data.get('investmentPercent')),
+    reservePercent: Number(data.get('reservePercent')),
+    spendingPercent: Number(data.get('spendingPercent')),
+    reserveMonths: data.get('reserveMonths') === '' ? null : Number(data.get('reserveMonths')),
+    annualReturnRate: Number(data.get('annualReturnRate')),
+  });
+}
+
+async function saveFinancialPlan(plan, message) {
+  if (state.financialPlanSaving) throw new Error('资金规划正在保存，请等待完成。');
+  const { plan: normalized } = buildFinancialPlanFacts(plan);
+  state.financialPlanSaving = true;
+  try {
+    await persistProfile({ financialPlan: normalized }, message);
+  } finally {
+    state.financialPlanSaving = false;
+  }
+}
+
+function renderPlanningResults(facts) {
+  const { plan } = facts;
+  const now = new Date();
+  const actual = statsForRange(new Date(now.getFullYear(), now.getMonth(), 1), new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999));
+  return `<section class="settings-section">
+    <h2>每月分配参考</h2><p>按确认的到手月收入分配。目标每月预留包含在对应份额内，不会重复增加收入或支出。</p>
+    <dl class="planning-rows">
+      <div><dt>长期积累 ${plan.investmentPercent}%</dt><dd data-planning-value="investment">${planningMoney(facts.investment)}</dd></div>
+      <div><dt>备用资金 ${plan.reservePercent}%</dt><dd data-planning-value="reserve">${planningMoney(facts.reserve)}</dd></div>
+      <div><dt>消费份额 ${plan.spendingPercent}%</dt><dd data-planning-value="spending">${planningMoney(facts.spending)}</dd></div>
+      <div><dt>其中：购买目标每月预留</dt><dd>${money(facts.purchaseMonthly)}</dd></div>
+      <div class="planning-total"><dt>日常消费可安排</dt><dd data-planning-value="dailySpending">${planningMoney(facts.dailySpending)}</dd></div>
+      <div><dt>储蓄目标每月预留</dt><dd>${money(facts.savingsMonthly)}</dd></div>
+      <div><dt>备用份额尚未分配</dt><dd>${planningMoney(facts.reserveRemaining)}</dd></div>
+    </dl>
+    ${facts.spendingShortfall > 0 ? `<p class="notice-text">购买目标每月预留超过消费份额 ${money(facts.spendingShortfall)}。当前月度计划存在缺口，需要调整目标投入、期限或分配比例。</p>` : ''}
+    ${facts.reserveMonthlyShortfall > 0 ? `<p class="notice-text">储蓄目标每月预留超过备用份额 ${money(facts.reserveMonthlyShortfall)}，当前计划无法同时满足。</p>` : ''}
+    <p class="planning-note">本月账本已记支出 ${money(actual.expense)}。账本总预算为 ${state.profile.monthlyBudget > 0 ? money(centsFromYuan(state.profile.monthlyBudget)) : '未设置'}，保存规划不会改动该预算。长期积累份额只是计划，不代表全部适合投资。</p>
+  </section>
+  <section class="settings-section">
+    <h2>当前现金与缓冲</h2><p>多个目标共用一份现金。资金确认后仍需定期核对，目标每月预留不会自动增加已存金额。</p>
+    <dl class="planning-rows">
+      <div><dt>已确认可动用现金</dt><dd data-planning-value="cash">${planningMoney(plan.availableCash)}</dd></div>
+      <div><dt>目标预留合计</dt><dd>${money(facts.totalAllocated)}</dd></div>
+      <div><dt>尚未分配现金</dt><dd data-planning-value="unallocated">${planningMoney(facts.unallocatedCash)}</dd></div>
+      <div><dt>扣除购买预留后可覆盖</dt><dd>${facts.bufferMonths === null ? '待补充金额' : `${NUMBER_FORMATTER.format(facts.bufferMonths)} 个月`}</dd></div>
+      <div><dt>缓冲底线</dt><dd>${facts.reserveFloor === null ? '未设置，仅展示影响' : money(facts.reserveFloor)}</dd></div>
+    </dl>
+    ${facts.allocationShortfall > 0 ? `<p class="notice-text">目标预留合计超过现金 ${money(facts.allocationShortfall)}。已保留目标，请重新核对现金或减少预留；当前不能确认这些资金已经到位。</p>` : ''}
+    <p class="planning-note">覆盖月数不计未来工资、副业或投资收益。${facts.livingExpenseIsEstimate ? '生活费暂按消费份额估算，可在左侧改填。' : '生活费使用你填写的计划金额。'}</p>
+  </section>
+  <section class="settings-section">
+    <h2>长期资金参考</h2><p>按生活支出反推本金，改变假设即可比较结果。</p>
+    <dl class="planning-rows">
+      <div><dt>计划月生活费${facts.livingExpenseIsEstimate ? '（估算）' : ''}</dt><dd>${planningMoney(facts.livingExpense)}</dd></div>
+      <div><dt>假设年化收益率</dt><dd>${plan.annualReturnRate}%</dd></div>
+      <div class="planning-total"><dt>收益覆盖生活费所需本金</dt><dd data-planning-value="targetAssets">${facts.targetAssets === null ? '当前假设无法计算' : money(facts.targetAssets)}</dd></div>
+      <div><dt>300 倍月收入参考</dt><dd>${planningMoney(facts.salaryMultipleReference)}</dd></div>
+    </dl>
+    <p class="planning-note">本金 = 月生活费 × 12 ÷ 假设年化收益率。300 倍月收入在固定 4% 年收益的假设下对应名义收益替代工资。以上未计通胀、费用和收益波动，不代表资金能终身维持生活。</p>
+  </section>`;
+}
+
+function renderPlanningGoals(facts) {
+  const labels = { unknown: '现金尚未核对', conflict: '现金预留冲突', funded: '目标预留已足额', saving: '继续积累',
+    shortfall: '当前购买资金不足', 'below-floor': '购后低于缓冲底线', 'impact-only': '仅展示购买影响', 'within-plan': '当前现金符合已设条件' };
+  if (!facts.goals.length) return `<div class="empty-state planning-empty"><h3>暂未设置目标</h3><p>可以继续使用分配和长期测算。需要时再填写购买或储蓄目标，不要求先设定目标。</p></div>`;
+  return facts.goals.map((goal) => `<article class="planning-goal" data-goal-id="${escapeHtml(goal.id)}">
+    <div class="planning-goal-heading"><div><h3>${escapeHtml(goal.name)}</h3><p>${goal.kind === 'purchase' ? '购买目标 · 每月预留来自消费份额' : '储蓄目标 · 每月预留来自备用份额'}</p></div>
+      <div class="button-row"><button class="text-button" type="button" data-action="edit-planning-goal" data-goal-id="${escapeHtml(goal.id)}">编辑目标</button><button class="text-button" type="button" data-action="remove-planning-goal" data-goal-id="${escapeHtml(goal.id)}">移除目标</button></div></div>
+    <div class="planning-goal-amount"><span>已预留 ${money(goal.allocatedAmount)} / 目标 ${money(goal.targetAmount)}</span><strong>${NUMBER_FORMATTER.format(goal.progress)}%</strong></div>
+    <progress max="100" value="${goal.progress}" aria-label="${escapeHtml(goal.name)}的计划预留进度"></progress>
+    <dl class="planning-goal-details">
+      <div><dt>尚需积累</dt><dd>${money(goal.gap)}</dd></div>
+      <div><dt>每月计划预留</dt><dd>${money(goal.monthlyContribution)}</dd></div>
+      <div><dt>按此金额补齐</dt><dd>${goal.fundingMonths === null ? '尚未设置投入' : goal.fundingMonths === 0 ? '已预留足额' : `约 ${goal.fundingMonths} 次月度投入`}</dd></div>
+      <div><dt>目标期限</dt><dd>${goal.deadline || '未设置'}</dd></div>
+      ${goal.requiredMonthly !== null ? `<div><dt>按期限每月需预留</dt><dd>${money(goal.requiredMonthly)}</dd></div>` : ''}
+      ${goal.cashAfterPurchase !== null ? `<div><dt>模拟购买后现金</dt><dd>${money(goal.cashAfterPurchase)}</dd></div>` : ''}
+    </dl>
+    <p class="${['conflict', 'shortfall', 'below-floor'].includes(goal.state) ? 'notice-text' : 'planning-note'}"><strong>${labels[goal.state]}</strong>${goal.purchaseShortfall > 0 ? `，在保留其他目标预留后还差 ${money(goal.purchaseShortfall)}，当前建议延期购买。` : goal.bufferShortfall > 0 ? `，距离已设底线还差 ${money(goal.bufferShortfall)}，当前建议延期或降低购买金额。` : goal.state === 'impact-only' ? '。缓冲底线未设置，暂不判断购买是否合适。' : ''}</p>
+    ${goal.bufferAfterPurchaseMonths !== null ? `<p class="planning-note">购买后，扣除其他购买预留的现金可覆盖约 ${NUMBER_FORMATTER.format(goal.bufferAfterPurchaseMonths)} 个月计划生活费。其他目标预留仍需保留。</p>` : ''}
+    ${goal.overdue ? '<p class="notice-text">目标期限已过且资金尚未预留足额，需要调整期限、金额或投入计划。</p>' : goal.requiredMonthly !== null ? `<p class="${goal.deadlineShortfall > 0 ? 'notice-text' : 'planning-note'}">期限测算按含本月的 ${goal.monthsLeft} 个月分摊，不计投资收益。${goal.deadlineShortfall > 0 ? `按当前月度预留，期限内仍有 ${money(goal.deadlineShortfall)} 缺口，需要调整投入、期限或已有现金分配。` : ''}</p>` : ''}
+  </article>`).join('');
+}
+
+function renderFinancialPlanning() {
+  const facts = buildFinancialPlanFacts(state.profile.financialPlan);
+  const { plan } = facts;
+  const salary = latestSalaryReference(state.transactions);
+  const amountValue = (value) => value === null ? '' : yuanFromCents(value);
+  return `${pageHeader('资金规划', '收入分配、资金目标和长期参考测算。金额由本机计算，比例与假设可以调整。', '')}${reportSectionTabs()}
+      <div class="planning-layout"><div class="settings-main"><section class="settings-section planning-inputs">
+      <h2>规划参数</h2><p>固定到手月收入作为基数。历史工资只能用于预填，保存后才确认本次规划。</p>
+      <form id="financial-plan-form">
+        <div class="form-grid">
+          <label class="field field-span-2"><span>到手月收入（元，可留空）</span><input class="text-input" name="monthlyIncome" type="number" min="0" max="10000000000" step="0.01" value="${amountValue(plan.monthlyIncome)}" />${salary ? `<button class="text-button planning-salary-reference" type="button" data-action="prefill-planning-salary">预填 ${salary.month} 工资 ${money(salary.amount)}</button>` : '<small>没有完整月份的工资记录时，直接填写。报销退款不用于预填。</small>'}</label>
+          <label class="field field-span-2"><span>已核对可动用现金（元，可留空）</span><input class="text-input" name="availableCash" type="number" min="0" max="10000000000" step="0.01" value="${amountValue(plan.availableCash)}" /><small>先扣除近期必付款和不准备动用的资金，不含信用额度。此金额不会随流水自动变化。${plan.cashConfirmedAt ? `上次确认：${plan.cashConfirmedAt}。` : ''}</small></label>
+        </div>
+        <fieldset class="planning-percentages"><legend>分配比例，合计 100%</legend>
+          <label class="field"><span>长期积累 %</span><input class="text-input" name="investmentPercent" type="number" min="0" max="100" step="1" value="${plan.investmentPercent}" required /></label>
+          <label class="field"><span>备用资金 %</span><input class="text-input" name="reservePercent" type="number" min="0" max="100" step="1" value="${plan.reservePercent}" required /></label>
+          <label class="field"><span>消费份额 %</span><input class="text-input" name="spendingPercent" type="number" min="0" max="100" step="1" value="${plan.spendingPercent}" required /></label>
+        </fieldset>
+        <details class="planning-assumptions"><summary>缓冲与长期测算参数</summary><div class="form-grid">
+          <label class="field field-span-2"><span>计划月生活费（元，可留空）</span><input class="text-input" name="monthlyLivingExpense" type="number" min="0" max="10000000000" step="0.01" value="${amountValue(plan.monthlyLivingExpense)}" /><small>留空时按消费份额估算，用于覆盖月数和长期测算。</small></label>
+          <label class="field"><span>缓冲底线（月，可留空）</span><input class="text-input" name="reserveMonths" type="number" min="0" max="120" step="any" value="${plan.reserveMonths ?? ''}" /><small>未设置时只展示购买影响，不自动通过购买评估。</small></label>
+          <label class="field"><span>假设年化收益率 %</span><input class="text-input" name="annualReturnRate" type="number" min="-100" max="100" step="any" value="${plan.annualReturnRate}" required /><small>默认 4% 仅作演算，不是收益承诺。</small></label>
+        </div></details>
+        <p class="planning-note">输入只预览，保存时确认现金金额与日期。规划和预留不会写成流水，也不会自动增加存款。</p>
+        <div class="form-actions"><button class="primary-button" type="submit">保存规划</button></div>
+      </form>
+      </section>
+    <section class="settings-section planning-goals-section"><div class="settings-title-row"><div><h2>购买与储蓄目标</h2><p>目标共用上面确认的现金，购买目标从消费份额预留，储蓄目标从备用份额预留。购买后仍需如实记账，并重新核对现金和目标。</p></div><button class="primary-button" type="button" data-action="open-planning-goal">${icon('ph-plus')}添加目标</button></div>
+      <div id="financial-planning-goals">${renderPlanningGoals(facts)}</div>
+      </section></div><div id="financial-plan-preview" class="settings-main">${renderPlanningResults(facts)}</div></div>`;
+}
+
+function updateFinancialPlanningPreview() {
+  const form = document.querySelector('#financial-plan-form');
+  const preview = document.querySelector('#financial-plan-preview');
+  if (!form || !preview) return;
+  try {
+    const facts = buildFinancialPlanFacts(readFinancialPlanForm(form));
+    preview.innerHTML = renderPlanningResults(facts);
+    document.querySelector('#financial-planning-goals').innerHTML = renderPlanningGoals(facts);
+  } catch (error) {
+    preview.innerHTML = `<p class="notice-text" role="status">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function openPlanningGoalDialog(goal = null) {
+  openDialog(`<form class="dialog-content" id="planning-goal-form" data-goal-id="${escapeHtml(goal?.id || '')}">
+    <div class="dialog-header"><div><h2 id="dialog-title">${goal ? '编辑资金目标' : '添加资金目标'}</h2><p>每月投入用于测算，已预留金额需要手动确认。</p></div><button class="icon-button dialog-close" type="button" data-action="close-dialog" aria-label="关闭">${icon('ph-x')}</button></div>
+    <div class="dialog-form-grid">
+      <label class="field field-span-2"><span>目标名称</span><input class="text-input" name="name" maxlength="80" value="${escapeHtml(goal?.name || '')}" placeholder="如：电脑、旅行或备用资金" required /></label>
+      <label class="field"><span>目标用途</span><select class="select-input" name="kind"><option value="purchase" ${goal?.kind !== 'savings' ? 'selected' : ''}>购买或消费，从消费份额预留</option><option value="savings" ${goal?.kind === 'savings' ? 'selected' : ''}>储蓄，从备用份额预留</option></select></label>
+      <label class="field"><span>目标金额（元）</span><input class="text-input" name="targetAmount" type="number" min="0.01" max="10000000000" step="0.01" value="${goal ? yuanFromCents(goal.targetAmount) : ''}" required /></label>
+      <label class="field"><span>已预留金额（元）</span><input class="text-input" name="allocatedAmount" type="number" min="0" max="10000000000" step="0.01" value="${goal ? yuanFromCents(goal.allocatedAmount) : 0}" required /></label>
+      <label class="field"><span>每月计划预留（元）</span><input class="text-input" name="monthlyContribution" type="number" min="0" max="10000000000" step="0.01" value="${goal ? yuanFromCents(goal.monthlyContribution) : 0}" required /></label>
+      <label class="field field-span-2"><span>期望完成日期（可留空）</span><input class="text-input" name="deadline" type="date" value="${escapeHtml(goal?.deadline || '')}" /></label>
+    </div><p class="planning-note">已预留金额来自同一份现金，不能在多个目标中重复使用。修改目标不会产生支出。</p>
+    <div class="dialog-actions"><button class="secondary-button" type="button" data-action="close-dialog">取消</button><button class="primary-button" type="submit">保存目标</button></div>
+  </form>`);
+}
+
 function renderReports() {
+  if (state.reportSection === 'planning') return renderFinancialPlanning();
   if (state.reportSection === 'recurring') return renderRecurringBills();
   if (state.reportSection === 'budget') return renderCategoryBudgets();
   const { start, end } = periodBounds(state.reportPeriod);
@@ -3838,8 +4009,27 @@ document.addEventListener('click', async (event) => {
       openTransactionDialog(null, { type: 'expense', note: bill.name, accountId: bill.accountId, categoryId: bill.categoryId || 'food', recurringBillId: bill.id });
       return;
     }
+    if (action === 'prefill-planning-salary') {
+      const salary = latestSalaryReference(state.transactions);
+      const input = document.querySelector('#financial-plan-form [name="monthlyIncome"]');
+      if (salary && input) { input.value = yuanFromCents(salary.amount); updateFinancialPlanningPreview(); }
+      return;
+    }
+    if (action === 'open-planning-goal') { openPlanningGoalDialog(); return; }
+    if (action === 'edit-planning-goal') {
+      const goal = currentFinancialPlan().goals.find((item) => item.id === actionTarget.dataset.goalId);
+      if (!goal) throw new Error('资金目标已不存在。');
+      openPlanningGoalDialog(goal);
+      return;
+    }
+    if (action === 'remove-planning-goal') {
+      const plan = currentFinancialPlan();
+      plan.goals = plan.goals.filter((item) => item.id !== actionTarget.dataset.goalId);
+      await saveFinancialPlan(plan, '目标已移除，现金与流水没有变更。');
+      return;
+    }
     if (action === 'report-section') {
-      state.reportSection = ['summary', 'recurring', 'budget'].includes(actionTarget.dataset.section) ? actionTarget.dataset.section : 'summary';
+      state.reportSection = ['summary', 'recurring', 'budget', 'planning'].includes(actionTarget.dataset.section) ? actionTarget.dataset.section : 'summary';
       if (state.activeView !== 'reports') navigate('reports'); else render();
       return;
     }
@@ -4055,6 +4245,7 @@ document.addEventListener('change', async (event) => {
 });
 
 document.addEventListener('input', (event) => {
+  if (event.target.closest('#financial-plan-form')) updateFinancialPlanningPreview();
   const importField = event.target.closest('[data-import-field]');
   if (importField && importField.dataset.importField === 'note' && state.statementImport?.rows) {
     const row = state.statementImport.rows[Number(importField.dataset.rowIndex)];
@@ -4100,6 +4291,27 @@ document.addEventListener('submit', async (event) => {
     if (manualSubmitButton) manualSubmitButton.disabled = true;
   }
   try {
+    if (form.id === 'financial-plan-form') {
+      const plan = readFinancialPlanForm(form);
+      plan.cashConfirmedAt = plan.availableCash === null ? '' : dateKey(new Date());
+      await saveFinancialPlan(plan, '资金规划已保存，流水和账本预算没有变更。');
+      return;
+    }
+    if (form.id === 'planning-goal-form') {
+      const plan = currentFinancialPlan();
+      const previousFacts = buildFinancialPlanFacts(plan);
+      const original = plan.goals.find((item) => item.id === form.dataset.goalId);
+      if (form.dataset.goalId && !original) throw new Error('资金目标已不存在。');
+      const goal = { id: original?.id || id(), name: String(data.get('name') || ''), kind: String(data.get('kind')),
+        targetAmount: planningAmountInput(data.get('targetAmount')), allocatedAmount: planningAmountInput(data.get('allocatedAmount')),
+        monthlyContribution: planningAmountInput(data.get('monthlyContribution')), deadline: String(data.get('deadline') || '') };
+      plan.goals = [...plan.goals.filter((item) => item.id !== goal.id), goal];
+      const facts = buildFinancialPlanFacts(plan);
+      if (facts.allocationShortfall > (previousFacts.allocationShortfall || 0)) throw new Error(`预留合计超过已确认现金 ${money(facts.allocationShortfall)}，请减少预留或先核对现金。`);
+      await saveFinancialPlan(plan, '目标已保存，未新增任何流水。');
+      closeDialog();
+      return;
+    }
     if (form.id === 'agent-chat-form') {
       await sendAgentMessage(data.get('message'));
       return;
