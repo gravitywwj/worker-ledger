@@ -1,8 +1,9 @@
-import { statementEntry } from './transaction-reconciliation.mjs';
+import { REFUND_PATTERN, statementEntry } from './transaction-reconciliation.mjs';
 
 const FIELDS = {
   date: ['交易时间', '交易日期', '发生时间', '日期', '付款时间', '入账时间', 'date', 'datetime', 'time'],
   direction: ['收/支', '收支', '收入支出', '方向', '资金方向', 'direction'],
+  tradeType: ['交易类型', '交易分类', '业务类型', 'transaction type'],
   amount: ['金额(元)', '金额（元）', '交易金额', '发生金额', '金额', 'amount'],
   note: ['商品说明', '商品', '摘要', '备注', '用途', 'description', 'memo'],
   counterparty: ['交易对方', '商户名称', '对方名称', 'counterparty', 'payee'],
@@ -18,6 +19,26 @@ export function decodeStatementFile(input) {
   const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
   try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes).replace(/^\uFEFF/, ''); }
   catch { return new TextDecoder('gb18030').decode(bytes).replace(/^\uFEFF/, ''); }
+}
+
+export async function readStatementFile(input, name) {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  if (bytes.byteLength > 20 * 1024 * 1024) throw new Error('账单文件超过 20 MB，请按时间分段导出。');
+  if (/\.csv$/i.test(name)) return inspectStatementCsv(parseStatementCsv(decodeStatementFile(bytes)));
+  if (!/\.xlsx$/i.test(name)) throw new Error('请选择 CSV 或 Excel（.xlsx）账单；压缩包请先解压。');
+  const { read, utils } = await import('../node_modules/xlsx/xlsx.mjs');
+  let workbook;
+  try { workbook = read(bytes, { type: 'array', dense: true }); }
+  catch { throw new Error('Excel 账单无法读取，请检查文件是否完整或需要先解除密码。'); }
+  const statements = [];
+  for (const sheetName of workbook.SheetNames) {
+    const rows = utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, raw: false, defval: '', blankrows: false });
+    try { statements.push({ ...inspectStatementCsv(rows), sheetName }); }
+    catch { /* Non-statement sheets do not have date and amount headers. */ }
+  }
+  if (!statements.length) throw new Error('Excel 中未找到同时包含日期和金额的账单表头。');
+  if (statements.length > 1) throw new Error('Excel 含多个账单工作表，请分别导出后导入，避免漏记。');
+  return statements[0];
 }
 
 export function parseStatementCsv(input) {
@@ -93,22 +114,31 @@ function fieldValue(row, index) { return index < 0 ? '' : String(row[index] || '
 
 export function mapStatementRows(statement, mapping = statement.mapping, options = {}) {
   const makeId = options.makeId || DEFAULT_ID;
-  const rows = statement.rows.map((cells, index) => {
+  const indices = options.rowIndices || statement.rows.map((_, index) => index);
+  const rows = indices.map((index) => {
+    const cells = statement.rows[index];
     const line = statement.headerRowIndex + index + 2;
     const raw = Object.fromEntries(Object.entries(mapping).map(([key, column]) => [key, fieldValue(cells, Number(column))]));
     const status = raw.status;
     const skipReason = /关闭|取消|撤销|失败|已关闭|已取消|交易关闭|交易失败/i.test(status) ? `交易状态：${status}` : '';
-    const directionText = `${raw.direction} ${raw.note} ${raw.counterparty} ${raw.paymentMethod} ${status}`;
+    const direction = String(raw.direction || '').normalize('NFKC');
+    const explicitTransfer = /转账|充值|提现/.test(direction);
+    const transferDirection = /不计(?:入)?收支/.test(direction) || explicitTransfer;
+    const incomeDirection = /收入|收款|^收$/.test(direction);
+    const expenseDirection = /支出|付款|支付|消费|^付$/.test(direction);
+    const tradeIncome = /收入|收款|到账/.test(raw.tradeType || '');
+    const tradeExpense = /消费|支出|付款|支付/.test(raw.tradeType || '') && !REFUND_PATTERN.test(raw.tradeType || '');
+    const refund = REFUND_PATTERN.test(`${raw.tradeType || ''} ${direction} ${raw.note}`)
+      || (!expenseDirection && (REFUND_PATTERN.test(`${raw.counterparty} ${raw.paymentMethod}`)
+        || /^(?:退款成功|退款到账|退回成功|返现成功)$/.test(status)));
     const parsedAmount = parseAmount(raw.amount);
-    const type = /转账|充值|提现/.test(raw.direction) ? 'transfer'
-      : /退款|退回|退还|返现/.test(directionText) ? 'income'
-        : /收入|收款|收|退款成功/.test(raw.direction) ? 'income'
-          : /支出|付款|支付|消费|付/.test(raw.direction) ? 'expense'
-            : parsedAmount?.negative ? 'expense' : /转账|充值|提现/.test(directionText) ? 'transfer' : 'expense';
+    const type = expenseDirection ? 'expense' : incomeDirection ? 'income' : explicitTransfer ? 'transfer'
+      : refund ? 'income' : transferDirection ? 'transfer' : parsedAmount?.negative ? 'expense'
+        : /转账|充值|提现/.test(`${raw.tradeType || ''} ${raw.note} ${raw.counterparty} ${raw.paymentMethod}`) ? 'transfer' : 'expense';
     const occurredAt = parseOccurredAt(raw.date);
-    const note = raw.note || raw.counterparty || raw.paymentMethod;
-    const sourceNote = [raw.counterparty, raw.note].filter(Boolean).join(' · ') || note;
-    const incomeCategory = /退|返/.test(directionText) ? 'reimburse' : options.incomeCategoryId || 'other-income';
+    const note = raw.note || raw.counterparty || (refund && raw.tradeType) || raw.paymentMethod;
+    const sourceNote = [raw.counterparty, raw.note, refund && raw.tradeType, raw.paymentMethod && `支付方式：${raw.paymentMethod}`].filter(Boolean).join(' · ') || note;
+    const incomeCategory = refund ? 'refund' : options.incomeCategoryId || 'other-income';
     const categoryId = type === 'transfer' ? 'transfer' : type === 'income' ? incomeCategory : options.defaultCategoryId || 'other';
     const transaction = {
       id: makeId(), type, amount: parsedAmount?.cents || 0, categoryId,
@@ -122,7 +152,10 @@ export function mapStatementRows(statement, mapping = statement.mapping, options
     if (!parsedAmount) errors.push('金额无效或超过两位小数');
     if (raw.externalId.length > 120) errors.push('交易单号超过 120 字，请重新映射或跳过');
     if (note.length > 4000 || sourceNote.length > 4000) errors.push('备注或原始说明超过 4000 字，请重新映射或跳过');
-    if (!skipReason && !/成功|完成|已支付|已收款|已付款|已退款|已到账|交易成功|支付成功/i.test(status)) errors.push('交易状态待确认');
+    if (!skipReason && !/成功|完成|已支付|已收款|已付款|已(?:全额|部分)?退款|已到账/.test(status)) errors.push('交易状态待确认');
+    if (!skipReason && !refund && !transferDirection && !incomeDirection && !expenseDirection) errors.push('收支方向待确认');
+    if (!skipReason && ((expenseDirection && (incomeDirection || refund || tradeIncome)) || (incomeDirection && (parsedAmount?.negative || tradeExpense))
+      || (explicitTransfer && (incomeDirection || expenseDirection || refund)))) errors.push('收支方向与原始信息冲突，请确认');
     if (!transaction.accountId) errors.push('实际扣款或到账账户待确认');
     if (type === 'transfer') errors.push('转账需确认转出和转入账户');
     if (type !== 'transfer' && !(options.categories || []).some((category) => category.id === categoryId && category.type === type)) errors.push('分类需确认');

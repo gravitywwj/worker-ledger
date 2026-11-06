@@ -73,6 +73,7 @@ test('source transaction IDs match all dates, stay scoped, and expose conflictin
   const index = buildTransactionHistoryIndex([old]);
   assert.equal(findDuplicateTransactions(index, [candidate])[0].matches[0].sameStatement, true);
   assert.equal(findDuplicateTransactions(index, [{ ...candidate, amount: 9999 }])[0].matches[0].difference, 7199);
+  assert.equal(findDuplicateTransactions(index, [{ ...candidate, type: 'income' }])[0].matches[0].typeConflict, true);
   for (const changes of [{ source: '支付宝账单' }, { accountId: 'another-wallet' }]) {
     const other = { ...candidate, statementEntries: [{ ...candidate.statementEntries[0], ...changes }] };
     assert.equal(findDuplicateTransactions(index, [other]).length, 0);

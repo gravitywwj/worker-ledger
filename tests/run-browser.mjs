@@ -6,6 +6,7 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runBrowserAcceptance, runHistoryAcceptance, runReconciliationAcceptance, runPlanningAcceptance } from './browser-acceptance.mjs';
+import { runStatementImportAcceptance } from './statement-import-acceptance.mjs';
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const probe = createServer();
 probe.listen(0, '127.0.0.1');
@@ -33,6 +34,7 @@ try {
   console.log(await runBrowserAcceptance(await browser.newPage(), base));
   console.log(await runHistoryAcceptance(await browser.newPage(), base));
   console.log(await runReconciliationAcceptance(await browser.newPage(), base));
+  console.log(await runStatementImportAcceptance(browser, base));
 } finally {
   if (browser) await browser.close();
   if (server.exitCode === null && server.signalCode === null) {

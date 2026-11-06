@@ -114,8 +114,14 @@ function duplicateMatch(candidate, existing) {
   const difference = Math.abs(candidate.amount - existing.amount);
   const sameStatement = candidate.identities.some((key) => existing.identities.includes(key));
   const elapsed = Math.abs(candidate.timestamp - existing.timestamp);
-  if (sameStatement) return { transaction: existing.transaction, kind: 'possible_duplicate', elapsed, similarity: 1, difference, sameStatement: true,
-    reason: difference ? '同一来源账户的交易单号相同，但金额不同，请核对' : '同一来源账户的交易单号相同' };
+  if (sameStatement) {
+    const refund = candidate.transaction.categoryId === 'refund' || existing.transaction.categoryId === 'refund';
+    const typeConflict = candidate.transaction.type !== existing.transaction.type
+      && (refund || (candidate.transaction.type !== 'transfer' && existing.transaction.type !== 'transfer'));
+    const conflict = [difference ? '金额' : '', typeConflict ? '收支方向' : ''].filter(Boolean).join('和');
+    return { transaction: existing.transaction, kind: 'possible_duplicate', elapsed, similarity: 1, difference, sameStatement: true, typeConflict,
+      reason: `同一来源账户的交易单号相同${conflict ? `，${conflict}不同，请核对` : ''}` };
+  }
   if (difference > Math.max(100, Math.round(Math.max(candidate.amount, existing.amount) * 0.05))) return null;
   let dayGap = Infinity;
   for (const left of candidate.days) for (const right of existing.days) dayGap = Math.min(dayGap, Math.abs(left - right));

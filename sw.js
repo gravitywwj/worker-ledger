@@ -1,4 +1,4 @@
-const CACHE_NAME = 'worker-ledger-v37';
+const CACHE_NAME = 'worker-ledger-v40';
 const APP_SHELL = [
   './',
   './src/product-prices.mjs',
@@ -13,9 +13,11 @@ const APP_SHELL = [
   './src/transaction-facts.mjs',
   './src/financial-planning.mjs',
   './agent/periodic-review.mjs',
+  './agent/tools.mjs',
+  './node_modules/xlsx/xlsx.mjs',
   './index.html',
-  './src/styles.css?v=25',
-  './src/app.js?v=41',
+  './src/styles.css?v=28',
+  './src/app.js?v=44',
   './assets/phosphor/style.css?v=1',
   './assets/phosphor/Phosphor.woff2',
   './manifest.webmanifest',

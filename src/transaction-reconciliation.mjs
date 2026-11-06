@@ -1,4 +1,5 @@
 export const PAYMENT_CHANNELS = ['微信', '支付宝', '银行卡', '现金', '其他'];
+export const REFUND_PATTERN = /退款|退回|退还|返还|返款|返现/;
 const TYPES = ['expense', 'income', 'transfer'];
 const REFERENCE_PATTERN = /(?:交易单号|订单号|交易号|流水号|单号)\s*[:：]?\s*([A-Za-z0-9_-]+)/g;
 

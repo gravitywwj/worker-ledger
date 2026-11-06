@@ -1018,6 +1018,24 @@ html[data-qa="true"] .mobile-nav { display: none; }
 .agent-fact-row small { color: var(--ink-muted); font-size: 12px; }
 .invalid-source { color: var(--warning); }
 
+.import-upload, .import-mapping { padding: 24px; }
+.import-upload h2 { margin-bottom: 12px; font-size: 18px; }
+.import-upload p { max-width: 70ch; color: var(--ink-soft); }
+.import-upload .button-row { flex-wrap: wrap; margin-top: 20px; }
+.import-column-mapping { margin-top: 20px; border-top: 1px solid var(--line); }
+.import-column-mapping summary, .import-row-editor summary { padding: 12px 0; color: var(--primary); cursor: pointer; font-weight: 650; }
+.import-row-routing { margin: 0; color: var(--ink-soft); font-size: 12px; }
+.import-row-accounts { display: flex; flex-wrap: wrap; gap: 8px 24px; margin-top: 8px; overflow-wrap: anywhere; }
+.import-payment-accounts { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; padding: 16px 0; }
+.import-payment-accounts > strong { flex-basis: 100%; }
+.import-payment-accounts .field { flex: 1 1 180px; min-width: 0; }
+.import-result-months { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.import-confirm, .import-result { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 16px; margin-bottom: 16px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--surface-subtle); }
+.import-confirm > div, .import-result > div { flex: 1; min-width: min(100%, 240px); }
+.import-confirm p, .import-result p { margin: 6px 0 0; color: var(--ink-soft); font-size: 12px; }
+.import-filters { flex-wrap: wrap; margin-bottom: 16px; }
+.import-filters button { min-height: 44px; }
+
 @media (max-width: 760px) {
   .header-actions { flex-wrap: wrap; }
   .feature-row { grid-template-columns: minmax(0, 1fr); align-items: start; }

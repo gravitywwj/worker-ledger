@@ -5,8 +5,9 @@ import { normalizeBackup } from './product-backup.mjs';
 import { buildPeriodicReviewFacts, normalizePeriodicReviewPayload, periodicReviewPlaceholderIds } from '../agent/periodic-review.mjs';
 import { productRow, renderProductEditor, readProductEditor, updateProductPreviews, renderPriceSources } from './product-ui.mjs';
 import { buildTransactionHistoryIndex, searchTransactionHistory, findDuplicateTransactions, normalizeTransactionNote, parseHistoryQuery } from './transaction-history.mjs';
-import { PAYMENT_CHANNELS, normalizeTransactionDetails, statementEntry, statementIdentity, associateTransaction, parseTransactionRouting, statementHints, maskStatementReferences } from './transaction-reconciliation.mjs';
-import { decodeStatementFile, inspectStatementCsv, mapStatementRows, parseStatementCsv, statementFieldOptions } from './statement-import.mjs';
+import { PAYMENT_CHANNELS, REFUND_PATTERN, normalizeTransactionDetails, statementEntry, statementIdentity, associateTransaction, parseTransactionRouting, statementHints, maskStatementReferences } from './transaction-reconciliation.mjs';
+import { readStatementFile, mapStatementRows, statementFieldOptions } from './statement-import.mjs';
+import { resolveCategoryCandidates } from '../agent/tools.mjs';
 import { dueRecurringBills, firstRecurringDate, normalizeRecurringBill, recordRecurringPayment, removeRecurringPayment, recurringBillCandidates } from './recurring-bills.mjs';
 import { categoryBudgetRows, normalizeCategoryBudgets, previousMonthBudgets } from './category-budgets.mjs';
 import { normalizeShoppingItem } from './shopping-list.mjs';
@@ -15,6 +16,7 @@ import { normalizeFinancialPlan, buildFinancialPlanFacts, latestSalaryReference 
 
 const DB_NAME = 'worker-ledger';
 const DB_VERSION = 7;
+const STATEMENT_DRAFT_CURRENT = 'statement-import-current';
 const STORES = {
   transactions: 'transactions',
   products: 'products',
@@ -59,6 +61,7 @@ const AGENT_STORAGE_KEYS = {
 let agentVoiceRecognition = null;
 let agentOcrWorkerPromise = null;
 
+const REFUND_CATEGORY = { id: 'refund', label: '退款', icon: 'ph-arrow-u-up-left', type: 'income' };
 const DEFAULT_CATEGORIES = [
   { id: 'food', label: '餐饮', icon: 'ph-fork-knife', type: 'expense' },
   { id: 'commute', label: '交通', icon: 'ph-train', type: 'expense' },
@@ -75,6 +78,7 @@ const DEFAULT_CATEGORIES = [
   { id: 'salary', label: '工资', icon: 'ph-briefcase', type: 'income' },
   { id: 'bonus', label: '奖金', icon: 'ph-sparkle', type: 'income' },
   { id: 'reimburse', label: '报销退款', icon: 'ph-receipt', type: 'income' },
+  REFUND_CATEGORY,
   { id: 'other-income', label: '其他收入', icon: 'ph-coins', type: 'income' },
 ];
 
@@ -100,6 +104,7 @@ const CATEGORY_ICON_FALLBACKS = {
   salary: 'ph-briefcase',
   bonus: 'ph-sparkle',
   reimburse: 'ph-receipt',
+  refund: REFUND_CATEGORY.icon,
   'other-income': 'ph-coins',
   transfer: 'ph-arrows-left-right',
 };
@@ -159,6 +164,7 @@ const state = {
   ledgerType: 'all',
   ledgerAccount: 'all',
   ledgerScope: 'month',
+  ledgerDay: '',
   ledgerCategory: 'all',
   ledgerStartDate: '',
   ledgerEndDate: '',
@@ -171,6 +177,7 @@ const state = {
   recurringCandidates: [],
   reportWeekDate: null,
   statementImport: null,
+  lastStatementImport: null,
   weatherIndex: 0,
   agentMessages: [],
   agentMemory: [],
@@ -190,6 +197,8 @@ const state = {
 
 let searchTimer = null;
 let resizeTimer = null;
+let statementDraftSaveVersion = 0;
+let statementDraftSaveStatus = '';
 let transactionHistoryCache = null;
 
 function id() {
@@ -831,7 +840,7 @@ async function loadData() {
     } else {
       if (!state.db) state.db = await openDatabase();
       await ensureInitialData();
-      const [profileRecord, transactions, categories, accounts, agentMessages, agentMemory, products, productCategories, recurringBills, categoryBudgets, shoppingList] = await Promise.all([
+      const [profileRecord, transactions, categories, accounts, agentMessages, agentMemory, products, productCategories, recurringBills, categoryBudgets, shoppingList, importPointer] = await Promise.all([
         dbGet(STORES.settings, 'profile'),
         dbGetAll(STORES.transactions),
         dbGetAll(STORES.categories),
@@ -843,6 +852,7 @@ async function loadData() {
         dbGetAll(STORES.recurringBills),
         dbGetAll(STORES.categoryBudgets),
         dbGetAll(STORES.shoppingList),
+        dbGet(STORES.settings, STATEMENT_DRAFT_CURRENT),
       ]);
       state.profile = {
         ...DEFAULT_PROFILE,
@@ -858,6 +868,16 @@ async function loadData() {
       state.shoppingList = shoppingList;
       state.categories = categories.length ? categories : [...DEFAULT_CATEGORIES];
       state.accounts = accounts.length ? accounts : [...DEFAULT_ACCOUNTS];
+      if (importPointer?.value) {
+        const draft = await dbGet(STORES.settings, importPointer.value);
+        if (draft?.value?.statement?.rows && draft.value.draftKey === importPointer.value) {
+          state.statementImport = draft.value;
+          state.statementImport.saving = false;
+          if (state.statementImport.rows) refreshStatementImportDuplicates(state.statementImport.rows);
+          statementDraftSaveStatus = '核对进度已保存在本机';
+          if (state.activeView === 'ledger' && state.statementImport.active !== false) state.ledgerSection = 'import';
+        }
+      }
       state.agentMessages = agentMessages
         .filter((message) => message?.role === 'user' || message?.role === 'assistant')
         .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
@@ -942,9 +962,15 @@ async function persistTransactions(transactions, successMessage = '这些流水�
     if (!(bill.payments || []).some((payment) => payment.transactionId === transaction.id)) recurringUpdates.set(bill.id, recordRecurringPayment(bill, transaction));
   }
   const bundle = { [STORES.transactions]: prepared.transactions, [STORES.products]: prepared.products, [STORES.productCategories]: prepared.productCategories };
+  const importPreset = options.statementImportPreset;
+  const nextProfile = importPreset ? { ...state.profile, statementImportPresets: { ...state.profile.statementImportPresets,
+    [importPreset.key]: { source: importPreset.source, sourceAccountId: importPreset.sourceAccountId, defaultAccountId: importPreset.defaultAccountId, defaultCategoryId: importPreset.defaultCategoryId, mapping: importPreset.mapping } } } : null;
+  if (nextProfile) bundle[STORES.settings] = { put: [{ key: 'profile', ...nextProfile }],
+    delete: options.statementDraftKey ? [options.statementDraftKey, STATEMENT_DRAFT_CURRENT] : [] };
   if (recurringUpdates.size) bundle[STORES.recurringBills] = [...recurringUpdates.values()];
   if (options.shoppingItemId) bundle[STORES.shoppingList] = { delete: [options.shoppingItemId] };
   if (!state.demo) await dbWriteBundle(bundle);
+  if (nextProfile) state.profile = nextProfile;
   const ids = new Set(prepared.transactions.map((item) => item.id));
   state.transactions = sortTransactions([...state.transactions.filter((item) => !ids.has(item.id)), ...prepared.transactions]);
   state.products = prepared.products;
@@ -955,7 +981,7 @@ async function persistTransactions(transactions, successMessage = '这些流水�
     const date = new Date(item.occurredAt);
     return !latest || date > latest ? date : latest;
   }, null);
-  if (latestDate) {
+  if (latestDate && !options.keepPeriod) {
     state.selectedMonth = new Date(latestDate.getFullYear(), latestDate.getMonth(), 1);
     state.reportWeekDate = latestDate;
   }
@@ -982,6 +1008,32 @@ function dbWriteBundle(bundle, replaceAll = false) {
         }
       }
     } catch (error) { tx.abort(); reject(error); }
+  });
+}
+
+function saveStatementImportDraft() {
+  const current = state.statementImport;
+  if (state.demo || !current?.draftKey) return Promise.resolve();
+  const version = ++statementDraftSaveVersion;
+  statementDraftSaveStatus = '正在保存核对进度';
+  const updateStatus = () => {
+    const element = document.querySelector('[data-import-save-status]');
+    if (element) element.textContent = statementDraftSaveStatus;
+    const retry = document.querySelector('[data-action="retry-statement-draft"]');
+    if (retry) retry.classList.toggle('hidden', !statementDraftSaveStatus.startsWith('核对进度未能保存'));
+  };
+  updateStatus();
+  return dbWriteBundle({ [STORES.settings]: [
+    { key: current.draftKey, value: current },
+    { key: STATEMENT_DRAFT_CURRENT, value: current.draftKey },
+  ] }).then(() => {
+    if (version === statementDraftSaveVersion) { statementDraftSaveStatus = '核对进度已保存在本机'; updateStatus(); }
+  }).catch(() => {
+    if (version === statementDraftSaveVersion) {
+      statementDraftSaveStatus = '核对进度未能保存，刷新前请重试';
+      updateStatus();
+      toast(statementDraftSaveStatus, 'error');
+    }
   });
 }
 
@@ -1090,7 +1142,8 @@ function monthHeader(title = monthLabel()) {
       </div>
       <div class="header-actions">
         <button class="icon-button" type="button" data-action="open-search" aria-label="搜索流水">${icon('ph-magnifying-glass')}</button>
-        <button class="primary-button" type="button" data-action="open-transaction">${icon('ph-plus')}<span>记一笔</span></button>
+        <button class="secondary-button" type="button" data-action="open-transaction">${icon('ph-plus')}<span>记一笔</span></button>
+        <button class="primary-button" type="button" data-action="open-statement-import">${icon('ph-upload-simple')}导入账单</button>
       </div>
     </header>`;
 }
@@ -1295,9 +1348,13 @@ function renderHome() {
 
 function filteredLedgerTransactions() {
   const { start, end } = periodBounds('month');
+  const dates = {
+    month: { startDate: dateKey(start), endDate: dateKey(end) },
+    day: { startDate: state.ledgerDay, endDate: state.ledgerDay },
+    range: { startDate: state.ledgerStartDate, endDate: state.ledgerEndDate },
+  };
   const query = { keyword: state.searchTerm, type: state.ledgerType, accountId: state.ledgerAccount, categoryId: state.ledgerCategory, limit: 50,
-    ...(state.ledgerStartDate || state.ledgerEndDate ? { startDate: state.ledgerStartDate || undefined, endDate: state.ledgerEndDate || undefined }
-      : state.ledgerScope === 'month' ? { startDate: dateKey(start), endDate: dateKey(end) } : {}) };
+    ...dates[state.ledgerScope] };
   let result = searchTransactionHistory(transactionHistoryIndex(), { ...query, offset: state.ledgerPage * 50 });
   const lastPage = Math.max(0, Math.ceil(result.count / 50) - 1);
   if (state.ledgerPage > lastPage) {
@@ -1311,25 +1368,30 @@ function renderLedger() {
   if (state.ledgerSection === 'shopping') return renderShoppingList();
   if (state.ledgerSection === 'import') return renderStatementImport();
   const result = filteredLedgerTransactions();
+  const scopeOptions = [['month', '按月'], ['day', '按日'], ['range', '自定义日期'], ['all', '全部历史']];
   return `
-    ${pageHeader('流水', '查询当前月份或全部历史，支持关键词、同义词和金额，每笔流水可查看原账单。', `<div class="header-actions"><button class="secondary-button" type="button" data-action="open-statement-import">导入账单</button><button class="primary-button" type="button" data-action="open-transaction">${icon('ph-plus')}记一笔</button></div>`)}
+    ${pageHeader('流水', '按月或按日查看每笔收支，点编辑图标可修改流水。', `<div class="header-actions"><button class="secondary-button" type="button" data-action="open-transaction">${icon('ph-plus')}记一笔</button><button class="primary-button" type="button" data-action="open-statement-import">${icon('ph-upload-simple')}导入账单</button></div>`)}
+    ${state.lastStatementImport ? `<section class="import-result" role="status"><div><strong>最近一次导入：新增 ${state.lastStatementImport.added} 笔，关联 ${state.lastStatementImport.linked} 笔</strong><p>新增支出 ${money(state.lastStatementImport.expense)} · 新增收入 ${money(state.lastStatementImport.income)}。关联来源不重复计入收支。</p></div>${state.lastStatementImport.months.length > 1 ? `<div class="import-result-months"><span>涉及月份：</span>${state.lastStatementImport.months.map((month) => `<button class="secondary-button" type="button" data-action="import-view-reports" data-month="${escapeHtml(month)}">${escapeHtml(month.slice(0, 4))} 年 ${Number(month.slice(5))} 月报表</button>`).join('')}</div>` : '<button class="secondary-button" type="button" data-action="import-view-reports">查看月度报表</button>'}<button class="text-button" type="button" data-action="import-view-expenses">查看这段时间的支出</button></section>` : ''}
     <div class="period-switch ledger-sections"><button class="${state.ledgerSection === 'transactions' ? 'primary-button' : 'secondary-button'}" type="button" data-action="ledger-section" data-section="transactions" aria-pressed="${state.ledgerSection === 'transactions'}">流水</button><button class="secondary-button" type="button" data-action="ledger-section" data-section="shopping">商品与待购</button></div>
-    <div class="toolbar">
+    <div class="toolbar ledger-toolbar">
+      <div class="filter-row">
+        <label class="field compact-select"><span>范围</span><select class="select-input" id="ledger-scope-filter">${scopeOptions.map(([value, label]) => `<option value="${value}" ${state.ledgerScope === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label>
+        ${state.ledgerScope === 'month' ? `<div class="month-control">
+          <button class="icon-button" type="button" data-action="previous-month" aria-label="上个月">${icon('ph-caret-left')}</button>
+          <label class="field"><span>月份</span><input class="text-input" type="month" id="ledger-month" placeholder="YYYY-MM" value="${escapeHtml(monthKey(state.selectedMonth))}" /></label>
+          <button class="icon-button" type="button" data-action="next-month" aria-label="下个月">${icon('ph-caret-right')}</button>
+        </div>` : ''}
+        ${state.ledgerScope === 'day' ? `<label class="field compact-select"><span>日期</span><input class="text-input" type="date" id="ledger-day" value="${escapeHtml(state.ledgerDay)}" /></label>` : ''}
+        ${state.ledgerScope === 'range' ? `<label class="field compact-select"><span>开始日期</span><input class="text-input" type="date" id="ledger-start-date" value="${escapeHtml(state.ledgerStartDate)}" /></label><label class="field compact-select"><span>结束日期</span><input class="text-input" type="date" id="ledger-end-date" value="${escapeHtml(state.ledgerEndDate)}" /></label>` : ''}
+      </div>
       <div class="filter-row">
         <label class="search-input-wrap">
           ${icon('ph-magnifying-glass')}
-          <input class="text-input" id="ledger-search" type="search" placeholder="搜索备注、分类、标签或金额" value="${escapeHtml(state.searchTerm)}" />
+          <input class="text-input" id="ledger-search" type="search" aria-label="搜索流水" placeholder="搜索备注、分类、标签或金额" value="${escapeHtml(state.searchTerm)}" />
         </label>
-        <label class="field compact-select"><span>范围</span><select class="select-input" id="ledger-scope-filter"><option value="month" ${state.ledgerScope === 'month' ? 'selected' : ''}>当前月份</option><option value="all" ${state.ledgerScope === 'all' ? 'selected' : ''}>全部历史</option></select></label>
         <label class="field compact-select"><span>类型</span><select class="select-input" id="ledger-type-filter"><option value="all">全部类型</option><option value="expense" ${state.ledgerType === 'expense' ? 'selected' : ''}>支出</option><option value="income" ${state.ledgerType === 'income' ? 'selected' : ''}>收入</option><option value="transfer" ${state.ledgerType === 'transfer' ? 'selected' : ''}>转账</option></select></label>
         <label class="field compact-select"><span>账户</span><select class="select-input" id="ledger-account-filter"><option value="all">全部账户</option>${accountOptions(state.ledgerAccount)}</select></label>
         <label class="field compact-select"><span>分类</span><select class="select-input" id="ledger-category-filter"><option value="all">全部分类</option>${state.categories.filter((item) => item.type === 'expense' || item.type === 'income').map((item) => `<option value="${escapeHtml(item.id)}" ${state.ledgerCategory === item.id ? 'selected' : ''}>${escapeHtml(item.label)}</option>`).join('')}</select></label>
-      </div>
-      <div class="filter-row"><label class="field compact-select"><span>开始日期</span><input class="text-input" type="date" id="ledger-start-date" value="${escapeHtml(state.ledgerStartDate)}" /></label><label class="field compact-select"><span>结束日期</span><input class="text-input" type="date" id="ledger-end-date" value="${escapeHtml(state.ledgerEndDate)}" /></label></div>
-      <div class="month-control ${state.ledgerScope === 'all' ? 'hidden' : ''}">
-        <button class="icon-button" type="button" data-action="previous-month" aria-label="上个月">${icon('ph-caret-left')}</button>
-        <strong>${escapeHtml(monthLabel())}</strong>
-        <button class="icon-button" type="button" data-action="next-month" aria-label="下个月">${icon('ph-caret-right')}</button>
       </div>
     </div>
     <section class="content-panel transaction-table ledger-list">
@@ -1347,7 +1409,7 @@ function statementCategoryOptions(type, selected = '') {
   return state.categories.filter((category) => category.type === type).map((category) => `<option value="${escapeHtml(category.id)}" ${selected === category.id ? 'selected' : ''}>${escapeHtml(category.label)}</option>`).join('');
 }
 
-const statementDynamicErrors = new Set(['实际扣款或到账账户待确认', '分类需确认', '转账需确认转出和转入账户', '交易状态待确认']);
+const statementDynamicErrors = new Set(['实际扣款或到账账户待确认', '分类需确认', '转账需确认转出和转入账户', '交易状态待确认', '收支方向待确认', '收支方向与原始信息冲突，请确认']);
 
 function statementImportFixedErrors(row) {
   return row.errors.filter((error) => !statementDynamicErrors.has(error));
@@ -1370,10 +1432,12 @@ function statementImportRowErrors(row) {
   const errors = statementImportFixedErrors(row);
   if (!Number.isSafeInteger(transaction.amount) || transaction.amount <= 0) errors.push('金额无效或超过两位小数');
   if (!Number.isFinite(Date.parse(transaction.occurredAt))) errors.push('交易日期无效');
-  if (!transaction.accountId || !state.accounts.some((account) => account.id === transaction.accountId)) errors.push('实际扣款或到账账户待确认');
-  if (transaction.type === 'transfer' && (!transaction.toAccountId || transaction.toAccountId === transaction.accountId)) errors.push('转账需确认两个不同的本人账户');
+  if (!transaction.accountId || !activeAccounts().some((account) => account.id === transaction.accountId)) errors.push('实际扣款或到账账户待确认');
+  if (transaction.type === 'transfer' && (!activeAccounts().some((account) => account.id === transaction.toAccountId) || transaction.toAccountId === transaction.accountId)) errors.push('转账需确认两个不同的本人账户');
   if (transaction.type !== 'transfer' && !state.categories.some((category) => category.id === transaction.categoryId && category.type === transaction.type)) errors.push('分类需确认');
   if (row.errors.includes('交易状态待确认') && !['import', 'skip'].includes(row.decision) && !String(row.decision).startsWith('link:')) errors.push('交易状态待确认');
+  if (row.errors.includes('收支方向待确认') && row.decision === 'pending') errors.push('收支方向待确认');
+  if (row.errors.includes('收支方向与原始信息冲突，请确认') && row.decision === 'pending') errors.push('收支方向与原始信息冲突，请确认');
   return [...new Set(errors)];
 }
 
@@ -1388,9 +1452,9 @@ function statementDuplicateDetails(row) {
 function statementImportRow(row, index) {
   const transaction = row.transaction;
   const errors = statementImportDecisionErrors(row);
-  const exact = row.duplicates.some((match) => match.sameStatement && match.difference === 0);
-  const conflict = row.duplicates.some((match) => match.sameStatement && match.difference !== 0);
-  const status = row.decision === 'skip' || row.skipReason ? '已跳过' : errors.length ? '待补充' : row.duplicates.length ? '疑似重复' : '可入账';
+  const exact = row.duplicates.some((match) => match.sameStatement && match.difference === 0 && !match.typeConflict);
+  const conflict = row.duplicates.some((match) => match.sameStatement && (match.difference !== 0 || match.typeConflict));
+  const status = row.decision === 'skip' || row.skipReason ? '已跳过' : errors.length || row.decision === 'pending' ? '待核对' : row.duplicates.length ? '疑似重复' : '可入账';
   const accountSelect = statementAccountOptions(transaction.accountId);
   const categorySelect = statementCategoryOptions(transaction.type === 'income' ? 'income' : 'expense', transaction.categoryId);
   const matchOptions = row.duplicates.filter((match) => !match.draftMatch && !match.sameStatement && match.difference === 0
@@ -1399,18 +1463,20 @@ function statementImportRow(row, index) {
   const decisionOptions = row.skipReason
     ? '<option value="skip" selected>已跳过</option>'
     : exact ? '<option value="skip" selected>跳过（交易单号已存在）</option>'
-      : conflict ? '<option value="pending" selected>单号金额冲突，先跳过</option><option value="skip">跳过</option>'
+      : conflict ? `<option value="pending" ${row.decision === 'pending' ? 'selected' : ''}>同单号的金额或方向有冲突</option><option value="skip" ${row.decision === 'skip' ? 'selected' : ''}>跳过</option>`
         : `<option value="pending" ${row.decision === 'pending' ? 'selected' : ''}>选择处理方式</option><option value="import" ${row.decision === 'import' ? 'selected' : ''}>导入为新流水</option>${matchOptions}<option value="skip" ${row.decision === 'skip' ? 'selected' : ''}>跳过</option>`;
   return `<article class="import-review-row ${errors.length ? 'needs-review' : ''}" data-import-row="${index}">
     <div class="import-row-summary"><strong>第 ${row.line} 行 · ${escapeHtml(status)}</strong><strong>${transaction.amount ? money(transaction.amount) : escapeHtml(row.raw.amount || '金额无效')}</strong></div>
     <div class="import-row-source"><span>${escapeHtml(transaction.occurredAt ? dateKey(transaction.occurredAt) : row.raw.date || '日期无效')}</span><span>${escapeHtml(transaction.note || '无备注')}</span><small>交易单号：${escapeHtml(row.raw.externalId || '未提供')} · ${escapeHtml(row.raw.status || '未提供状态')}</small></div>
-    <div class="import-row-fields">
+    <p class="import-row-routing">${agentDraftTypeLabel(transaction.type)}${transaction.type === 'transfer' ? '' : ` · ${escapeHtml(getCategory(transaction.categoryId).label)}`}</p>
+    <div class="import-row-accounts"><span>原支付方式：<strong>${escapeHtml(row.raw.paymentMethod || '未提供')}</strong></span><span>入账账户：<strong>${escapeHtml(accountName(transaction.accountId))}</strong></span></div>
+    <details class="import-row-editor" ${(row.editorOpen ?? row.decision === 'pending') ? 'open' : ''}><summary>调整账户、分类与处理方式</summary><div class="import-row-fields">
       <label class="field"><span>类型</span><select class="select-input" data-import-field="type" data-row-index="${index}"><option value="expense" ${transaction.type === 'expense' ? 'selected' : ''}>支出</option><option value="income" ${transaction.type === 'income' ? 'selected' : ''}>收入</option><option value="transfer" ${transaction.type === 'transfer' ? 'selected' : ''}>转账</option></select></label>
-      <label class="field"><span>实际账户</span><select class="select-input" data-import-field="accountId" data-row-index="${index}">${accountSelect}</select></label>
+      <label class="field"><span>入账账户</span><select class="select-input" data-import-field="accountId" data-row-index="${index}">${accountSelect}</select></label>
       ${transaction.type === 'transfer' ? `<label class="field"><span>本人转入账户</span><select class="select-input" data-import-field="toAccountId" data-row-index="${index}">${statementAccountOptions(transaction.toAccountId)}</select></label>` : `<label class="field"><span>分类</span><select class="select-input" data-import-field="categoryId" data-row-index="${index}">${categorySelect}</select></label>`}
       <label class="field"><span>备注</span><input class="text-input" data-import-field="note" data-row-index="${index}" value="${escapeHtml(transaction.note)}" maxlength="4000" /></label>
       <label class="field"><span>处理</span><select class="select-input" data-import-decision data-row-index="${index}" ${row.skipReason || exact ? 'disabled' : ''}>${decisionOptions}</select></label>
-    </div>
+    </div></details>
     ${row.skipReason ? `<p class="field-hint">${escapeHtml(row.skipReason)}</p>` : errors.length ? `<p class="notice-text">${errors.map(escapeHtml).join('；')}</p>` : ''}
     ${statementDuplicateDetails(row)}
   </article>`;
@@ -1419,16 +1485,25 @@ function statementImportRow(row, index) {
 function renderStatementImport() {
   const current = state.statementImport;
   const actions = `<div class="header-actions"><button class="secondary-button" type="button" data-action="ledger-section" data-section="transactions">返回流水</button></div>`;
-  if (!current) return `${pageHeader('导入账单', '选择本地 CSV 文件。数据只在本机解析，确认整批后才写入。', `<div class="header-actions"><button class="secondary-button" type="button" data-action="ledger-section" data-section="transactions">返回流水</button><button class="primary-button" type="button" data-action="select-statement-file">选择 CSV 文件</button></div>`)}<section class="content-panel import-upload"><p class="field-hint">支持 UTF-8 与 GB18030 编码；微信、支付宝常见表头会自动识别，银行卡可手动映射。</p></section>`;
-  if (!current.rows) {
-    const fields = [['date', '交易日期'], ['direction', '收支方向'], ['amount', '金额'], ['note', '备注或商品'], ['counterparty', '交易对方'], ['paymentMethod', '支付方式'], ['status', '交易状态'], ['externalId', '交易单号']];
-    const mapFields = fields.map(([key, label]) => `<label class="field"><span>${label}${['date', 'amount'].includes(key) ? '（必填）' : ''}</span><select class="select-input" name="map-${key}" ${['date', 'amount'].includes(key) ? 'required' : ''}>${statementFieldOptions(current.statement.headers, current.mapping[key])}</select></label>`).join('');
-    return `${pageHeader('账单字段映射', `${escapeHtml(current.name)} · ${current.statement.rows.length} 行数据 · ${current.source}`, actions)}<section class="content-panel"><form id="statement-mapping-form" data-field-span="2"><div class="form-grid">${mapFields}
-      <label class="field"><span>账单来源</span><input class="text-input" name="source" maxlength="80" value="${escapeHtml(current.source)}" required /></label>
-      <label class="field"><span>来源账户</span><select class="select-input" name="sourceAccountId" required><option value="">选择这份账单所属账户</option>${statementAccountOptions(current.sourceAccountId, false)}</select></label>
-      <label class="field"><span>实际扣款 / 到账账户</span><select class="select-input" name="defaultAccountId"><option value="">逐行确认</option>${statementAccountOptions(current.defaultAccountId, false)}</select></label>
-      <label class="field"><span>支出默认分类</span><select class="select-input" name="defaultCategoryId">${statementCategoryOptions('expense', current.defaultCategoryId)}</select></label>
-      </div><p class="field-hint">来源账户记录账单从哪里导出；实际账户决定余额变化。两者分别确认。交易单号用于跨日期查重。</p><div class="form-actions"><button class="secondary-button" type="button" data-action="select-statement-file">更换文件</button><button class="primary-button" type="submit">生成分页核对表</button></div></form></section>`;
+  if (!current) return `${pageHeader('导入账单', '一次导入一份账单，集中核对后整批保存。', `<div class="header-actions"><button class="secondary-button" type="button" data-action="ledger-section" data-section="transactions">返回流水</button><button class="primary-button" type="button" data-action="select-statement-file">${icon('ph-file-arrow-up')}选择账单文件</button></div>`)}<section class="content-panel import-upload"><h2>微信、支付宝或银行卡账单</h2><p>支持 CSV 和 Excel（.xlsx），常见表头自动识别。CSV 支持 UTF-8 与 GB18030 编码。</p><p>从支付平台或银行导出账单后选择文件。压缩包请先解压，带密码的 Excel 请先解除密码；单个文件不超过 20 MB。</p><p class="field-hint">文件在本机解析，不发送给模型。来源账户与实际扣款账户分别核对；重复单号会跳过，无法确定的记录集中处理。</p><div class="button-row"><button class="secondary-button" type="button" data-view="agent">文字、截图或语音补记</button><button class="text-button" type="button" data-action="open-transaction">手动记一笔</button></div></section>`;
+  const saveStatus = state.demo ? '演示模式下进度不保存' : statementDraftSaveStatus || '正在保存核对进度';
+  const saveNotice = `<p class="field-hint" data-import-save-status role="status">${escapeHtml(saveStatus)}</p>${state.demo ? '' : `<button class="text-button ${saveStatus.startsWith('核对进度未能保存') ? '' : 'hidden'}" type="button" data-action="retry-statement-draft">重试保存进度</button>`}`;
+  if (!current.rows || current.editingMapping) {
+    const draft = current.mappingDraft || {};
+    const value = (key, fallback) => Object.hasOwn(draft, key) ? draft[key] : fallback;
+    const fields = [['date', '交易日期'], ['direction', '收支方向'], ['tradeType', '交易类型'], ['amount', '金额'], ['note', '备注或商品'], ['counterparty', '交易对方'], ['paymentMethod', '支付方式'], ['status', '交易状态'], ['externalId', '交易单号']];
+    const mapFields = fields.map(([key, label]) => `<label class="field"><span>${label}${['date', 'amount'].includes(key) ? '（必填）' : ''}</span><select class="select-input" name="map-${key}" ${['date', 'amount'].includes(key) ? 'required' : ''}>${statementFieldOptions(current.statement.headers, Number(value(`map-${key}`, current.mapping[key])))}</select></label>`).join('');
+    return `${pageHeader('确认账单设置', `${escapeHtml(current.name)}${current.statement.sheetName ? ` · ${escapeHtml(current.statement.sheetName)}` : ''} · ${current.statement.rows.length} 行数据`, actions)}<section class="content-panel import-mapping"><form id="statement-mapping-form" data-field-span="2">
+      ${saveNotice}
+      ${current.remembered ? '<p class="field-hint">已沿用这类表头的字段设置，本次入账账户需要重新确认。</p>' : '<p class="field-hint">表头已自动识别。确认来源和实际账户后即可核对账单；实际账户不明确时可逐行补充。</p>'}
+      <div class="form-grid">
+      <label class="field"><span>账单来源</span><input class="text-input" name="source" maxlength="80" value="${escapeHtml(value('source', current.source))}" required /></label>
+      <label class="field"><span>来源账户</span><select class="select-input" name="sourceAccountId" required><option value="">选择这份账单所属账户</option>${statementAccountOptions(value('sourceAccountId', current.sourceAccountId), false)}</select></label>
+      <label class="field"><span>实际扣款 / 到账账户</span><select class="select-input" name="defaultAccountId"><option value="">逐行确认</option>${statementAccountOptions(value('defaultAccountId', current.defaultAccountId), false)}</select></label>
+      <label class="field"><span>支出默认分类</span><select class="select-input" name="defaultCategoryId">${statementCategoryOptions('expense', value('defaultCategoryId', current.defaultCategoryId))}</select></label>
+      </div><p class="field-hint">来源账户记录账单从哪里导出；入账账户决定余额变化。存在多种支付方式时，在核对页分别确认账户。</p>
+      <details class="import-column-mapping"><summary>查看或调整字段映射（已识别 ${Object.values(current.mapping).filter((index) => index >= 0).length} 项）</summary><div class="form-grid">${mapFields}</div></details>
+      <div class="form-actions"><button class="secondary-button" type="button" data-action="select-statement-file">更换文件</button><button class="primary-button" type="submit">生成分页核对表</button></div></form></section>`;
   }
   const rows = current.rows;
   const counts = { ready: 0, duplicate: 0, missing: 0, skipped: 0 };
@@ -1438,16 +1513,32 @@ function renderStatementImport() {
     else if (row.duplicates.length) counts.duplicate += 1;
     else counts.ready += 1;
   }
+  const isPending = (row) => row.decision === 'pending' || (!(row.skipReason || row.decision === 'skip') && statementImportDecisionErrors(row).length > 0);
+  const pendingCount = rows.filter(isPending).length;
+  const filtered = rows.map((row, index) => ({ row, index })).filter(({ row }) => current.filter === 'pending' ? isPending(row) : current.filter === 'ready' ? !isPending(row) && row.decision !== 'skip' && !row.skipReason : current.filter === 'skipped' ? row.decision === 'skip' || row.skipReason : true);
+  const pageCount = Math.max(1, Math.ceil(filtered.length / 50));
+  current.page = Math.min(current.page, pageCount - 1);
   const start = current.page * 50;
-  const pageRows = rows.slice(start, start + 50);
+  const pageRows = filtered.slice(start, start + 50);
   const unresolved = rows.some((row) => row.decision === 'pending'
     || ((row.decision === 'import' || String(row.decision).startsWith('link:')) && statementImportDecisionErrors(row).length));
   const importCount = rows.filter((row) => row.decision === 'import' || String(row.decision).startsWith('link:')).length;
+  const selected = rows.filter((row) => row.decision === 'import' && !statementImportRowErrors(row).length);
+  const sum = (type) => selected.filter((row) => row.transaction.type === type).reduce((total, row) => total + row.transaction.amount, 0);
+  const paymentMethods = [...new Set(rows.filter((row) => !row.skipReason).map((row) => row.raw.paymentMethod || ''))];
+  const paymentAccounts = paymentMethods.length > 1 ? `<div class="import-payment-accounts"><strong>按原支付方式确认入账账户</strong>${paymentMethods.map((method) => {
+    const group = rows.filter((row) => !row.skipReason && (row.raw.paymentMethod || '') === method && row.decision !== 'skip');
+    const accountIds = [...new Set(group.map((row) => row.transaction.accountId))];
+    return `<label class="field"><span>${escapeHtml(method || '未提供支付方式')} · ${group.length} 行</span><select class="select-input" data-import-payment-account="${escapeHtml(method)}"><option value="">选择入账账户</option>${statementAccountOptions(accountIds.length === 1 ? accountIds[0] : '', false)}</select></label>`;
+  }).join('')}</div>` : '';
   return `${pageHeader('核对账单', `${escapeHtml(current.source)} · ${rows.length} 行 · 只核对本地数据，不调用模型。`, actions)}
+    ${saveNotice}
     <div class="import-counts"><span>可入账 <strong>${counts.ready}</strong></span><span>疑似重复 <strong>${counts.duplicate}</strong></span><span>待补充 <strong>${counts.missing}</strong></span><span>已跳过 <strong>${counts.skipped}</strong></span></div>
-    <section class="content-panel"><div class="import-bulk-row"><label class="field"><span>批量设置实际账户</span><select id="import-bulk-account" class="select-input"><option value="">选择账户</option>${statementAccountOptions('', false)}</select></label><button class="secondary-button" type="button" data-action="apply-import-account">应用到全部行</button><label class="field"><span>批量设置分类</span><select id="import-bulk-category" class="select-input"><option value="">选择分类</option>${state.categories.filter((item) => item.type === 'expense').map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.label)}</option>`).join('')}</select></label><button class="secondary-button" type="button" data-action="apply-import-category">应用到支出行</button></div>
-      <div class="panel-heading"><h2>第 ${current.page + 1} / ${Math.max(1, Math.ceil(rows.length / 50))} 页</h2><span class="panel-note">每页 50 行 · ${rows.length} 行均在本机完成解析和查重</span></div><div class="import-review-list">${pageRows.map((row, index) => statementImportRow(row, start + index)).join('')}</div>
-      <div class="form-actions import-page-actions"><button class="secondary-button" type="button" data-action="import-previous-page" ${current.page === 0 ? 'disabled' : ''}>上一页</button><button class="secondary-button" type="button" data-action="import-next-page" ${start + 50 >= rows.length ? 'disabled' : ''}>下一页</button><button class="secondary-button" type="button" data-action="back-to-statement-mapping">返回字段映射</button><button class="primary-button" type="button" data-action="commit-statement-import" ${unresolved || !importCount ? 'disabled' : ''}>确认整批入账（${importCount} 笔）</button></div>
+    <div class="import-confirm"><div><strong>本次新增支出 ${money(sum('expense'))} · 收入 ${money(sum('income'))}</strong><p>${pendingCount ? `还有 ${pendingCount} 行待核对，处理或跳过后才能整批保存。` : '核对金额、账户和分类后确认，关联来源不重复计入收支。'}</p></div><button class="primary-button" type="button" data-action="commit-statement-import" ${unresolved || !importCount || current.saving ? 'disabled' : ''}>${current.saving ? '正在保存' : `确认整批入账（${importCount} 笔）`}</button></div>
+    <div class="period-switch import-filters" aria-label="筛选核对状态">${[['all', '全部', rows.length], ['pending', '待核对', pendingCount], ['ready', '待入账', importCount - rows.filter((row) => (row.decision === 'import' || String(row.decision).startsWith('link:')) && statementImportDecisionErrors(row).length).length], ['skipped', '已跳过', counts.skipped]].map(([filter, label, count]) => `<button class="${(current.filter || 'all') === filter ? 'primary-button' : 'secondary-button'}" type="button" data-action="import-filter" data-filter="${filter}" aria-pressed="${(current.filter || 'all') === filter}">${label} ${count}</button>`).join('')}</div>
+    <section class="content-panel">${paymentAccounts}<div class="import-bulk-row">${paymentMethods.length > 1 ? '' : `<label class="field"><span>批量设置实际账户</span><select id="import-bulk-account" class="select-input"><option value="">选择账户</option>${statementAccountOptions('', false)}</select></label><button class="secondary-button" type="button" data-action="apply-import-account">应用到全部行</button>`}<label class="field"><span>批量设置分类</span><select id="import-bulk-category" class="select-input"><option value="">选择分类</option>${state.categories.filter((item) => item.type === 'expense').map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.label)}</option>`).join('')}</select></label><button class="secondary-button" type="button" data-action="apply-import-category">应用到支出行</button></div>
+      <div class="panel-heading"><h2>第 ${current.page + 1} / ${pageCount} 页</h2><span class="panel-note">每页 50 行 · 当前筛选 ${filtered.length} 行</span></div><div class="import-review-list">${pageRows.length ? pageRows.map(({ row, index }) => statementImportRow(row, index)).join('') : '<div class="empty-state"><h3>没有这类记录</h3><p>可以切换状态查看其他账单。</p></div>'}</div>
+      <div class="form-actions import-page-actions"><button class="secondary-button" type="button" data-action="import-previous-page" ${current.page === 0 ? 'disabled' : ''}>上一页</button><button class="secondary-button" type="button" data-action="import-next-page" ${start + 50 >= filtered.length ? 'disabled' : ''}>下一页</button><button class="secondary-button" type="button" data-action="back-to-statement-mapping">返回字段映射</button></div>
     </section>`;
 }
 
@@ -1455,38 +1546,88 @@ function buildStatementImportReview(data) {
   const current = state.statementImport;
   if (!current) throw new Error('请先选择账单文件。');
   const mapping = Object.fromEntries(Object.keys(current.mapping).map((key) => [key, Number(data.get(`map-${key}`) ?? current.mapping[key])]));
-  if (mapping.date < 0 || mapping.amount < 0 || mapping.date === mapping.amount) throw new Error('交易日期和金额需要映射到不同的列。');
+  if (mapping.date < 0 || mapping.amount < 0 || mapping.date === mapping.amount || Object.values(mapping).some((index) => !Number.isInteger(index) || index < -1 || index >= current.statement.headers.length)) throw new Error('交易日期和金额需要映射到不同的有效列。');
   const source = String(data.get('source') || '').trim();
   const sourceAccountId = String(data.get('sourceAccountId') || '');
   if (!source || !state.accounts.some((account) => account.id === sourceAccountId)) throw new Error('请选择有效的账单来源账户。');
+  const defaultAccountId = String(data.get('defaultAccountId') || '');
+  const defaultCategoryId = String(data.get('defaultCategoryId') || '');
   const statement = { ...current.statement, source };
-  const rows = mapStatementRows(statement, mapping, {
+  const paymentMethods = new Set(statement.rows.map((cells) => mapping.paymentMethod < 0 ? '' : String(cells[mapping.paymentMethod] || '').trim()));
+  const mixedPaymentMethods = paymentMethods.size > 1;
+  const globalChange = !current.rows || source !== current.source || sourceAccountId !== current.sourceAccountId;
+  const accountDefaultChanged = (mixedPaymentMethods ? '' : defaultAccountId) !== (current.mixedPaymentMethods ? '' : current.defaultAccountId);
+  const categoryDefaultChanged = defaultCategoryId !== current.defaultCategoryId;
+  const indices = statement.rows.map((cells, index) => index).filter((index) => globalChange
+    || Object.keys(mapping).some((key) => mapping[key] !== current.mapping[key]
+      && (mapping[key] < 0 ? '' : String(statement.rows[index][mapping[key]] || '').trim()) !== current.rows[index].raw[key]));
+  const changedRows = mapStatementRows(statement, mapping, {
     sourceAccountId,
-    defaultAccountId: String(data.get('defaultAccountId') || ''),
-    defaultCategoryId: String(data.get('defaultCategoryId') || ''),
-    incomeCategoryId: state.categories.find((item) => item.id === 'reimburse' && item.type === 'income')?.id || state.categories.find((item) => item.type === 'income')?.id || '',
-    categories: state.categories,
+    defaultAccountId: mixedPaymentMethods ? '' : defaultAccountId,
+    defaultCategoryId,
+    incomeCategoryId: state.categories.find((item) => item.id === 'other-income' && item.type === 'income')?.id || state.categories.find((item) => item.type === 'income')?.id || '',
+    categories: state.categories, rowIndices: indices,
   });
-  const matches = findDuplicateTransactions(transactionHistoryIndex(), rows.map((row) => row.transaction), 3);
-  const duplicates = new Map(matches.map((item) => [item.candidate.id, item.matches]));
-  for (const row of rows) {
-    row.duplicates = duplicates.get(row.transaction.id) || [];
-    const exactDuplicate = row.duplicates.some((match) => match.sameStatement && match.difference === 0);
-    row.decision = row.skipReason || exactDuplicate ? 'skip' : row.duplicates.length || row.errors.length ? 'pending' : 'import';
-  }
-  Object.assign(current, { mapping, source, sourceAccountId, defaultAccountId: String(data.get('defaultAccountId') || ''),
-    defaultCategoryId: String(data.get('defaultCategoryId') || ''), rows, page: 0 });
+  const hints = resolveCategoryCandidates(changedRows.map((row) => ({ typeHint: row.transaction.type, semanticHint: `${row.raw.counterparty} ${row.raw.note}` })), { availableCategories: state.categories });
+  changedRows.forEach((row, index) => {
+    row.defaultAccountUsed = !mixedPaymentMethods;
+    if (row.transaction.categoryId !== 'refund') {
+      const remembered = rememberedAgentCategory(`${row.raw.counterparty} ${row.raw.note}`, row.transaction.type);
+      const candidateId = remembered?.categoryId || hints[index].candidates.find((candidate) => candidate.score === 1 && state.categories.some((category) => category.id === candidate.id && category.type === row.transaction.type))?.id;
+      const validCandidate = candidateId && state.categories.some((category) => category.id === candidateId && category.type === row.transaction.type);
+      if (validCandidate) row.transaction.categoryId = candidateId;
+      row.defaultCategoryUsed = row.transaction.type === 'expense' && !validCandidate;
+    }
+  });
+  const rows = current.rows ? [...current.rows] : Array(statement.rows.length);
+  changedRows.forEach((row, index) => {
+    const previous = rows[indices[index]];
+    if (previous) row.transaction.id = previous.transaction.id;
+    rows[indices[index]] = row;
+  });
+  const changedIndices = new Set(indices);
+  rows.forEach((row, index) => {
+    if (changedIndices.has(index)) return;
+    let updated = false;
+    if (accountDefaultChanged && row.defaultAccountUsed) { row.transaction.accountId = mixedPaymentMethods ? '' : defaultAccountId; updated = true; }
+    if (categoryDefaultChanged && row.defaultCategoryUsed) { row.transaction.categoryId = defaultCategoryId; updated = true; }
+    if (updated && !row.decisionTouched && row.decision === 'pending' && !row.duplicates.length && !statementImportRowErrors(row).length) row.decision = 'import';
+  });
+  refreshStatementImportDuplicates(rows, changedIndices);
+  Object.assign(current, { mapping, source, sourceAccountId, defaultAccountId, defaultCategoryId, mixedPaymentMethods,
+    rows, editingMapping: false, mappingDraft: null, page: current.rows ? current.page : 0, filter: current.filter || 'all' });
 }
 
-function applyStatementImportBulk(field, value) {
+function refreshStatementImportDuplicates(rows, changed = new Set()) {
+  const matches = findDuplicateTransactions(transactionHistoryIndex(), rows.filter((row) => !row.skipReason).map((row) => row.transaction), 3);
+  const duplicates = new Map(matches.map((item) => [item.candidate.id, item.matches]));
+  const signature = (items) => JSON.stringify(items.map((match) => [match.transaction.id, match.sameStatement, match.draftMatch, match.difference, match.typeConflict, match.accountConflict]));
+  let updated = false;
+  rows.forEach((row, index) => {
+    const previous = signature(row.duplicates || []);
+    row.duplicates = duplicates.get(row.transaction.id) || [];
+    if (!changed.has(index) && previous === signature(row.duplicates)) return;
+    updated = true;
+    const exactDuplicate = row.duplicates.some((match) => match.sameStatement && match.difference === 0 && !match.typeConflict);
+    if (!changed.has(index) && row.decision === 'skip' && !row.autoSkipped && !row.skipReason) return;
+    row.autoSkipped = Boolean(exactDuplicate);
+    row.decision = row.skipReason || exactDuplicate ? 'skip' : row.duplicates.length || row.errors.length ? 'pending' : 'import';
+  });
+  return updated;
+}
+
+function applyStatementImportBulk(field, value, paymentMethod) {
   const current = state.statementImport;
   if (!current?.rows || !value) return;
+  if (field === 'accountId' && paymentMethod === undefined
+    && new Set(current.rows.filter((row) => !row.skipReason).map((row) => row.raw.paymentMethod || '')).size > 1) return;
   for (const row of current.rows) {
     if (row.skipReason || row.decision === 'skip') continue;
-    if (field === 'accountId') row.transaction.accountId = value;
-    if (field === 'categoryId' && row.transaction.type === 'expense') row.transaction.categoryId = value;
+    if (paymentMethod !== undefined && (row.raw.paymentMethod || '') !== paymentMethod) continue;
+    if (field === 'accountId') { row.transaction.accountId = value; row.defaultAccountUsed = false; }
+    if (field === 'categoryId' && row.transaction.type === 'expense') { row.transaction.categoryId = value; row.defaultCategoryUsed = false; }
     const errors = statementImportRowErrors(row);
-    if (!errors.length && !row.duplicates.length && row.decision === 'pending') row.decision = 'import';
+    if (!errors.length && !row.duplicates.length && row.decision === 'pending' && !row.decisionTouched) row.decision = 'import';
   }
 }
 
@@ -1779,7 +1920,7 @@ function renderReports() {
       <strong>${money(amount)}</strong>
     </div>`).join('');
   return `
-    ${pageHeader('报表', '周报看近期变化，月报看完整收支和分类结构。', `<button class="secondary-button" type="button" data-view="ledger">${icon('ph-list-bullets')}查看流水</button>`)}
+    ${pageHeader('报表', '周报看近期变化，月报看完整收支和分类结构。', `<button class="secondary-button" type="button" data-action="report-view-ledger">${icon('ph-list-bullets')}查看流水</button>`)}
     ${reportSectionTabs()}
     <div class="toolbar">
       <div class="period-switch">
@@ -3819,9 +3960,10 @@ async function exportData() {
 async function importData(file) {
   const data = normalizeBackup(JSON.parse(await file.text()));
   if (!window.confirm(`将导入 ${data.transactions.length} 笔流水，并替换当前账本数据。继续吗？`)) return;
+  const categories = data.categories.some((category) => category.id === REFUND_CATEGORY.id) ? data.categories : [...data.categories, REFUND_CATEGORY];
   if (!state.demo) await dbWriteBundle({
     [STORES.transactions]: data.transactions, [STORES.products]: data.products, [STORES.productCategories]: data.productCategories,
-    [STORES.categories]: data.categories, [STORES.accounts]: data.accounts, [STORES.agentMessages]: [],
+    [STORES.categories]: categories, [STORES.accounts]: data.accounts, [STORES.agentMessages]: [],
     [STORES.recurringBills]: data.recurringBills, [STORES.categoryBudgets]: data.categoryBudgets, [STORES.shoppingList]: data.shoppingList,
     [STORES.agentMemory]: Array.isArray(data.agentMemory) ? data.agentMemory : [],
     [STORES.settings]: [{ ...DEFAULT_PROFILE, ...(data.profile || {}), key: 'profile' }],
@@ -3833,10 +3975,12 @@ async function importData(file) {
   state.shoppingList = data.shoppingList;
   state.profile = { ...DEFAULT_PROFILE, ...(data.profile || {}), salaryEstimate: { ...DEFAULT_PROFILE.salaryEstimate, ...(data.profile?.salaryEstimate || {}) } };
   state.transactions = sortTransactions(data.transactions);
-  state.categories = data.categories;
+  state.categories = categories;
   state.accounts = data.accounts;
   state.agentMessages = [];
   state.agentMemory = Array.isArray(data.agentMemory) ? data.agentMemory : [];
+  state.statementImport = null;
+  state.lastStatementImport = null;
   transactionHistoryCache = null;
   render();
   toast('备份已导入。');
@@ -3863,6 +4007,8 @@ async function resetData() {
   state.categories = [...DEFAULT_CATEGORIES];
   state.accounts = [...DEFAULT_ACCOUNTS];
   state.agentMemory = [];
+  state.statementImport = null;
+  state.lastStatementImport = null;
   navigate('home');
   toast('本地账本已清空。');
   void syncIntegrationSummary();
@@ -3911,16 +4057,42 @@ document.addEventListener('click', async (event) => {
   }
   try {
     if (action === 'retry-load') { await loadData(); return; }
-    if (action === 'open-statement-import') { state.statementImport = null; state.ledgerSection = 'import'; navigate('ledger'); return; }
+    if (action === 'open-statement-import') {
+      if (state.statementImport) { state.statementImport.active = true; void saveStatementImportDraft(); }
+      state.ledgerSection = 'import'; navigate('ledger'); return;
+    }
     if (action === 'select-statement-file') { document.querySelector('#statement-file')?.click(); return; }
-    if (action === 'ledger-section') { state.ledgerSection = actionTarget.dataset.section === 'shopping' ? 'shopping' : 'transactions'; navigate('ledger'); return; }
+    if (action === 'retry-statement-draft') { await saveStatementImportDraft(); return; }
+    if (action === 'ledger-section') {
+      if (state.statementImport && state.ledgerSection === 'import') { state.statementImport.active = false; void saveStatementImportDraft(); }
+      state.ledgerSection = actionTarget.dataset.section === 'shopping' ? 'shopping' : 'transactions'; navigate('ledger'); return;
+    }
     if (action === 'import-previous-page') { state.statementImport.page = Math.max(0, state.statementImport.page - 1); render(); return; }
     if (action === 'import-next-page') { state.statementImport.page += 1; render(); return; }
-    if (action === 'back-to-statement-mapping') { state.statementImport.rows = null; state.statementImport.page = 0; render(); return; }
-    if (action === 'apply-import-account') { applyStatementImportBulk('accountId', document.querySelector('#import-bulk-account')?.value); render(); return; }
-    if (action === 'apply-import-category') { applyStatementImportBulk('categoryId', document.querySelector('#import-bulk-category')?.value); render(); return; }
+    if (action === 'import-filter') { state.statementImport.filter = actionTarget.dataset.filter; state.statementImport.page = 0; render(); return; }
+    if (action === 'import-view-reports' && state.lastStatementImport) {
+      const month = state.lastStatementImport.months.includes(actionTarget.dataset.month) ? actionTarget.dataset.month : state.lastStatementImport.endDate.slice(0, 7);
+      state.selectedMonth = new Date(`${month}-01T12:00:00`);
+      state.reportSection = 'summary'; state.reportPeriod = 'month'; navigate('reports'); return;
+    }
+    if (action === 'report-view-ledger') {
+      const { start, end } = periodBounds(state.reportPeriod);
+      Object.assign(state, { ledgerSection: 'transactions', ledgerScope: 'range', ledgerType: 'all', ledgerAccount: 'all', ledgerCategory: 'all', searchTerm: '', ledgerPage: 0,
+        ledgerStartDate: dateKey(start), ledgerEndDate: dateKey(end) });
+      navigate('ledger'); return;
+    }
+    if (action === 'import-view-expenses' && state.lastStatementImport) {
+      Object.assign(state, { ledgerSection: 'transactions', ledgerScope: 'range', ledgerType: 'expense', ledgerAccount: 'all', ledgerCategory: 'all', searchTerm: '', ledgerPage: 0,
+        ledgerStartDate: state.lastStatementImport.startDate, ledgerEndDate: state.lastStatementImport.endDate });
+      navigate('ledger'); return;
+    }
+    if (action === 'back-to-statement-mapping') { state.statementImport.editingMapping = true; void saveStatementImportDraft(); render(); return; }
+    if (action === 'apply-import-account') { applyStatementImportBulk('accountId', document.querySelector('#import-bulk-account')?.value); void saveStatementImportDraft(); render(); return; }
+    if (action === 'apply-import-category') { applyStatementImportBulk('categoryId', document.querySelector('#import-bulk-category')?.value); void saveStatementImportDraft(); render(); return; }
     if (action === 'commit-statement-import') {
       const current = state.statementImport;
+      if (!current?.rows || current.saving) return;
+      if (!activeAccounts().some((account) => account.id === current.sourceAccountId)) throw new Error('账单来源账户已不可用，请返回字段映射重新选择。');
       const updates = new Map();
       const incoming = [];
       for (const row of current.rows) {
@@ -3941,14 +4113,28 @@ document.addEventListener('click', async (event) => {
       }
       const batch = [...updates.values(), ...incoming];
       if (!batch.length) throw new Error('没有选择可入账或可关联的流水。');
-      await persistTransactions(batch, `账单核对完成 · 新增 ${incoming.length} 笔，关联 ${updates.size} 笔。`);
+      current.saving = true;
+      actionTarget.disabled = true;
+      try {
+        await persistTransactions(batch, `账单核对完成 · 新增 ${incoming.length} 笔，关联 ${updates.size} 笔。`, {
+          statementImportPreset: { key: current.presetKey, source: current.source, sourceAccountId: current.sourceAccountId,
+            defaultAccountId: current.defaultAccountId, defaultCategoryId: current.defaultCategoryId, mapping: current.mapping },
+          statementDraftKey: current.draftKey,
+        });
+      } finally { current.saving = false; actionTarget.disabled = false; }
+      const dates = batch.map((item) => dateKey(item.occurredAt)).sort();
+      state.lastStatementImport = { added: incoming.length, linked: updates.size, startDate: dates[0], endDate: dates.at(-1), months: [...new Set(dates.map((date) => date.slice(0, 7)))],
+        expense: incoming.filter((item) => item.type === 'expense').reduce((sum, item) => sum + item.amount, 0),
+        income: incoming.filter((item) => item.type === 'income').reduce((sum, item) => sum + item.amount, 0) };
+      Object.assign(state, { ledgerScope: 'range', ledgerType: 'all', ledgerAccount: 'all', ledgerCategory: 'all', searchTerm: '', ledgerPage: 0,
+        ledgerStartDate: dates[0], ledgerEndDate: dates.at(-1) });
       state.statementImport = null;
       state.ledgerSection = 'transactions';
       render();
       return;
     }
     if (action === 'view-agent-fact') {
-      state.ledgerSection = 'transactions'; state.ledgerScope = 'all'; state.ledgerCategory = actionTarget.dataset.categoryId;
+      state.ledgerSection = 'transactions'; state.ledgerScope = 'range'; state.ledgerCategory = actionTarget.dataset.categoryId;
       state.ledgerStartDate = actionTarget.dataset.startDate; state.ledgerEndDate = actionTarget.dataset.endDate;
       state.searchTerm = ''; state.ledgerType = 'all'; state.ledgerAccount = 'all'; state.ledgerPage = 0;
       navigate('ledger');
@@ -4045,7 +4231,7 @@ document.addEventListener('click', async (event) => {
       return;
     }
     if (action === 'view-budget-category') {
-      state.ledgerScope = 'all'; state.ledgerCategory = actionTarget.dataset.categoryId;
+      state.ledgerScope = 'range'; state.ledgerCategory = actionTarget.dataset.categoryId;
       state.ledgerStartDate = `${monthKey(state.selectedMonth)}-01`;
       const year = state.selectedMonth.getFullYear(), month = state.selectedMonth.getMonth() + 1;
       state.ledgerEndDate = `${monthKey(state.selectedMonth)}-${String(new Date(year, month, 0).getDate()).padStart(2, '0')}`;
@@ -4178,12 +4364,51 @@ document.addEventListener('change', async (event) => {
     event.target.value = '';
     if (!file) return;
     try {
-      const statement = inspectStatementCsv(parseStatementCsv(decodeStatementFile(await file.arrayBuffer())));
-      state.statementImport = { name: file.name, statement, mapping: statement.mapping, source: statement.source,
-        sourceAccountId: '', defaultAccountId: '', defaultCategoryId: state.categories.find((item) => item.id === 'daily' && item.type === 'expense')?.id || '', rows: null, page: 0 };
+      if (file.size > 20 * 1024 * 1024) throw new Error('账单文件超过 20 MB，请按时间分段导出。');
+      const bytes = await file.arrayBuffer();
+      const statement = await readStatementFile(bytes, file.name);
+      const digest = await crypto.subtle.digest('SHA-256', bytes);
+      const draftKey = `statement-import:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+      const savedDraft = state.statementImport?.draftKey === draftKey ? state.statementImport
+        : state.demo ? null : (await dbGet(STORES.settings, draftKey))?.value;
+      if (savedDraft?.statement?.rows && savedDraft.draftKey === draftKey) {
+        state.statementImport = savedDraft;
+        state.statementImport.active = true;
+        state.statementImport.saving = false;
+        if (savedDraft.rows) refreshStatementImportDuplicates(savedDraft.rows);
+        state.ledgerSection = 'import';
+        void saveStatementImportDraft();
+        navigate('ledger');
+        return;
+      }
+      const presetKey = JSON.stringify(statement.headers);
+      const preset = state.profile.statementImportPresets?.[presetKey];
+      const validAccount = (accountId) => activeAccounts().some((account) => account.id === accountId) ? accountId : '';
+      const mapping = Object.fromEntries(Object.entries(statement.mapping).map(([key, index]) => [key,
+        Number.isInteger(preset?.mapping?.[key]) && preset.mapping[key] >= -1 && preset.mapping[key] < statement.headers.length ? preset.mapping[key] : index]));
+      state.statementImport = { name: file.name, statement, draftKey, active: true,
+        presetKey, remembered: Boolean(preset), mapping, source: typeof preset?.source === 'string' ? preset.source : statement.source,
+        sourceAccountId: validAccount(preset?.sourceAccountId), defaultAccountId: '',
+        defaultCategoryId: state.categories.find((item) => item.id === preset?.defaultCategoryId && item.type === 'expense')?.id || state.categories.find((item) => item.id === 'other' && item.type === 'expense')?.id || '', rows: null, page: 0, filter: 'all' };
       state.ledgerSection = 'import';
+      void saveStatementImportDraft();
       navigate('ledger');
     } catch (error) { toast(error instanceof Error ? error.message : '账单文件无法读取。', 'error'); }
+    return;
+  }
+  const mappingForm = event.target.closest('#statement-mapping-form');
+  if (mappingForm && state.statementImport) {
+    state.statementImport.mappingDraft = Object.fromEntries(new FormData(mappingForm));
+    void saveStatementImportDraft();
+    return;
+  }
+  if (event.target.hasAttribute('data-import-payment-account') && state.statementImport?.rows) {
+    const method = event.target.dataset.importPaymentAccount;
+    applyStatementImportBulk('accountId', event.target.value, method);
+    refreshStatementImportDuplicates(state.statementImport.rows);
+    void saveStatementImportDraft();
+    render();
+    [...document.querySelectorAll('[data-import-payment-account]')].find((item) => item.dataset.importPaymentAccount === method)?.focus({ preventScroll: true });
     return;
   }
   if (event.target.id === 'agent-screenshot-input') {
@@ -4201,7 +4426,26 @@ document.addEventListener('change', async (event) => {
   }
   if (event.target.id === 'ledger-type-filter') { state.ledgerType = event.target.value; state.ledgerPage = 0; render(); }
   if (event.target.id === 'ledger-account-filter') { state.ledgerAccount = event.target.value; state.ledgerPage = 0; render(); }
-  if (event.target.id === 'ledger-scope-filter') { state.ledgerScope = event.target.value; state.ledgerPage = 0; render(); }
+  if (['ledger-scope-filter', 'ledger-month', 'ledger-day'].includes(event.target.id)) {
+    const { id: controlId, value } = event.target;
+    if (controlId === 'ledger-scope-filter') {
+      state.ledgerScope = value;
+      const month = monthKey(state.selectedMonth);
+      if (value === 'day' && !state.ledgerDay.startsWith(`${month}-`)) {
+        const today = new Date();
+        state.ledgerDay = dateKey(monthKey(today) === month ? today : state.selectedMonth);
+      }
+    } else if (controlId === 'ledger-month' && /^\d{4}-(?:0[1-9]|1[0-2])$/.test(value)) {
+      state.selectedMonth = new Date(`${value}-01T12:00:00`);
+    } else if (controlId === 'ledger-day' && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      state.ledgerDay = value;
+      state.selectedMonth = new Date(`${value.slice(0, 7)}-01T12:00:00`);
+    }
+    state.ledgerPage = 0;
+    render();
+    document.getElementById(controlId)?.focus({ preventScroll: true });
+    return;
+  }
   if (event.target.id === 'ledger-category-filter') { state.ledgerCategory = event.target.value; state.ledgerPage = 0; render(); }
   if (event.target.id === 'ledger-start-date' || event.target.id === 'ledger-end-date') {
     const start = event.target.id === 'ledger-start-date' ? event.target.value : state.ledgerStartDate;
@@ -4212,18 +4456,39 @@ document.addEventListener('change', async (event) => {
   if (event.target.id === 'shopping-shop-filter') { state.shoppingShopName = event.target.value; render(); }
   const importRow = event.target.closest('[data-row-index]');
   if (importRow && state.statementImport?.rows) {
-    const row = state.statementImport.rows[Number(importRow.dataset.rowIndex)];
+    const index = Number(importRow.dataset.rowIndex);
+    const row = state.statementImport.rows[index];
     if (row) {
-      if (event.target.hasAttribute('data-import-decision')) row.decision = event.target.value;
+      const focused = document.activeElement === event.target;
+      const field = event.target.dataset.importField;
+      row.editorOpen = event.target.closest('.import-row-editor')?.open ?? true;
+      if (event.target.hasAttribute('data-import-decision')) { row.decision = event.target.value; row.autoSkipped = false; row.decisionTouched = true; }
       else if (event.target.hasAttribute('data-import-field')) {
-        const field = event.target.dataset.importField;
         row.transaction[field] = event.target.value;
+        if (field === 'accountId') row.defaultAccountUsed = false;
+        if (field === 'categoryId' || field === 'type') row.defaultCategoryUsed = false;
         if (field === 'type') {
           row.transaction.categoryId = event.target.value === 'income' ? state.categories.find((item) => item.id === 'reimburse' && item.type === 'income')?.id || '' : event.target.value === 'transfer' ? 'transfer' : state.categories.find((item) => item.id === 'daily' && item.type === 'expense')?.id || '';
           row.transaction.toAccountId = '';
         }
+        if (row.decision === 'pending' && !row.decisionTouched && !row.duplicates.length && !statementImportRowErrors(row).length) row.decision = 'import';
       }
+      const duplicatesChanged = field && field !== 'toAccountId' && refreshStatementImportDuplicates(state.statementImport.rows);
+      if (field === 'note' && !focused) {
+        const element = event.target.closest('.import-review-row');
+        const sourceNote = element?.querySelector('.import-row-source span:nth-child(2)');
+        if (sourceNote) sourceNote.textContent = row.transaction.note || '无备注';
+        void saveStatementImportDraft();
+        if (duplicatesChanged) setTimeout(() => { if (element?.isConnected) render(); }, 0);
+        return;
+      }
+      if (state.statementImport.filter !== 'all') {
+        state.statementImport.filter = 'all';
+        state.statementImport.page = Math.floor(index / 50);
+      }
+      void saveStatementImportDraft();
       render();
+      if (focused) document.querySelector(field ? `[data-import-field="${field}"][data-row-index="${index}"]` : `[data-import-decision][data-row-index="${index}"]`)?.focus({ preventScroll: true });
       return;
     }
   }
@@ -4244,12 +4509,27 @@ document.addEventListener('change', async (event) => {
   }
 });
 
+document.addEventListener('toggle', (event) => {
+  const editor = event.target;
+  if (!editor.matches?.('.import-row-editor') || !editor.isConnected || !state.statementImport?.rows) return;
+  const row = state.statementImport.rows[Number(editor.closest('[data-import-row]')?.dataset.importRow)];
+  if (row && (row.editorOpen ?? row.decision === 'pending') !== editor.open) {
+    row.editorOpen = editor.open;
+    void saveStatementImportDraft();
+  }
+}, true);
+
 document.addEventListener('input', (event) => {
+  const mappingForm = event.target.closest('#statement-mapping-form');
+  if (mappingForm && state.statementImport) {
+    state.statementImport.mappingDraft = Object.fromEntries(new FormData(mappingForm));
+    void saveStatementImportDraft();
+  }
   if (event.target.closest('#financial-plan-form')) updateFinancialPlanningPreview();
   const importField = event.target.closest('[data-import-field]');
   if (importField && importField.dataset.importField === 'note' && state.statementImport?.rows) {
     const row = state.statementImport.rows[Number(importField.dataset.rowIndex)];
-    if (row) row.transaction.note = event.target.value;
+    if (row) { row.transaction.note = event.target.value; void saveStatementImportDraft(); }
   }
   if (event.target.closest('[data-product-editor]')) updateProductPreviews(event.target.closest('[data-product-editor]'));
   const editedDraftForm = event.target.closest('[data-agent-draft-form]');
@@ -4333,6 +4613,7 @@ document.addEventListener('submit', async (event) => {
     }
     if (form.id === 'statement-mapping-form') {
       buildStatementImportReview(data);
+      void saveStatementImportDraft();
       render();
       return;
     }

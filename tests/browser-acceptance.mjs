@@ -253,8 +253,6 @@ export async function runBrowserAcceptance(page, base) {
   await p.locator('#ledger-account-filter').selectOption('all');
   await p.locator('#ledger-category-filter').selectOption('all');
   await p.locator('#ledger-search').fill('');
-  await p.locator('#ledger-start-date').fill('');
-  await p.locator('#ledger-end-date').fill('');
   const latest=(await read('transactions')).find(t=>t.source==='agent');
   const deleteButton=p.locator('[data-action="delete-transaction"][data-transaction-id="'+latest.id+'"]');
   check(await deleteButton.count()===1,'agent transaction is not in the ledger page: '+latest.id);
@@ -656,8 +654,10 @@ export async function runReconciliationAcceptance(page, base) {
   const submit = form => form.getByRole('button', { name: '保存这一笔', exact: true }).click();
   const ask = async text => {
     await p.getByRole('link', { name: '智能助手', exact: true }).click();
+    const previousIds = await p.locator('[data-agent-draft-form]').evaluateAll((forms) => forms.map((form) => form.dataset.messageId));
     await p.locator('#agent-input').fill(text);
     await p.getByRole('button', { name: '发送消息', exact: true }).click();
+    await p.waitForFunction((ids) => [...document.querySelectorAll('[data-agent-draft-form]')].some((form) => !ids.includes(form.dataset.messageId)), previousIds);
     return p.locator('[data-agent-draft-form]').last();
   };
   try {
